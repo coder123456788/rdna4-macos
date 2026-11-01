@@ -1,0 +1,532 @@
+diff --git a/src/navi48-bringup/hosttest/shim/IOKit/IOReturn.h b/src/navi48-bringup/hosttest/shim/IOKit/IOReturn.h
+index 934a664..3d5271a 100644
+--- a/src/navi48-bringup/hosttest/shim/IOKit/IOReturn.h
++++ b/src/navi48-bringup/hosttest/shim/IOKit/IOReturn.h
+@@ -28,4 +28,5 @@ enum {
+     kIOReturnNotReady,
+     kIOReturnIOError,
+     kIOReturnNotFound,
++    kIOReturnNoDevice,
+ };
+diff --git a/src/navi48-bringup/tests/navi44_die_test.cpp b/src/navi48-bringup/tests/navi44_die_test.cpp
+new file mode 100644
+index 0000000..ba33140
+--- /dev/null
++++ b/src/navi48-bringup/tests/navi44_die_test.cpp
+@@ -0,0 +1,516 @@
++// navi44_die_test.cpp — host-side checks for the two Navi 44 deltas that do
++// not need a GPU: the per-die firmware set (fw_table, patch 0002) and the
++// per-die geometry fallback + GB_ADDR_CONFIG override (gfx_v12_0, patch 0003).
++//
++//     zig c++ -std=c++17 -I hosttest/shim -I src/amd -o navi44_die_test \
++//         tests/navi44_die_test.cpp src/amd/fw_table.cpp \
++//         src/amd/gfx_v12_0.cpp src/fw/*.c
++//     ./navi44_die_test [firmware dir]
++//
++// The firmware cases compare the embedded blobs against firmware/*.bin
++// byte-for-byte, so they also catch an embed step that silently picked up
++// the wrong file. The geometry cases drive the real public entry points:
++// gfx_gpu_early_init() on a synthetic IP table, and gfx_get_gb_addr_config()
++// against a scratch MMIO window standing in for BAR5.
++#include "fw_table.h"
++#include "amdgpu_gfx.h"
++
++#include <cstdarg>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++namespace amdgpu {
++// The kernel log ring lives in n48log.cpp, which is not part of a host
++// build. Everything else in this test is the real implementation.
++void n48_logf(const char *fmt, ...)
++{
++    va_list ap;
++    va_start(ap, fmt);
++    vprintf(fmt, ap);
++    va_end(ap);
++}
++} // namespace amdgpu
++
++using namespace amdgpu;
++
++namespace {
++
++int gFail = 0, gRun = 0;
++
++void ok(const char *what, bool cond)
++{
++    gRun++;
++    if (!cond) { gFail++; std::printf("FAIL  %s\n", what); }
++}
++
++void eq(const char *what, uint64_t got, uint64_t want)
++{
++    gRun++;
++    if (got != want) {
++        gFail++;
++        std::printf("FAIL  %-58s got %llu want %llu\n", what,
++                    (unsigned long long)got, (unsigned long long)want);
++    }
++}
++
++void eqs(const char *what, const char *got, const char *want)
++{
++    gRun++;
++    if (std::strcmp(got, want) != 0) {
++        gFail++;
++        std::printf("FAIL  %-58s got \"%s\" want \"%s\"\n", what, got, want);
++    }
++}
++
++bool readFile(const std::string &path, std::vector<uint8_t> &out)
++{
++    FILE *f = std::fopen(path.c_str(), "rb");
++    if (!f) return false;
++    std::fseek(f, 0, SEEK_END);
++    const long sz = std::ftell(f);
++    std::fseek(f, 0, SEEK_SET);
++    if (sz < 0) { std::fclose(f); return false; }
++    out.resize((size_t)sz);
++    const size_t got = out.empty() ? 0 : std::fread(out.data(), 1, out.size(), f);
++    std::fclose(f);
++    return got == out.size();
++}
++
++uint64_t fileSize(const std::string &path)
++{
++    FILE *f = std::fopen(path.c_str(), "rb");
++    if (!f) return ~0ull;
++    std::fseek(f, 0, SEEK_END);
++    const long sz = std::ftell(f);
++    std::fclose(f);
++    return sz < 0 ? ~0ull : (uint64_t)sz;
++}
++
++// ---------------------------------------------------------------- firmware
++
++struct Role {
++    FwId id;
++    const char *navi44;
++    const char *navi48;
++};
++
++const Role kRoles[] = {
++    {FwId::PSP_SOS,    "psp_14_0_2_sos",    "psp_14_0_3_sos"},
++    {FwId::PSP_TA,     "psp_14_0_2_ta",     "psp_14_0_3_ta"},
++    {FwId::GC_IMU,     "gc_12_0_0_imu",     "gc_12_0_1_imu"},
++    {FwId::GC_PFP,     "gc_12_0_0_pfp",     "gc_12_0_1_pfp"},
++    {FwId::GC_ME,      "gc_12_0_0_me",      "gc_12_0_1_me"},
++    {FwId::GC_MEC,     "gc_12_0_0_mec",     "gc_12_0_1_mec"},
++    {FwId::GC_UNI_MES, "gc_12_0_0_uni_mes", "gc_12_0_1_uni_mes"},
++    {FwId::GC_RLC,     "gc_12_0_0_rlc",     "gc_12_0_1_rlc"},
++    {FwId::SMU,        "smu_14_0_2",        "smu_14_0_3"},
++    {FwId::SDMA,       "sdma_7_0_0",        "sdma_7_0_1"},
++};
++
++void checkSet(const char *label, bool navi44, const std::string &fwDir)
++{
++    std::printf("\n-- firmware set: %s --\n", label);
++    std::string pfx;
++    pfx += "  [";
++    pfx += label;
++    pfx += "] ";
++
++    eq((pfx + "fw_is_navi44").c_str(), fw_is_navi44() ? 1u : 0u, navi44 ? 1u : 0u);
++
++    for (const Role &r : kRoles) {
++        const FwBlob *b = fw_get(r.id);
++        ok((pfx + "entry exists").c_str(), b != nullptr);
++        if (!b) continue;
++        const char *want = navi44 ? r.navi44 : r.navi48;
++        eqs((pfx + "name " + want).c_str(), b->name ? b->name : "(null)", want);
++        eq((pfx + "size " + want).c_str(), b->size,
++           fileSize(fwDir + "/" + std::string(want) + ".bin"));
++        ok((pfx + "data " + want).c_str(), b->data != nullptr);
++    }
++
++    // No embedded blob on either die: the split MES pair is superseded by
++    // uni_mes, and TOC is only loaded for psp_14_0_5.
++    for (FwId id : {FwId::GC_MES, FwId::GC_MES1, FwId::GC_TOC}) {
++        const FwBlob *b = fw_get(id);
++        ok((pfx + "absent row exists").c_str(), b != nullptr);
++        if (!b) continue;
++        ok((pfx + "absent row has no data").c_str(), b->data == nullptr && b->size == 0);
++    }
++
++    // The other die's names must not resolve in this set.
++    for (const Role &r : kRoles) {
++        const char *other = navi44 ? r.navi48 : r.navi44;
++        ok((pfx + "no foreign name " + other).c_str(),
++           fw_find_by_name(other) == nullptr);
++        ok((pfx + "own name resolves " + (navi44 ? r.navi44 : r.navi48)).c_str(),
++           fw_find_by_name(navi44 ? r.navi44 : r.navi48) != nullptr);
++    }
++}
++
++void firmwareTests(const std::string &fwDir)
++{
++    std::printf("\n================ firmware set (0002) ================\n");
++    std::printf("firmware dir: %s\n", fwDir.c_str());
++
++    // The default table, before any selection, is the historical Navi 48 set.
++    checkSet("default", false, fwDir);
++
++    fw_select_for_device(0x7590);              // Navi 44 / RX 9060 XT
++    checkSet("0x7590", true, fwDir);
++
++    fw_select_for_device(0x7550);              // Navi 48 / RX 9070
++    checkSet("0x7550", false, fwDir);
++
++    fw_select_for_device(0x7590);              // switching back rebuilds
++    checkSet("0x7590 again", true, fwDir);
++
++    std::printf("\n-- fw_table edges --\n");
++    fw_select_for_device(0x1234);              // unknown id: keep Navi 48
++    ok("unknown id selects Navi 48", !fw_is_navi44());
++    eqs("unknown id PSP_SOS", fw_get(FwId::PSP_SOS)->name, "psp_14_0_3_sos");
++
++    ok("fw_get(Count) is null",
++       fw_get(static_cast<FwId>(static_cast<uint32_t>(FwId::Count))) == nullptr);
++    ok("fw_find_by_name(nullptr) is null", fw_find_by_name(nullptr) == nullptr);
++    ok("fw_find_by_name(\"\") is null", fw_find_by_name("") == nullptr);
++    ok("fw_find_by_name(prefix) is null", fw_find_by_name("psp_14_0_3_so") == nullptr);
++    ok("fw_find_by_name(suffix) is null", fw_find_by_name("sp_14_0_3_sos") == nullptr);
++
++    // Byte-identity of the embedded copy against the file it was generated
++    // from, for both sets. This is what proves the .c embed step took the
++    // right firmware, not merely a same-sized one.
++    for (int set = 0; set < 2; set++) {
++        fw_select_for_device(set == 0 ? 0x7550 : 0x7590);
++        for (const Role &r : kRoles) {
++            const FwBlob *b = fw_get(r.id);
++            const char *name = set == 0 ? r.navi48 : r.navi44;
++            std::vector<uint8_t> file;
++            if (!b || !b->data || !readFile(fwDir + "/" + name + ".bin", file)) {
++                ok((std::string("file readable: ") + name).c_str(), false);
++                continue;
++            }
++            eq((std::string("bytes match file: ") + name).c_str(),
++               (file.size() == b->size &&
++                std::memcmp(file.data(), b->data, b->size) == 0) ? 1u : 0u, 1u);
++        }
++    }
++}
++
++// ---------------------------------------------------------------- geometry
++
++constexpr uint32_t kGcBase = 0x8000;   // arbitrary but >0 dword index
++
++struct Scratch {
++    DeviceContext dev;
++    std::vector<uint32_t> mmio;
++
++    Scratch()
++    {
++        // Covers GC segment 0 (GB_ADDR_CONFIG, CC_* at 0x13dd) and segment 1
++        // (GRBM_GFX_INDEX, the USER_* harvest masks at 0x5b9x), the two the
++        // geometry and harvest paths read.
++        mmio.assign(kGcBase + 0x9000, 0);
++        dev.rmmio = mmio.data();
++        dev.rmmioSize = mmio.size() * sizeof(uint32_t);
++        dev.ip.set(IPBlock::GC, kGcBase);
++        dev.ip.setBase(IPBlock::GC, 1, kGcBase + 0x2000);
++    }
++    void reg(uint32_t value)
++    {
++        mmio[kGcBase + GFXRegs::GB_ADDR_CONFIG] = value;
++    }
++    void gc0(uint32_t off, uint32_t value) { mmio[kGcBase + off] = value; }
++    void gc1(uint32_t off, uint32_t value) { mmio[kGcBase + 0x2000 + off] = value; }
++};
++
++// Realistic Navi 44 values: NUM_PIPES=1 (2 tile pipes), NUM_SHADER_ENGINES=1
++// (2 SEs), NUM_RB_PER_SE=1 (2 RBs/SE), NUM_PKRS=3 (8), PIPE_INTERLEAVE=1
++// (512 B), MAX_COMPRESSED_FRAGS=1 (2).
++static uint32_t packGb(uint32_t pipes, uint32_t ses, uint32_t rb, uint32_t pkrs,
++                       uint32_t interleave, uint32_t frags)
++{
++    return (pipes << GB_ADDR_CONFIG__NUM_PIPES__SHIFT) |
++           (interleave << GB_ADDR_CONFIG__PIPE_INTERLEAVE_SIZE__SHIFT) |
++           (frags << GB_ADDR_CONFIG__MAX_COMPRESSED_FRAGS__SHIFT) |
++           (pkrs << GB_ADDR_CONFIG__NUM_PKRS__SHIFT) |
++           (ses << GB_ADDR_CONFIG__NUM_SHADER_ENGINES__SHIFT) |
++           (rb << GB_ADDR_CONFIG__NUM_RB_PER_SE__SHIFT);
++}
++
++void geometryTests()
++{
++    std::printf("\n================ die geometry (0003) ================\n");
++
++    // ---- fallback caps, before GB_ADDR_CONFIG is readable ----
++    {
++        struct Case { IPVersion v; uint32_t se, sh, rb, cu, ctx; const char *label; };
++        const Case cases[] = {
++            {{12, 0, 0}, 2, 2, 2, 8, 8, "Navi 44 GC 12.0.0"},
++            {{12, 0, 1}, 4, 2, 4, 8, 8, "Navi 48 GC 12.0.1"},
++            {{12, 0, 5}, 4, 2, 4, 8, 8, "GC 12.0.5 (unnamed, Navi 48 caps)"},
++            {{11, 0, 3}, 4, 2, 4, 8, 8, "GC 11.0.3 (not RDNA4, Navi 48 caps)"},
++        };
++        for (const Case &c : cases) {
++            Scratch s;
++            s.dev.ip.setVersion(IPBlock::GC, c.v);
++            GFXConfig cfg{};
++            const kern_return_t kr = gfx_gpu_early_init(s.dev, cfg);
++            const std::string p = std::string("  [") + c.label + "] ";
++            eq((p + "kIOReturn").c_str(), kr, kIOReturnSuccess);
++            eq((p + "max_shader_engines").c_str(), cfg.max_shader_engines, c.se);
++            eq((p + "max_sh_per_se").c_str(), cfg.max_sh_per_se, c.sh);
++            eq((p + "max_backends_per_se").c_str(), cfg.max_backends_per_se, c.rb);
++            eq((p + "max_cu_per_sh").c_str(), cfg.max_cu_per_sh, c.cu);
++            eq((p + "max_hw_contexts").c_str(), cfg.max_hw_contexts, c.ctx);
++            eq((p + "sc_prim_fifo_size_frontend").c_str(),
++               cfg.sc_prim_fifo_size_frontend, 0x20);
++            eq((p + "sc_prim_fifo_size_backend").c_str(),
++               cfg.sc_prim_fifo_size_backend, 0x100);
++            eq((p + "sc_hiz_tile_fifo_size").c_str(), cfg.sc_hiz_tile_fifo_size, 0);
++            eq((p + "sc_earlyz_tile_fifo_size").c_str(),
++               cfg.sc_earlyz_tile_fifo_size, 0x4C0);
++            eq((p + "CUs = SE*SH*CU").c_str(),
++               cfg.max_shader_engines * cfg.max_sh_per_se * cfg.max_cu_per_sh,
++               c.se * c.sh * c.cu);
++        }
++    }
++
++    // ---- GB_ADDR_CONFIG ----
++    {
++        Scratch s;
++        s.dev.ip.setVersion(IPBlock::GC, {12, 0, 0});
++        GFXConfig cfg{};
++        (void)gfx_gpu_early_init(s.dev, cfg);
++        ok("unresolved GC base -> kIOReturnNotReady",
++           gfx_get_gb_addr_config(s.dev, cfg) == kIOReturnNotReady);
++    }
++    {
++        Scratch s;
++        s.dev.ip.setVersion(IPBlock::GC, {12, 0, 0});
++        GFXConfig cfg{};
++        (void)gfx_gpu_early_init(s.dev, cfg);
++        const uint32_t before = cfg.max_shader_engines;
++        s.reg(0);
++        ok("GB_ADDR_CONFIG==0 -> kIOReturnNotReady",
++           gfx_get_gb_addr_config(s.dev, cfg) == kIOReturnNotReady);
++        eq("GB_ADDR_CONFIG==0 keeps caps", cfg.max_shader_engines, before);
++        s.reg(0xFFFFFFFFu);
++        ok("GB_ADDR_CONFIG==~0 -> kIOReturnNotReady",
++           gfx_get_gb_addr_config(s.dev, cfg) == kIOReturnNotReady);
++        eq("GB_ADDR_CONFIG==~0 keeps caps", cfg.max_shader_engines, before);
++    }
++
++    // Navi 44-shaped register on a Navi 44 fallback: agrees, and every
++    // derived field decodes to the documented value.
++    {
++        Scratch s;
++        s.dev.ip.setVersion(IPBlock::GC, {12, 0, 0});
++        GFXConfig cfg{};
++        (void)gfx_gpu_early_init(s.dev, cfg);
++        const uint32_t gb = packGb(1, 1, 1, 3, 1, 1);
++        s.reg(gb);
++        eq("navi44 gb: kIOReturn", gfx_get_gb_addr_config(s.dev, cfg), kIOReturnSuccess);
++        eq("navi44 gb: raw", cfg.gb_addr_config_raw, gb);
++        eq("navi44 gb: num_pipes", cfg.num_pipes, 2);
++        eq("navi44 gb: num_se", cfg.num_shader_engines, 2);
++        eq("navi44 gb: num_rb_per_se", cfg.num_rb_per_se, 2);
++        eq("navi44 gb: num_pkrs", cfg.num_pkrs, 8);
++        eq("navi44 gb: pipe_interleave", cfg.pipe_interleave_size, 512);
++        eq("navi44 gb: max_compressed_frags", cfg.max_compressed_frags, 2);
++        eq("navi44 gb: max_shader_engines <- NUM_SHADER_ENGINES",
++           cfg.max_shader_engines, 2);
++        eq("navi44 gb: max_backends_per_se <- NUM_RB_PER_SE",
++           cfg.max_backends_per_se, 2);
++    }
++
++    // The register wins over a wrong fallback, and it is NUM_SHADER_ENGINES
++    // (not NUM_PIPES) that sets the SE count. A Navi 48-shaped register on
++    // the Navi 44 fallback is the case where the two fields differ from
++    // each other too, so a pipe-based override cannot pass by accident:
++    // NUM_PIPES=2 -> 4 tile pipes, NUM_SHADER_ENGINES=2 -> 4 SEs (equal),
++    // then NUM_PIPES=3 -> 8 pipes, NUM_SHADER_ENGINES=1 -> 2 SEs (differ).
++    {
++        Scratch s;
++        s.dev.ip.setVersion(IPBlock::GC, {12, 0, 0});
++        GFXConfig cfg{};
++        (void)gfx_gpu_early_init(s.dev, cfg);
++        s.reg(packGb(2, 2, 2, 3, 1, 1));
++        eq("navi48-shaped gb: kIOReturn", gfx_get_gb_addr_config(s.dev, cfg),
++           kIOReturnSuccess);
++        eq("navi48-shaped gb: SEs from register", cfg.max_shader_engines, 4);
++        eq("navi48-shaped gb: RBs/SE from register", cfg.max_backends_per_se, 4);
++        eq("navi48-shaped gb: num_pipes", cfg.num_pipes, 4);
++    }
++    {
++        Scratch s;
++        s.dev.ip.setVersion(IPBlock::GC, {12, 0, 1});
++        GFXConfig cfg{};
++        (void)gfx_gpu_early_init(s.dev, cfg);
++        s.reg(packGb(3, 1, 3, 3, 1, 1));   // 8 tile pipes, 2 SEs, 8 RBs/SE
++        eq("pipes!=SEs: kIOReturn", gfx_get_gb_addr_config(s.dev, cfg),
++           kIOReturnSuccess);
++        eq("pipes!=SEs: num_pipes decodes to 8", cfg.num_pipes, 8);
++        eq("pipes!=SEs: SEs follow NUM_SHADER_ENGINES, not pipes",
++           cfg.max_shader_engines, 2);
++        eq("pipes!=SEs: RBs/SE follow NUM_RB_PER_SE", cfg.max_backends_per_se, 8);
++    }
++
++    // Implausible field values keep the fallback instead of zeroing the
++    // masks. NUM_SHADER_ENGINES is 4 bits, so 0 is the only in-range value
++    // that decodes below 1; 15 decodes to 32768.
++    {
++        Scratch s;
++        s.dev.ip.setVersion(IPBlock::GC, {12, 0, 0});
++        GFXConfig cfg{};
++        (void)gfx_gpu_early_init(s.dev, cfg);
++        s.reg(packGb(1, 0, 1, 3, 1, 1));   // NM_SHADER_ENGINES=0 -> 1 SE
++        eq("NUM_SHADER_ENGINES=0: kIOReturn", gfx_get_gb_addr_config(s.dev, cfg),
++           kIOReturnSuccess);
++        eq("NUM_SHADER_ENGINES=0 decodes to 1", cfg.num_shader_engines, 1);
++        eq("NUM_SHADER_ENGINES=0 is in range, so it wins",
++           cfg.max_shader_engines, 1);
++    }
++    {
++        Scratch s;
++        s.dev.ip.setVersion(IPBlock::GC, {12, 0, 0});
++        GFXConfig cfg{};
++        (void)gfx_gpu_early_init(s.dev, cfg);
++        s.reg(packGb(1, 15, 15, 3, 1, 1)); // 32768 SEs: out of range
++        eq("out-of-range SEs: kIOReturn", gfx_get_gb_addr_config(s.dev, cfg),
++           kIOReturnSuccess);
++        eq("out-of-range SEs keep fallback", cfg.max_shader_engines, 2);
++        // NUM_RB_PER_SE is only 2 bits wide, so 15 truncates to 3 -> 8: in
++        // range, and the register wins.
++        eq("RB field truncates to 3 -> 8 RBs/SE", cfg.num_rb_per_se, 8);
++        eq("2-bit RB field stays in range, so it wins",
++           cfg.max_backends_per_se, 8);
++    }
++}
++
++// ------------------------------------------------------- harvest masks (setup_rb)
++//
++// The GB_ADDR_CONFIG tests above pin the SE and RB counts; this pins what
++// gfx_setup_rb does with them, which is what every later stage consumes.
++// Both dies are covered because the mask arithmetic is width-dependent:
++//
++//   Navi 44  2 SE x 2 SH/SE x 2 RB/SE -> SA bitmap 4 bits, RB bitmap 4 bits,
++//            RB bits per SA = 2/2 = 1
++//   Navi 48  4 SE x 2 SH/SE x 4 RB/SE -> SA bitmap 8 bits, RB bitmap 16 bits,
++//            RB bits per SA = 4/2 = 2
++//
++// A width mistake here is silent: the masks are still "some" number, the
++// ladder still runs, and only a harvested part would expose it. The disable
++// field widths are the Linux header's own (gc_12_0_0_sh_mask.h):
++// BACKEND_DISABLE is 4 bits at shift 4, SA_DISABLE 16 bits at shift 8.
++static GFXConfig prepareRb(Scratch &s, IPVersion v, uint32_t gb)
++{
++    s.dev.ip.setVersion(IPBlock::GC, v);
++    s.reg(gb);
++    GFXConfig cfg{};
++    (void)gfx_gpu_early_init(s.dev, cfg);
++    (void)gfx_get_gb_addr_config(s.dev, cfg);
++    return cfg;
++}
++
++void setupRbTests()
++{
++    std::printf("\n================ RB harvest masks (gfx_setup_rb) ================\n");
++
++    // ---- Navi 44, nothing harvested ----
++    {
++        Scratch s;
++        GFXConfig cfg = prepareRb(s, {12, 0, 0}, packGb(1, 1, 1, 3, 1, 1));
++        eq("navi44 rb: SEs decoded", cfg.max_shader_engines, 2);
++        eq("navi44 rb: RBs/SE decoded", cfg.max_backends_per_se, 2);
++        eq("navi44 rb: setup_rb", gfx_setup_rb(s.dev, cfg), kIOReturnSuccess);
++        eq("navi44 rb: active_sa = 4 SAs", cfg.active_sa_bitmap, 0xFu);
++        eq("navi44 rb: global_active_rb = 4 RBs", cfg.global_active_rb_bitmap, 0xFu);
++        eq("navi44 rb: active_rb = SA-derived", cfg.active_rb_bitmap, 0xFu);
++        eq("navi44 rb: num_rbs = 2 SE x 2", cfg.num_rbs, 4);
++    }
++
++    // ---- Navi 44, shader array 2 disabled: its RB goes with it ----
++    {
++        Scratch s;
++        GFXConfig cfg = prepareRb(s, {12, 0, 0}, packGb(1, 1, 1, 3, 1, 1));
++        s.gc0(GFXRegs::GRBM_CC_GC_SA_UNIT_DISABLE,
++              0x4u << GRBM_CC_GC_SA_UNIT_DISABLE__SA_DISABLE__SHIFT);
++        eq("navi44 SA2 off: setup_rb", gfx_setup_rb(s.dev, cfg), kIOReturnSuccess);
++        eq("navi44 SA2 off: active_sa", cfg.active_sa_bitmap, 0xBu);
++        eq("navi44 SA2 off: active_rb follows its SA", cfg.active_rb_bitmap, 0xBu);
++        eq("navi44 SA2 off: num_rbs", cfg.num_rbs, 3);
++    }
++
++    // ---- Navi 44, one RB disabled by the use mask: SA intact, RB gone ----
++    {
++        Scratch s;
++        GFXConfig cfg = prepareRb(s, {12, 0, 0}, packGb(1, 1, 1, 3, 1, 1));
++        s.gc1(GFXRegs::GC_USER_RB_BACKEND_DISABLE,
++              0x8u << GC_USER_RB_BACKEND_DISABLE__BACKEND_DISABLE__SHIFT);
++        eq("navi44 user RB3 off: setup_rb", gfx_setup_rb(s.dev, cfg), kIOReturnSuccess);
++        eq("navi44 user RB3 off: active_sa untouched", cfg.active_sa_bitmap, 0xFu);
++        eq("navi44 user RB3 off: global_active_rb", cfg.global_active_rb_bitmap, 0x7u);
++        eq("navi44 user RB3 off: active_rb loses it too", cfg.active_rb_bitmap, 0x7u);
++        eq("navi44 user RB3 off: num_rbs", cfg.num_rbs, 3);
++    }
++
++    // ---- Navi 48, nothing harvested ----
++    {
++        Scratch s;
++        GFXConfig cfg = prepareRb(s, {12, 0, 1}, packGb(2, 2, 2, 3, 1, 1));
++        eq("navi48 rb: SEs decoded", cfg.max_shader_engines, 4);
++        eq("navi48 rb: RBs/SE decoded", cfg.max_backends_per_se, 4);
++        eq("navi48 rb: setup_rb", gfx_setup_rb(s.dev, cfg), kIOReturnSuccess);
++        eq("navi48 rb: active_sa = 8 SAs", cfg.active_sa_bitmap, 0xFFu);
++        eq("navi48 rb: global_active_rb = 16 RBs", cfg.global_active_rb_bitmap, 0xFFFFu);
++        eq("navi48 rb: active_rb = 2 bits per SA", cfg.active_rb_bitmap, 0xFFFFu);
++        eq("navi48 rb: num_rbs = 4 SE x 4", cfg.num_rbs, 16);
++    }
++
++    // ---- Navi 48, SAs 0 and 1 disabled and RB 1 disabled ----
++    // Each SA disables a 2-bit RB pair, so SAs 0,1 remove RBs 0..3; RB 1 was
++    // already inside that, so the intersection loses nothing extra.
++    {
++        Scratch s;
++        GFXConfig cfg = prepareRb(s, {12, 0, 1}, packGb(2, 2, 2, 3, 1, 1));
++        s.gc0(GFXRegs::GRBM_CC_GC_SA_UNIT_DISABLE,
++              0x3u << GRBM_CC_GC_SA_UNIT_DISABLE__SA_DISABLE__SHIFT);
++        s.gc1(GFXRegs::GC_USER_RB_BACKEND_DISABLE,
++              0x2u << GC_USER_RB_BACKEND_DISABLE__BACKEND_DISABLE__SHIFT);
++        eq("navi48 SA0-1 off: setup_rb", gfx_setup_rb(s.dev, cfg), kIOReturnSuccess);
++        eq("navi48 SA0-1 off: active_sa", cfg.active_sa_bitmap, 0xFCu);
++        eq("navi48 SA0-1 off: active_rb loses the pair", cfg.active_rb_bitmap, 0xFFF0u);
++        eq("navi48 SA0-1 off: num_rbs = 12", cfg.num_rbs, 12);
++    }
++
++    // ---- refusals: unresolved GC, and caps that cannot be masked ----
++    {
++        Scratch s;
++        s.dev.ip = IPBaseTable{};
++        GFXConfig cfg{};
++        eq("setup_rb without a GC base", gfx_setup_rb(s.dev, cfg), kIOReturnNotReady);
++    }
++    {
++        Scratch s;
++        GFXConfig cfg{};   // every cap zero: width/height unknown
++        eq("setup_rb without caps", gfx_setup_rb(s.dev, cfg), kIOReturnNotReady);
++    }
++}
++
++} // namespace
++
++int main(int argc, char **argv)
++{
++    const std::string fwDir = argc > 1 ? argv[1] : "firmware";
++    std::printf("navi44_die_test -- Navi 44 firmware set (0002) + die geometry (0003)\n");
++    firmwareTests(fwDir);
++    geometryTests();
++    setupRbTests();
++
++    std::printf("\n================ SUMMARY ================\n");
++    std::printf("%d check(s) failed out of %d\n", gFail, gRun);
++    return gFail == 0 ? 0 : 1;
++}

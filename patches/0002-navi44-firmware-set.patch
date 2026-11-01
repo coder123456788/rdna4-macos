@@ -1,0 +1,279 @@
+diff --git a/src/navi48-bringup/Makefile b/src/navi48-bringup/Makefile
+index d20799e..06cd83a 100644
+--- a/src/navi48-bringup/Makefile
++++ b/src/navi48-bringup/Makefile
+@@ -24,8 +24,13 @@ FW_BINS  := $(wildcard firmware/*.bin)
+ FW_SRCS  := $(patsubst firmware/%.bin,src/fw/fw_%.c,$(FW_BINS))
+ # REQUIRED blobs: AMD firmware from linux-firmware, NOT in this repository (see BUILDING.md and
+ # tools/fetch-firmware.sh). The kext cannot link without them, so fail early with a clear message.
++#
++# Two dies' sets: the kext embeds both and picks one per device in probe()
++# (src/fw/fw_table.h: fw_select_for_device). Navi 48 first, Navi 44 second.
+ FW_REQUIRED := gc_12_0_1_imu gc_12_0_1_me gc_12_0_1_mec gc_12_0_1_pfp gc_12_0_1_rlc gc_12_0_1_uni_mes \
+-               psp_14_0_3_sos psp_14_0_3_ta sdma_7_0_1 smu_14_0_3
++               psp_14_0_3_sos psp_14_0_3_ta sdma_7_0_1 smu_14_0_3 \
++               gc_12_0_0_imu gc_12_0_0_me gc_12_0_0_mec gc_12_0_0_pfp gc_12_0_0_rlc gc_12_0_0_uni_mes \
++               psp_14_0_2_sos psp_14_0_2_ta sdma_7_0_0 smu_14_0_2
+ FW_MISSING  := $(filter-out $(patsubst firmware/%.bin,%,$(FW_BINS)),$(FW_REQUIRED))
+ # Our own compute test shaders, assembled from shaders/*.s (tools/build-shader.sh) and tracked as
+ # shaders/*.bin so no LLVM is needed to build the kext.
+diff --git a/src/navi48-bringup/src/Navi48Bringup.cpp b/src/navi48-bringup/src/Navi48Bringup.cpp
+index 59d08bc..e12ba73 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -39,10 +39,7 @@
+ #include <kern/clock.h>             // clock_get_uptime/absolutetime_to_nanoseconds - the owner's wait and non-owner
+                                      // yields are both timed (mirrors AppleHardwareHook.cpp's n48_pol_ns)
+ 
+-extern "C" {
+-extern const uint8_t fw_psp_14_0_3_sos[];
+-extern const size_t  fw_psp_14_0_3_sos_size;
+-}
++#include "fw/fw_table.h"            // 0.0.664 (Navi 44 part 2): per-die firmware set, selected in probe()
+ 
+ OSDefineMetaClassAndStructors(Navi48Bringup, IOService)
+ 
+@@ -583,9 +580,16 @@ void Navi48Bringup::stagePSP() {
+ 
+ 	HwBridge hw(this);
+ 	n48::PspLoader psp(hw);
+-	if (!psp.parseContainer(fw_psp_14_0_3_sos, fw_psp_14_0_3_sos_size)) {
+-		N48LOG("psp-stage: embedded container failed to parse; aborting"); setProperty("PSP,Stage", "bad-container"); return;
++	const amdgpu::FwBlob *sos = amdgpu::fw_get(amdgpu::FwId::PSP_SOS);
++	if (!sos || !sos->data || sos->size == 0) {
++		N48LOG("psp-stage: no PSP SOS blob for this die (%s); aborting", amdgpu::fw_is_navi44() ? "navi44" : "navi48");
++		setProperty("PSP,Stage", "no-sos-blob"); return;
++	}
++	if (!psp.parseContainer(sos->data, sos->size)) {
++		N48LOG("psp-stage: %s container failed to parse; aborting", sos->name);
++		setProperty("PSP,Stage", "bad-container"); return;
+ 	}
++	setProperty("PSP,SOSBlob", sos->name);
+ 	setProperty("PSP,ContainerSOSVersion", static_cast<uint64_t>(psp.sosVersion()), 32);
+ 	if (!psp.setFwPriOffset(vramBase)) { setProperty("PSP,Stage", "bad-fwpri"); return; }
+ 	if (!psp.preflight()) { N48LOG("psp-stage: preflight refused; nothing sent to the PSP"); setProperty("PSP,Stage", "preflight-refused"); return; }
+@@ -7336,6 +7340,12 @@ IOService *Navi48Bringup::probe(IOService *provider, SInt32 *score) {
+ 	    (device != 0x7550 && device != 0x7551 && device != 0x7590)) {
+ 		N48LOG("probe: 0x%08x not Navi 48 or Navi 44, ignoring", vendorDevice); return nullptr;
+ 	}
++	// Pick the firmware set before any stage can ask for a blob: Navi 44 and
++	// Navi 48 share the role names but ship different files (psp_14_0_2_* +
++	// gc_12_0_0_* vs psp_14_0_3_* + gc_12_0_1_*). Defaulting to the Navi 48
++	// set keeps every existing 0x7550/0x7551 path byte-identical.
++	amdgpu::fw_select_for_device(device);
++	setProperty("FW,Set", amdgpu::fw_is_navi44() ? "navi44" : "navi48");
+ 	if (device == 0x7590) {
+ 		// Navi 44 (RX 9050 / 9060 XT): DCN 4.1.0 display, GC 12.0.0, a smaller die.
+ 		// This match arms NOTHING: every writing stage keeps its own boot-arg
+diff --git a/src/navi48-bringup/src/amd/fw_table.cpp b/src/navi48-bringup/src/amd/fw_table.cpp
+index 1a011db..152a144 100644
+--- a/src/navi48-bringup/src/amd/fw_table.cpp
++++ b/src/navi48-bringup/src/amd/fw_table.cpp
+@@ -74,56 +74,104 @@ extern const size_t  fw_smu_14_0_3_size;
+ extern const uint8_t fw_sdma_7_0_1[];
+ extern const size_t  fw_sdma_7_0_1_size;
+ 
++// ---- Navi 44 (gfx1200, 0x7590) set ------------------------------------
++// Same roles, different files: GC 12.0.0, PSP/SMU 14.0.2, SDMA 7.0.0.
++extern const uint8_t fw_psp_14_0_2_sos[];
++extern const size_t  fw_psp_14_0_2_sos_size;
++
++extern const uint8_t fw_psp_14_0_2_ta[];
++extern const size_t  fw_psp_14_0_2_ta_size;
++
++extern const uint8_t fw_gc_12_0_0_imu[];
++extern const size_t  fw_gc_12_0_0_imu_size;
++
++extern const uint8_t fw_gc_12_0_0_pfp[];
++extern const size_t  fw_gc_12_0_0_pfp_size;
++
++extern const uint8_t fw_gc_12_0_0_me[];
++extern const size_t  fw_gc_12_0_0_me_size;
++
++extern const uint8_t fw_gc_12_0_0_mec[];
++extern const size_t  fw_gc_12_0_0_mec_size;
++
++extern const uint8_t fw_gc_12_0_0_uni_mes[];
++extern const size_t  fw_gc_12_0_0_uni_mes_size;
++
++extern const uint8_t fw_gc_12_0_0_rlc[];
++extern const size_t  fw_gc_12_0_0_rlc_size;
++
++extern const uint8_t fw_smu_14_0_2[];
++extern const size_t  fw_smu_14_0_2_size;
++
++extern const uint8_t fw_sdma_7_0_0[];
++extern const size_t  fw_sdma_7_0_0_size;
++
+ } // extern "C"
+ 
+ namespace {
+ 
+ constexpr uint32_t kCount = static_cast<uint32_t>(FwId::Count);
+ 
++// Which die's files fill the table. 0 means "nothing selected yet", which
++// builds the Navi 48 set — the only die this kext could bring up before the
++// Navi 44 port, so an unselected table keeps the historical behaviour.
++constexpr uint32_t kSetNavi48 = 1;
++constexpr uint32_t kSetNavi44 = 2;
++
+ // Plain zero-initialized statics — no constructor, lands in .bss.
+ FwBlob g_table[kCount];
+ bool   g_built = false;
++uint32_t g_set = 0;
++
++void put(FwId id, const uint8_t *data, size_t size, const char *name) {
++    g_table[static_cast<uint32_t>(id)] = FwBlob{ data, size, name, id };
++}
+ 
+ // Fills g_table[] with ordinary runtime assignments (reads each extern
+ // fw_<blob>_size's actual value — valid the moment this kext's segments
+ // are mapped, well before any bring-up code could call fw_get()). Safe
+-// to call repeatedly; only the first call does anything. Bring-up is
+-// single-threaded through this point, so no guard/lock is used — see
+-// the file header.
++// to call repeatedly after fw_select_for_device() clears g_built.
++// Bring-up is single-threaded through this point, so no guard/lock is
++// used — see the file header.
+ //
+-// GC_MES, GC_MES1 and GC_TOC have no embedded blob on this card's
+-// non-kicker psp_14_0_3/gfx1201 bring-up ladder (uni_mes supersedes the
+-// legacy split MES pair; TOC is only loaded for psp_14_0_5), so those
+-// rows keep data=nullptr, size=0 — see fw_table.h.
++// GC_MES, GC_MES1 and GC_TOC have no embedded blob on either die's
++// non-kicker bring-up ladder (uni_mes supersedes the legacy split MES
++// pair; TOC is only loaded for psp_14_0_5), so those rows keep
++// data=nullptr, size=0 — see fw_table.h.
+ void build_table() {
+     if (g_built) return;
+ 
+-    g_table[static_cast<uint32_t>(FwId::PSP_SOS)] =
+-        FwBlob{ fw_psp_14_0_3_sos, fw_psp_14_0_3_sos_size, "psp_14_0_3_sos", FwId::PSP_SOS };
+-    g_table[static_cast<uint32_t>(FwId::PSP_TA)] =
+-        FwBlob{ fw_psp_14_0_3_ta, fw_psp_14_0_3_ta_size, "psp_14_0_3_ta", FwId::PSP_TA };
+-    g_table[static_cast<uint32_t>(FwId::GC_IMU)] =
+-        FwBlob{ fw_gc_12_0_1_imu, fw_gc_12_0_1_imu_size, "gc_12_0_1_imu", FwId::GC_IMU };
+-    g_table[static_cast<uint32_t>(FwId::GC_PFP)] =
+-        FwBlob{ fw_gc_12_0_1_pfp, fw_gc_12_0_1_pfp_size, "gc_12_0_1_pfp", FwId::GC_PFP };
+-    g_table[static_cast<uint32_t>(FwId::GC_ME)] =
+-        FwBlob{ fw_gc_12_0_1_me, fw_gc_12_0_1_me_size, "gc_12_0_1_me", FwId::GC_ME };
+-    g_table[static_cast<uint32_t>(FwId::GC_MEC)] =
+-        FwBlob{ fw_gc_12_0_1_mec, fw_gc_12_0_1_mec_size, "gc_12_0_1_mec", FwId::GC_MEC };
+-    g_table[static_cast<uint32_t>(FwId::GC_MES)] =
+-        FwBlob{ nullptr, 0, "gc_12_0_1_mes", FwId::GC_MES };
+-    g_table[static_cast<uint32_t>(FwId::GC_MES1)] =
+-        FwBlob{ nullptr, 0, "gc_12_0_1_mes1", FwId::GC_MES1 };
+-    g_table[static_cast<uint32_t>(FwId::GC_UNI_MES)] =
+-        FwBlob{ fw_gc_12_0_1_uni_mes, fw_gc_12_0_1_uni_mes_size, "gc_12_0_1_uni_mes", FwId::GC_UNI_MES };
+-    g_table[static_cast<uint32_t>(FwId::GC_RLC)] =
+-        FwBlob{ fw_gc_12_0_1_rlc, fw_gc_12_0_1_rlc_size, "gc_12_0_1_rlc", FwId::GC_RLC };
+-    g_table[static_cast<uint32_t>(FwId::GC_TOC)] =
+-        FwBlob{ nullptr, 0, "gc_12_0_1_toc", FwId::GC_TOC };
+-    g_table[static_cast<uint32_t>(FwId::SMU)] =
+-        FwBlob{ fw_smu_14_0_3, fw_smu_14_0_3_size, "smu_14_0_3", FwId::SMU };
+-    g_table[static_cast<uint32_t>(FwId::SDMA)] =
+-        FwBlob{ fw_sdma_7_0_1, fw_sdma_7_0_1_size, "sdma_7_0_1", FwId::SDMA };
++    if (g_set == kSetNavi44) {
++        // Navi 44 / gfx1200 / RX 9050, RX 9060 XT
++        put(FwId::PSP_SOS, fw_psp_14_0_2_sos, fw_psp_14_0_2_sos_size, "psp_14_0_2_sos");
++        put(FwId::PSP_TA,  fw_psp_14_0_2_ta,  fw_psp_14_0_2_ta_size,  "psp_14_0_2_ta");
++        put(FwId::GC_IMU,  fw_gc_12_0_0_imu,  fw_gc_12_0_0_imu_size,  "gc_12_0_0_imu");
++        put(FwId::GC_PFP,  fw_gc_12_0_0_pfp,  fw_gc_12_0_0_pfp_size,  "gc_12_0_0_pfp");
++        put(FwId::GC_ME,   fw_gc_12_0_0_me,   fw_gc_12_0_0_me_size,   "gc_12_0_0_me");
++        put(FwId::GC_MEC,  fw_gc_12_0_0_mec,  fw_gc_12_0_0_mec_size,  "gc_12_0_0_mec");
++        put(FwId::GC_MES,  nullptr, 0, "gc_12_0_0_mes");
++        put(FwId::GC_MES1, nullptr, 0, "gc_12_0_0_mes1");
++        put(FwId::GC_UNI_MES, fw_gc_12_0_0_uni_mes, fw_gc_12_0_0_uni_mes_size, "gc_12_0_0_uni_mes");
++        put(FwId::GC_RLC,  fw_gc_12_0_0_rlc,  fw_gc_12_0_0_rlc_size,  "gc_12_0_0_rlc");
++        put(FwId::GC_TOC,  nullptr, 0, "gc_12_0_0_toc");
++        put(FwId::SMU,     fw_smu_14_0_2,     fw_smu_14_0_2_size,     "smu_14_0_2");
++        put(FwId::SDMA,    fw_sdma_7_0_0,     fw_sdma_7_0_0_size,     "sdma_7_0_0");
++    } else {
++        // Navi 48 / gfx1201 / RX 9070, RX 9070 XT, R9700
++        put(FwId::PSP_SOS, fw_psp_14_0_3_sos, fw_psp_14_0_3_sos_size, "psp_14_0_3_sos");
++        put(FwId::PSP_TA,  fw_psp_14_0_3_ta,  fw_psp_14_0_3_ta_size,  "psp_14_0_3_ta");
++        put(FwId::GC_IMU,  fw_gc_12_0_1_imu,  fw_gc_12_0_1_imu_size,  "gc_12_0_1_imu");
++        put(FwId::GC_PFP,  fw_gc_12_0_1_pfp,  fw_gc_12_0_1_pfp_size,  "gc_12_0_1_pfp");
++        put(FwId::GC_ME,   fw_gc_12_0_1_me,   fw_gc_12_0_1_me_size,   "gc_12_0_1_me");
++        put(FwId::GC_MEC,  fw_gc_12_0_1_mec,  fw_gc_12_0_1_mec_size,  "gc_12_0_1_mec");
++        put(FwId::GC_MES,  nullptr, 0, "gc_12_0_1_mes");
++        put(FwId::GC_MES1, nullptr, 0, "gc_12_0_1_mes1");
++        put(FwId::GC_UNI_MES, fw_gc_12_0_1_uni_mes, fw_gc_12_0_1_uni_mes_size, "gc_12_0_1_uni_mes");
++        put(FwId::GC_RLC,  fw_gc_12_0_1_rlc,  fw_gc_12_0_1_rlc_size,  "gc_12_0_1_rlc");
++        put(FwId::GC_TOC,  nullptr, 0, "gc_12_0_1_toc");
++        put(FwId::SMU,     fw_smu_14_0_3,     fw_smu_14_0_3_size,     "smu_14_0_3");
++        put(FwId::SDMA,    fw_sdma_7_0_1,     fw_sdma_7_0_1_size,     "sdma_7_0_1");
++    }
+ 
+     g_built = true;
+ }
+@@ -145,6 +193,28 @@ bool str_eq(const char *a, const char *b) {
+ 
+ } // anonymous namespace
+ 
++// Called once from probe(), before any stage runs. Idempotent: a repeat call
++// with the same device leaves a built table untouched.
++//
++// Clearing the rows here (rather than relying on build_table() to overwrite
++// them) keeps fw_get() honest if the caller looks at an id between selection
++// and first use: every row is either the selected die's blob or an explicit
++// {nullptr, 0, name} — never the other die's data.
++void fw_select_for_device(uint16_t deviceId) {
++    const uint32_t want = (deviceId == 0x7590) ? kSetNavi44 : kSetNavi48;
++    if (g_set == want) return;
++
++    g_set = want;
++    g_built = false;
++    for (uint32_t i = 0; i < kCount; ++i) {
++        g_table[i] = FwBlob{ nullptr, 0, nullptr, static_cast<FwId>(i) };
++    }
++}
++
++bool fw_is_navi44() {
++    return g_set == kSetNavi44;
++}
++
+ const FwBlob *fw_get(FwId id) {
+     build_table();
+     uint32_t idx = static_cast<uint32_t>(id);
+diff --git a/src/navi48-bringup/src/fw/fw_table.h b/src/navi48-bringup/src/fw/fw_table.h
+index b3b6da6..ace2142 100644
+--- a/src/navi48-bringup/src/fw/fw_table.h
++++ b/src/navi48-bringup/src/fw/fw_table.h
+@@ -52,4 +52,15 @@ const FwBlob *fw_get(FwId id);
+ // Looks up by bare name (e.g. "smu_14_0_3"); returns nullptr if not found.
+ const FwBlob *fw_find_by_name(const char *name);
+ 
++// Picks the blob set for a device before the first fw_get()/fw_find_by_name()
++// call. The roles are the same on both dies but the files are not:
++//   Navi 48 (0x7550, 0x7551): gc_12_0_1_*, psp_14_0_3_*, smu_14_0_3, sdma_7_0_1
++//   Navi 44 (0x7590):         gc_12_0_0_*, psp_14_0_2_*, smu_14_0_2, sdma_7_0_0
++// If it is never called the Navi 48 set is used, which is the historical
++// behaviour. Calling it again with a different id rebuilds the table.
++void fw_select_for_device(uint16_t deviceId);
++
++// True when the selected set is Navi 44's (0x7590).
++bool fw_is_navi44();
++
+ } // namespace amdgpu
+diff --git a/tools/fetch-firmware.sh b/tools/fetch-firmware.sh
+index b38e98d..92ddc0e 100755
+--- a/tools/fetch-firmware.sh
++++ b/tools/fetch-firmware.sh
+@@ -37,6 +37,16 @@ psp_14_0_3_sos    23bea01a0c6f36d00759d0765d46cb4cb4aa87398b2fbccacbf547a890c0bf
+ psp_14_0_3_ta     38d6691bf64232946cd5ce5735363c7c2877830ff640b9b95516403257fe2922
+ sdma_7_0_1        73c29e1c1714ebc95d2221ba56e187910902891593010653bf9518937e414a59
+ smu_14_0_3        3221ef2ddb341570eeb727e1e16f170bfb2ea1230be4a7eb248d0b183fbfbf15
++gc_12_0_0_imu     aa15e5b3156bffc45e0c50bccbcd364fbd3f958531b695b7487a803d780b8328
++gc_12_0_0_me      c288e326b9a5ccccac377455db3c25ace047a42a8e9e5a2239b5554dd2a9a9e7
++gc_12_0_0_mec     9b0788eb46efa7d53a1d87cfe3031cd403ec1eef04314af2a55257883a4560d1
++gc_12_0_0_pfp     cb6eb3ce40c79b0ada234b70ed038983627af78287afd7e5e26123dbcf7e79f8
++gc_12_0_0_rlc     6436b582734a413456fff3d3c7195e71cc9e78a7ed31ee21c83ffd6fae1ad186
++gc_12_0_0_uni_mes 309d60ad4a0210f8a68e27cae88beddb22b5ae900d70848b1e8ca0eac9d1decd
++psp_14_0_2_sos    7b538448b57d4f9dd06b2eea90d4f86a16e65e3027cdecee8db71c2c5f1fa243
++psp_14_0_2_ta     21b8898e56524240c19a1f834fcea3dde7d98c33044658a1641f0cb3c3b1bddd
++sdma_7_0_0        beaafb53993a106edd392392d5896245ae2a957c6d0f495d0002eec72ad8ad38
++smu_14_0_2        1b2054e3f710d1ab8dbdf6ff35914ad376b51caa6337831260c955add874b2ee
+ "
+ 
+ while read -r name want; do

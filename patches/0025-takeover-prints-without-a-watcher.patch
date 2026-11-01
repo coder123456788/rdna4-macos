@@ -1,0 +1,44 @@
+From d1b8240330afce2c21994fdb0f83c67f28803756 Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Sat, 31 Oct 2026 10:36:50 -0700
+Subject: [PATCH] 0025: print the takeover even when no watcher was armed
+
+---
+ src/navi48-bringup/src/accel_takeover.cpp | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/src/navi48-bringup/src/accel_takeover.cpp b/src/navi48-bringup/src/accel_takeover.cpp
+index 738a541..aa9cd48 100644
+--- a/src/navi48-bringup/src/accel_takeover.cpp
++++ b/src/navi48-bringup/src/accel_takeover.cpp
+@@ -165,11 +165,26 @@ void takeover_arm(::IOService *provider) {
+ 
+ // Called from Apple's start() through SpecialAMDKey, so it must not sleep: the block is held
+ // by the poller, whose thread is ours, not Apple's.
++//
++// 0025: a positive announce is proof by itself and is printed even when no watcher is armed.
++// The armed path only exists when OUR fire path published LoadAccelerator, but on the 0x73BF
++// pair boot Apple's own HW-services driver can publish it later, after our gate refused or our
++// TTL hook missed its window - and an unarmed boot used to drop the one line that says the
++// handover happened. Negative verdicts stay gated on arming: "Apple never started" is only
++// meaningful when the card was actually offered.
+ void takeover_mark_started(void *accel) {
+-    if (!__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE)) return;
+     __atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE);
++    if (__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE)) {
++        TAKELOG("Apple's accelerator announced itself over SpecialAMDKey 0x00 (accel=%p) - "
++                "the handover happened", accel);
++        return;
++    }
++    TAKELOG("========== NAVI 44 TAKEOVER REPORT (no watcher armed) ==========");
++    TAKELOG("%s", n48::accel_takeover_headline(n48::TakeoverVerdict::Started));
+     TAKELOG("Apple's accelerator announced itself over SpecialAMDKey 0x00 (accel=%p) - "
+             "the handover happened", accel);
++    print_ttl_census();
++    TAKELOG("no terminal needed: photograph this screen");
+ }
+ 
+ void takeover_start_poller() {
+-- 
+2.52.0.windows.1
+

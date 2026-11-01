@@ -1,0 +1,768 @@
+From 22992ce1f27d2effbffdcea5aa2d711e55a2e0be Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Sat, 31 Oct 2026 11:39:12 -0700
+Subject: [PATCH] 0027: the verdict lands on the boot stick, not a photograph
+
+A boots report comes back only as a photograph today, and the owner has no camera in
+the loop. The boot stick is a plain FAT32 data partition, so macOS mounts it at
+/Volumes/OPENCORE; the kext now writes navi48-report.txt there from its own kernel
+thread: same headline as the screen, the takeover verdict and cause, kext/accelerator
+facts, injected ids, and the TTL census. One file per boot, rewritten until the verdict
+is final - an unarmed (0x73BF pair) boot keeps watching for a late announce, since only
+an armed timeout and a positive announce are final. Host suite: 64 checks; the plant
+harness catches 34/34 breaks.
+---
+ src/navi48-bringup/src/Navi48Bringup.cpp      |   7 +-
+ src/navi48-bringup/src/accel_report_file.h    | 128 ++++++++++
+ src/navi48-bringup/src/accel_takeover.cpp     | 145 +++++++++++
+ .../tests/accel_report_file_plant.sh          | 149 +++++++++++
+ .../tests/accel_report_file_test.cpp          | 238 ++++++++++++++++++
+ 5 files changed, 666 insertions(+), 1 deletion(-)
+ create mode 100644 src/navi48-bringup/src/accel_report_file.h
+ create mode 100644 src/navi48-bringup/tests/accel_report_file_plant.sh
+ create mode 100644 src/navi48-bringup/tests/accel_report_file_test.cpp
+
+diff --git a/src/navi48-bringup/src/Navi48Bringup.cpp b/src/navi48-bringup/src/Navi48Bringup.cpp
+index 24677f3..468b20a 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -47,6 +47,7 @@
+ #include "accel_fire_at_boot.h"     // 0017: may this boot run the fire path with no userspace verb?
+ #include "accel_boot_report.h"      // 0019: the boot screen is the report - no keyboard here
+ #include "accel_takeover_report.h"  // 0020: ...and the screen reports whether Apple took the card
++#include "accel_report_file.h"      // 0027: ...and the stick carries the verdict, no photograph
+ 
+ // 0016 — the stage-17 compute shader, so the Navi 44 gate can report what it is about to
+ // let a writing stage upload. Same declaration as src/amd/compute_test.cpp's: C linkage
+@@ -7810,8 +7811,12 @@ bool Navi48Bringup::start(IOService *provider) {
+ 			PE_parse_boot_argn("navi48-report-hold", &holdRequested, sizeof(holdRequested));
+ 			const n48::AccelBootReport rmode =
+ 				n48::accel_report_mode(ff.argRequested, holdRequested);
++			const char *head = n48::accel_report_headline(fv, fireCalled, fireKr, ff.gateMode);
++			// 0027: the same sentence goes to the stick as well, from a thread that waits for the
++			// verdict and then for /Volumes/OPENCORE - so a boot reports itself with no
++			// photograph. Started on every requested boot, not only when this port fired.
++			if (ff.argRequested) n48::takeover_start_writer(head);
+ 			if (rmode != n48::AccelBootReport::Off) {
+-				const char *head = n48::accel_report_headline(fv, fireCalled, fireKr, ff.gateMode);
+ 				const uint32_t secs = (rmode == n48::AccelBootReport::PrintAndHold)
+ 				                    ? n48::accel_report_hold_seconds(holdRequested) : 0;
+ 				setProperty("Navi48,AccelReport", head);
+diff --git a/src/navi48-bringup/src/accel_report_file.h b/src/navi48-bringup/src/accel_report_file.h
+new file mode 100644
+index 0000000..2b1d5dc
+--- /dev/null
++++ b/src/navi48-bringup/src/accel_report_file.h
+@@ -0,0 +1,128 @@
++//  accel_report_file.h — patch 0027: the verdict leaves the screen and lands on the stick.
++//
++//  0019-0025 answer the two questions a boot has to answer - did this port publish
++//  LoadAccelerator, and did Apple's accelerator then take the card - but every answer is printed
++//  to the -v console and needs a photograph to come back. This machine has no camera in the loop,
++//  so the answer has to survive the boot by itself.
++//
++//  The boot stick is a plain FAT32 data partition (not an ESP), so macOS auto-mounts it as
++//  /Volumes/OPENCORE at every boot with the stick attached. accel_report_file.cpp writes this
++//  text there from a kernel thread after the verdict is settled; the owner only has to hand the
++//  stick back, and the file is readable from Windows as E:\navi48-report.txt.
++//
++//  The text is built here, with no IOKit, so the host suite can check every line and every
++//  variant without a Mac - the same split as accel_takeover_report.h / accel_takeover.cpp.
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include "accel_takeover_report.h"
++
++namespace n48 {
++
++constexpr const char *kReportFilePath = "/Volumes/OPENCORE/navi48-report.txt";
++constexpr uint32_t kReportFileRetrySeconds = 120;  // the FAT volume mounts when diskarbitrationd gets there
++constexpr uint32_t kReportFileSettleSeconds = 2;   // let Apple's last calls land in the census
++
++struct ReportFileInputs {
++    const char *fireHeadline;  // 0019: what this port decided (never null when written)
++    bool armed;                // a watcher was watching this boot
++    bool started;              // Apple's accelerator announced itself
++    bool appleKextLoaded;      // TakeoverFacts, gathered after the wait
++    bool accelAttached;
++    uint16_t deviceId;         // IOKit properties, 0 = none injected
++    uint16_t vendorId;
++    uint32_t waited;           // seconds the writer waited before settling
++    uint32_t ttlBound;
++    uint32_t ttlCalls;
++    uint32_t ttlSlots;
++    int firstUnsupported;
++    uint64_t reachedMask;      // bit s = slot s was called
++};
++
++// Pure; snprintf semantics: returns the length the full text needs, always NUL-terminates when
++// cap > 0, and counts without writing when out is null. One line per fact so a partial file
++// still reads.
++inline size_t report_file_text(char *out, size_t cap, const ReportFileInputs &in) {
++    struct W {
++        char *out;
++        size_t cap, len;
++        void ch(char c) { if (out && len + 1 < cap) out[len] = c; len++; }
++        void str(const char *s) { while (s && *s) ch(*s++); }
++        void dec(uint32_t v) {
++            char b[10];
++            int i = 0;
++            if (!v) { ch('0'); return; }
++            while (v) { b[i++] = (char)('0' + v % 10); v /= 10; }
++            while (i) ch(b[--i]);
++        }
++        void hex4(uint16_t v) {
++            static const char h[] = "0123456789abcdef";
++            for (int s = 12; s >= 0; s -= 4) ch(h[(v >> s) & 15]);
++        }
++        void finish() { if (out && cap) out[len < cap ? len : cap - 1] = 0; }
++    } w = { out, cap, 0 };
++
++    w.str("navi48 report - written by the kext; no photograph needed\n");
++    w.str("acceleration report: ");
++    w.str(in.fireHeadline ? in.fireHeadline : "(not reported)");
++    w.ch('\n');
++    w.str("takeover: ");
++    w.str(in.started ? "STARTED - Apple's accelerator announced itself"
++          : in.armed  ? "NO TAKEOVER - no announce within the wait"
++                      : "not tracked - no watcher was armed on this boot");
++    w.ch('\n');
++    if (!in.started) {
++        const TakeoverFacts f = { in.appleKextLoaded, in.accelAttached };
++        w.str("cause: ");
++        w.str(accel_takeover_diagnosis(f));
++        w.ch('\n');
++    }
++    w.str("waited: ");
++    w.dec(in.waited);
++    w.str(" s\n");
++    w.str("kext loaded=");
++    w.dec(in.appleKextLoaded ? 1u : 0u);
++    w.str("  accelerator child=");
++    w.dec(in.accelAttached ? 1u : 0u);
++    w.ch('\n');
++    w.str("card: device-id 0x");
++    w.hex4(in.deviceId);
++    w.str("  vendor-id 0x");
++    w.hex4(in.vendorId);
++    w.str("  (IOKit properties; 0 = none injected)\n");
++    w.str("ttl: bound=");
++    w.dec(in.ttlBound);
++    w.str(" calls=");
++    w.dec(in.ttlCalls);
++    w.str(" slots=");
++    w.dec(in.ttlSlots);
++    w.str("/43 first unsupported=");
++    if (in.firstUnsupported < 0) {
++        w.ch('-');
++        w.dec((uint32_t)(-in.firstUnsupported));
++    } else {
++        w.dec((uint32_t)in.firstUnsupported);
++    }
++    w.ch('\n');
++    if (in.reachedMask) {
++        w.str("ttl slots reached:");
++        static const char hx[] = "0123456789abcdef";
++        for (int s = 0; s < 43; s++) {
++            if ((in.reachedMask >> s) & 1) {
++                w.ch(' ');
++                w.ch(hx[s >> 4]);
++                w.ch(hx[s & 15]);
++            }
++        }
++        w.ch('\n');
++    }
++    w.finish();
++    return w.len;
++}
++
++// ---- runtime, defined in accel_takeover.cpp ----
++void takeover_start_writer(const char *fireHeadline);
++
++} // namespace n48
+diff --git a/src/navi48-bringup/src/accel_takeover.cpp b/src/navi48-bringup/src/accel_takeover.cpp
+index aa9cd48..71a5bd9 100644
+--- a/src/navi48-bringup/src/accel_takeover.cpp
++++ b/src/navi48-bringup/src/accel_takeover.cpp
+@@ -8,6 +8,7 @@
+ //  Same idiom as AppleHardwareHook.cpp's kIQ stamp poller: kernel_thread_start, deallocate, done.
+ 
+ #include "accel_takeover_report.h"
++#include "accel_report_file.h"
+ 
+ #include "amd/n48log.h"
+ #include "apple/Navi48Ttl.hpp"
+@@ -18,6 +19,38 @@
+ #include <libkern/c++/OSMetaClass.h>
+ #include <libkern/c++/OSSymbol.h>
+ 
++// 0027: the BSD VFS entry points. MacKernelSDK ships no bsd/ headers, so the prototypes are
++// declared here from xnu-12377 (Tahoe) bsd/sys/vnode.h. vn_rdwr fills its own vfs_context from
++// current_thread() and ignores the proc argument for UIO_SYSSPACE, so a kernel thread can call
++// this without a user process. Argument kinds are spelled as their ABI types (pointers, int
++// enums, int64 off_t) so the C++ declarations match the C symbols the kernel exports.
++extern "C" {
++struct vnode;
++struct vfs_context;
++struct ucred;
++typedef struct vnode *vnode_t;
++typedef struct vfs_context *vfs_context_t;
++typedef struct ucred *kauth_cred_t;
++vfs_context_t vfs_context_create(vfs_context_t ctx);
++int vfs_context_rele(vfs_context_t ctx);
++kauth_cred_t vfs_context_ucred(vfs_context_t ctx);
++int vnode_open(const char *path, int fmode, int cmode, int flags, vnode_t *vpp,
++               vfs_context_t ctx);
++int vnode_close(vnode_t vp, int flags, vfs_context_t ctx);
++int vn_rdwr(int rw, vnode_t vp, char *base, int len, long long offset, int segflg, int ioflg,
++            kauth_cred_t cred, int *aresid, void *p);
++}
++
++namespace {
++constexpr int kO_WRONLY = 0x0001;
++constexpr int kO_CREAT = 0x0200;
++constexpr int kO_TRUNC = 0x0400;
++constexpr int kUIO_WRITE = 1;
++constexpr int kUIO_SYSSPACE = 2;
++constexpr int kFWRITE = 0x0002;
++constexpr int kEIO = 5;
++} // namespace
++
+ #define TAKELOG(fmt, ...) ::amdgpu::n48_logf("takeover: " fmt "\n", ##__VA_ARGS__)
+ 
+ namespace {
+@@ -26,6 +59,8 @@ volatile uint32_t gArmed;
+ volatile uint32_t gStarted;
+ volatile uint32_t gBlockPrinted;
+ volatile uintptr_t gProvider;
++volatile uint32_t gWriterStarted;
++volatile uintptr_t gFireHeadline;
+ 
+ bool text_contains(const char *hay, const char *needle) {
+     if (!hay || !needle) return false;
+@@ -112,6 +147,97 @@ uint16_t injected_id(::IOService *prov, const char *name) {
+     return (uint16_t)(b[0] | (b[1] << 8));
+ }
+ 
++// 0027: everything the file needs, read at write time so a late kextd load and its TTL calls
++// are still in the numbers. A benign race with Apple's own thread, as in print_ttl_census().
++n48::ReportFileInputs gather_report_inputs() {
++    n48::ReportFileInputs in = {};
++    in.fireHeadline = (const char *)__atomic_load_n(&gFireHeadline, __ATOMIC_ACQUIRE);
++    in.armed = __atomic_load_n(&gArmed, __ATOMIC_ACQUIRE) != 0;
++    in.started = __atomic_load_n(&gStarted, __ATOMIC_ACQUIRE) != 0;
++    const n48::TakeoverFacts f = gather_facts();
++    in.appleKextLoaded = f.appleKextLoaded;
++    in.accelAttached = f.accelAttached;
++    IOService *prov = (IOService *)__atomic_load_n(&gProvider, __ATOMIC_ACQUIRE);
++    in.deviceId = injected_id(prov, "device-id");
++    in.vendorId = injected_id(prov, "vendor-id");
++    const int first = gNavi48Ttl.firstUnsupported();
++    uint32_t slots = 0;
++    uint64_t mask = 0;
++    for (int s = 0; s < 43; s++) {
++        if (gNavi48Ttl.callCount(s) != 0) {
++            slots++;
++            mask |= (1ull << s);
++        }
++    }
++    in.ttlBound = gNavi48Ttl.bound() ? 1u : 0u;
++    in.ttlCalls = gNavi48Ttl.totalCalls();
++    in.ttlSlots = slots;
++    in.firstUnsupported = first;
++    in.reachedMask = mask;
++    return in;
++}
++
++// A plain kernel-thread write to the mounted FAT32 stick. 0 on success, the VFS errno otherwise;
++// a short write is reported as EIO so the caller retries rather than leaving half a file.
++int write_report_file(const char *text, size_t len) {
++    vfs_context_t ctx = vfs_context_create(nullptr);
++    if (!ctx) return kEIO;
++    vnode_t vp = nullptr;
++    int err = vnode_open(n48::kReportFilePath, kO_WRONLY | kO_CREAT | kO_TRUNC, 0644, 0, &vp, ctx);
++    if (err == 0 && vp) {
++        int resid = 0;
++        err = vn_rdwr(kUIO_WRITE, vp, (char *)text, (int)len, 0, kUIO_SYSSPACE, 0,
++                      vfs_context_ucred(ctx), &resid, nullptr);
++        if (err == 0 && resid != 0) err = kEIO;
++        vnode_close(vp, kFWRITE, ctx);
++    } else if (err == 0) {
++        err = kEIO;
++    }
++    vfs_context_rele(ctx);
++    return err;
++}
++
++// Waits for the verdict, then for the stick. The volume appears when diskarbitrationd mounts it,
++// which is well after this kext starts, so failure to open is expected for a while and is
++// retried instead of reported as a verdict. On an unarmed boot (the 0x73BF pair) the negative
++// verdict is never final - Apple's own driver can publish much later - so the file keeps being
++// rewritten until an announce arrives or the window closes.
++void report_file_thread(void *, wait_result_t) {
++    uint32_t waited = 0;
++    while (waited < n48::kTakeoverWaitSeconds) {
++        IOSleep(1000);
++        waited++;
++        if (__atomic_load_n(&gStarted, __ATOMIC_ACQUIRE)) break;
++    }
++    IOSleep(n48::kReportFileSettleSeconds * 1000);
++    char text[2048];
++    bool wroteOnce = false;
++    for (uint32_t t = 0; t < n48::kReportFileRetrySeconds; t++) {
++        n48::ReportFileInputs in = gather_report_inputs();
++        in.waited = waited;
++        const size_t n = n48::report_file_text(text, sizeof text, in);
++        const int err = write_report_file(text, n);
++        if (err == 0) {
++            if (!wroteOnce) {
++                TAKELOG("report written to %s (%llu bytes) - no photograph needed",
++                        n48::kReportFilePath, (unsigned long long)n);
++                wroteOnce = true;
++            }
++            // Started is final; an armed timeout is final; an unarmed quiet boot is not.
++            if (in.started || in.armed) return;
++        } else if (t == 0) {
++            TAKELOG("report file not writable yet (%d); retrying up to %u s",
++                    err, n48::kReportFileRetrySeconds);
++        }
++        IOSleep(1000);
++        if (waited < n48::kTakeoverWaitSeconds) waited++;
++    }
++    if (wroteOnce)
++        TAKELOG("report file last written before the window closed: %s", n48::kReportFilePath);
++    else
++        TAKELOG("report file never written: %s never became writable", n48::kReportFilePath);
++}
++
+ void print_block(n48::TakeoverVerdict v, uint32_t waited, const n48::TakeoverFacts &f) {
+     for (uint32_t t = 0; t <= n48::kTakeoverHold; t++) {
+         TAKELOG("========== NAVI 44 TAKEOVER REPORT %u/%u ==========", t, n48::kTakeoverHold);
+@@ -198,4 +324,23 @@ void takeover_start_poller() {
+     TAKELOG("watching %u s for Apple's accelerator to announce itself", kTakeoverWaitSeconds);
+ }
+ 
++// 0027: started whenever the report was requested - not only when this port's fire path
++// published. On the 0x73BF pair boot Apple's own driver publishes LoadAccelerator and our gate
++// never fires; that is exactly the boot whose verdict has to survive without a photograph.
++void takeover_start_writer(const char *fireHeadline) {
++    uint32_t expected = 0;
++    if (!__atomic_compare_exchange_n(&gWriterStarted, &expected, 1u, false, __ATOMIC_ACQ_REL,
++                                     __ATOMIC_ACQUIRE)) return;
++    __atomic_store_n(&gFireHeadline, (uintptr_t)fireHeadline, __ATOMIC_RELEASE);
++    thread_t th = nullptr;
++    const kern_return_t kr = kernel_thread_start(&report_file_thread, nullptr, &th);
++    if (kr != KERN_SUCCESS) {
++        TAKELOG("kernel_thread_start failed (0x%x) - no report file on this boot", kr);
++        return;
++    }
++    thread_deallocate(th);
++    TAKELOG("report file thread started; it writes %s once the verdict is settled",
++            kReportFilePath);
++}
++
+ } // namespace n48
+diff --git a/src/navi48-bringup/tests/accel_report_file_plant.sh b/src/navi48-bringup/tests/accel_report_file_plant.sh
+new file mode 100644
+index 0000000..176e2a1
+--- /dev/null
++++ b/src/navi48-bringup/tests/accel_report_file_plant.sh
+@@ -0,0 +1,149 @@
++#!/usr/bin/env bash
++#
++#  accel_report_file_plant.sh — prove the 0027 suite can actually fail.
++#
++#  Usage (from anywhere):  ZIG=/path/to/zig.exe bash tests/accel_report_file_plant.sh
++#
++#  One break at a time, planted into a COPY of the real sources, and the suite must catch it.
++#  This block writes the boot's verdict to the boot stick instead of the screen, so this file is
++#  the only thing that comes back from a boot: a wrong line, a lost cause, or a writer that never
++#  starts would send the next fix at the wrong layer. The suite is what makes that recoverable.
++#
++#  Rules (same as the other *_plant.sh here):
++#    * needles are SINGLE-LINE, because the checkout is CRLF and a multi-line needle never
++#      matches;
++#    * every needle must be found, or the run aborts - a drifted needle silently becomes
++#      "no plant applied", which reads exactly like a passing suite;
++#    * the pristine checksum is taken up front and re-checked at the end;
++#    * `control` runs the untouched copy first.
++#
++set -u
++
++ZIG="${ZIG:?set ZIG to the zig (or zig c++) driver to use}"
++HERE="$(cd "$(dirname "$0")" && pwd)"
++ROOT="$(cd "$HERE/.." && pwd)"
++SCR="$(mktemp -d)"
++mkdir -p "$SCR" || { echo "cannot make $SCR"; exit 2; }
++trap 'rm -rf "$SCR"' EXIT
++
++cp -R "$ROOT/src" "$SCR/src" || { echo "copy of src failed"; exit 2; }
++cp -R "$ROOT/tests/dalshim" "$SCR/dalshim" 2>/dev/null
++
++PRISTINE=$(find "$SCR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) \
++    | sort | xargs cat | cksum | awk '{print $1}')
++
++build_run() {
++	# "$ZIG" stays quoted: the toolchain path contains spaces on this workstation.
++	"$ZIG" c++ -std=c++17 -O1 -I "$SCR/dalshim" -I "$SCR/src" \
++		"$HERE/accel_report_file_test.cpp" -o "$SCR/t" >"$SCR/build.log" 2>&1 || {
++		echo "    BUILD FAILED"; sed -n '1,6p' "$SCR/build.log"; return 2; }
++	"$SCR/t" "$SCR" >"$SCR/run.log" 2>&1
++	return $?
++}
++
++count_matches() { # file needle -> echoes the number of occurrences
++	N="$2" perl -0777 -ne 'my $c = () = $_ =~ /\Q$ENV{N}\E/g; print $c' "$1"
++}
++
++plant() {
++	local file="$1" needle="$2" repl="$3" occ="${4:-1}"
++	local path="$SCR/$file"
++	cp "$ROOT/$file" "$path"                       # always plant from pristine
++	local found
++	found=$(count_matches "$path" "$needle")
++	if [ "${found:-0}" -lt "$occ" ]; then
++		echo "    NEEDLE MISSING (occ $occ of $found): $needle"
++		return 9
++	fi
++	N="$needle" R="$repl" O="$occ" perl -0777 -i -pe '
++		my $n = $ENV{N}; my $r = $ENV{R}; my $want = $ENV{O}; my $i = 0;
++		s/\Q$n\E/$i++; ($i == $want) ? $r : $n/ge;
++	' "$path"
++	local after afterRepl
++	after=$(count_matches "$path" "$needle")
++	afterRepl=$(count_matches "$path" "$repl")
++	if [ "$after" -ge "$occ" ] && [ "${afterRepl:-0}" -eq 0 ]; then
++		echo "    PLANT DID NOT LAND"
++		return 9
++	fi
++	return 0
++}
++
++restore_all() { rm -rf "$SCR/src"; cp -R "$ROOT/src" "$SCR/src"; }
++
++F=src/accel_report_file.h
++R=src/accel_takeover.cpp
++C=src/Navi48Bringup.cpp
++
++declare -a PASS FAIL MISS
++PASSN=0 FAILN=0 MISSN=0
++run_plant() { # LABEL FILE NEEDLE REPL [OCC]
++	local label="$1"; shift
++	printf '  %-58s' "$label"
++	if ! plant "$@"; then echo "PLANT-ERROR"; MISS+=("$label"); MISSN=$((MISSN + 1)); restore_all; return; fi
++	build_run
++	local rc=$?
++	if [ "$rc" -eq 0 ]; then echo "ESCAPED (suite still passed)"; FAIL+=("$label"); FAILN=$((FAILN + 1));
++	else echo "caught (rc=$rc)"; PASS+=("$label"); PASSN=$((PASSN + 1)); fi
++	restore_all
++}
++
++echo "== control: the untouched copy =="
++if build_run; then echo "  control PASSED - plants below are meaningful"
++else echo "  control FAILED - the copy/build step is broken, stopping"; exit 1; fi
++
++echo "== plants: the text a boot comes back as =="
++run_plant "text: the banner drops no-photograph"     "$F" 'written by the kext; no photograph needed' 'written by the kext'
++run_plant "text: a missing headline reads empty"     "$F" 'w.str(in.fireHeadline ? in.fireHeadline : "(not reported)");' 'w.str(in.fireHeadline ? in.fireHeadline : "");'
++run_plant "text: armed timeout reads as STARTED"     "$F" '"NO TAKEOVER - no announce within the wait"' '"STARTED - Apple'"'"'s accelerator announced itself"'
++run_plant "text: unarmed reads as NO TAKEOVER"       "$F" '"not tracked - no watcher was armed on this boot"' '"NO TAKEOVER - no announce within the wait"'
++run_plant "text: a takeover carries a cause line"    "$F" 'if (!in.started) {' 'if (true) {'
++run_plant "text: the cause line goes blank"          "$F" 'w.str(accel_takeover_diagnosis(f));' 'w.str("");'
++run_plant "text: the wait is always zero"            "$F" 'w.dec(in.waited);' 'w.dec(0);'
++run_plant "text: kext-loaded bit is inverted"        "$F" 'w.dec(in.appleKextLoaded ? 1u : 0u);' 'w.dec(in.appleKextLoaded ? 0u : 1u);'
++run_plant "text: device and vendor swapped"          "$F" 'w.hex4(in.deviceId);' 'w.hex4(in.vendorId);'
++run_plant "text: the ids print decimal"              "$F" 'w.hex4(in.deviceId);' 'w.dec(in.deviceId);'
++run_plant "text: first unsupported loses its sign"   "$F" 'w.ch('"'"'-'"'"');' ';'
++run_plant "text: slot scan stops at 42"              "$F" 'for (int s = 0; s < 43; s++) {' 'for (int s = 0; s < 42; s++) {'
++run_plant "text: reached mask shifts by one"         "$F" 'if ((in.reachedMask >> s) & 1) {' 'if ((in.reachedMask >> (s + 1)) & 1) {'
++run_plant "text: the buffer is never terminated"     "$F" 'void finish() { if (out && cap) out[len < cap ? len : cap - 1] = 0; }' 'void finish() { }'
++
++echo "== plants: the write itself (VFS from our own thread) =="
++run_plant "writer: the path leaves the stick"        "$R" 'vnode_open(n48::kReportFilePath' 'vnode_open("/tmp/navi48-report.txt"'
++run_plant "writer: opened without write access"      "$R" 'kO_WRONLY | kO_CREAT | kO_TRUNC' 'kO_CREAT | kO_TRUNC'
++run_plant "writer: the uio is a read"                "$R" 'vn_rdwr(kUIO_WRITE, vp, (char *)text' 'vn_rdwr(0, vp, (char *)text'
++run_plant "writer: a user-space buffer"              "$R" '0, kUIO_SYSSPACE, 0,' '0, 0, 0,'
++run_plant "writer: the vnode is leaked"              "$R" 'vnode_close(vp, kFWRITE, ctx);' ';'
++run_plant "writer: the vfs context is leaked"        "$R" 'vfs_context_rele(ctx);' ';'
++run_plant "writer: a short write passes as success"  "$R" 'if (err == 0 && resid != 0) err = kEIO;' ';'
++run_plant "writer: our thread is never started"      "$R" 'kernel_thread_start(&report_file_thread, nullptr, &th)' 'kernel_thread_start(&report_file_thread_gone, nullptr, &th)'
++run_plant "writer: two threads can start"            "$R" '__atomic_compare_exchange_n(&gWriterStarted' '__atomic_compare_exchange_n((uint32_t *)&gWriterStarted'
++run_plant "writer: the headline is dropped"          "$R" '__atomic_store_n(&gFireHeadline, (uintptr_t)fireHeadline, __ATOMIC_RELEASE);' ';'
++run_plant "writer: the headline is not gathered"     "$R" 'in.fireHeadline = (const char *)__atomic_load_n(&gFireHeadline, __ATOMIC_ACQUIRE);' 'in.fireHeadline = nullptr;'
++run_plant "writer: the settle is two milliseconds"   "$R" 'IOSleep(n48::kReportFileSettleSeconds * 1000);' 'IOSleep(n48::kReportFileSettleSeconds);'
++run_plant "writer: unarmed freezes on first write"   "$R" 'if (in.started || in.armed) return;' 'if (true) return;'
++run_plant "writer: the device id is not gathered"    "$R" 'in.deviceId = injected_id(prov, "device-id")' 'in.deviceId = 0'
++run_plant "writer: the slot mask is a single bit"    "$R" 'mask |= (1ull << s)' 'mask |= (1ull << 0)'
++run_plant "header: the volume is misspelled"         "$F" '"/Volumes/OPENCORE/navi48-report.txt"' '"/Volumes/OPENCORE/navi48-report.txtx"'
++run_plant "header: the retry window is one second"   "$F" 'kReportFileRetrySeconds = 120' 'kReportFileRetrySeconds = 1'
++
++echo "== plants: the xsrc wiring (every requested boot writes) =="
++run_plant "xsrc: the header is not included"         "$C" '#include "accel_report_file.h"' '#include "accel_report_file_gone.h"'
++run_plant "xsrc: the writer is never started"        "$C" 'if (ff.argRequested) n48::takeover_start_writer(head);' ';'
++run_plant "xsrc: only a fired boot writes"           "$C" 'if (ff.argRequested) n48::takeover_start_writer(head);' 'if (fireCalled) n48::takeover_start_writer(head);'
++
++echo "== summary =="
++# Plain integers: `${#ARR[@]}` on an empty array is an unbound-variable fatal under set -u.
++echo "caught:   $PASSN"
++echo "escaped:  $FAILN  ${FAIL[*]:-}"
++echo "plant-errors: $MISSN  ${MISS[*]:-}"
++
++AFTER=$(find "$SCR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) \
++    | sort | xargs cat | cksum | awk '{print $1}')
++if [ "$AFTER" != "$PRISTINE" ]; then
++	echo "PRISTINE CHECKSUM CHANGED - the copy is polluted; investigate before trusting any result"
++	exit 3
++fi
++echo "pristine tree unchanged after the run (checksum $PRISTINE)"
++
++[ "$FAILN" -eq 0 ] && [ "$MISSN" -eq 0 ]
+diff --git a/src/navi48-bringup/tests/accel_report_file_test.cpp b/src/navi48-bringup/tests/accel_report_file_test.cpp
+new file mode 100644
+index 0000000..38aac28
+--- /dev/null
++++ b/src/navi48-bringup/tests/accel_report_file_test.cpp
+@@ -0,0 +1,238 @@
++//  accel_report_file_test.cpp — host suite for the on-disk verdict (patch 0027).
++//
++//  Build (any machine, no Mac, no GPU):
++//    zig c++ -std=c++17 -Wall -Wextra -O1 -I tests/dalshim -I src \
++//        tests/accel_report_file_test.cpp -o /tmp/accel_report_file_test.exe
++//    /tmp/accel_report_file_test.exe .
++//
++//  argv[1] is the navi48-bringup root, used by the source-pin sections.
++//
++//  Why a suite for a text file: the owner has no camera in the loop, so this file is the only
++//  thing that comes back from a boot. A file that says the wrong verdict, drops the cause, or
++//  silently writes nothing is worse than no file - it sends the next fix at the wrong layer.
++
++#include "accel_report_file.h"
++
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <sstream>
++#include <string>
++
++namespace {
++
++int gChecks = 0, gFailures = 0;
++void report(const char *file, int line, const char *what, bool ok) {
++	gChecks++;
++	if (ok) return;
++	gFailures++;
++	printf("FAIL %s:%d: %s\n", file, line, what);
++}
++#define CHECK(cond) report(__FILE__, __LINE__, #cond, (cond))
++
++std::string slurp(const std::string &path) {
++	std::ifstream in(path, std::ios::binary);
++	if (!in) return "";
++	std::ostringstream ss;
++	ss << in.rdbuf();
++	return ss.str();
++}
++
++bool has(const std::string &hay, const char *needle) {
++	return hay.find(needle) != std::string::npos;
++}
++
++std::string render(const n48::ReportFileInputs &in) {
++	char buf[2048];
++	n48::report_file_text(buf, sizeof buf, in);
++	return std::string(buf);
++}
++
++n48::ReportFileInputs base() {
++	n48::ReportFileInputs in = {};
++	in.fireHeadline = "LoadAccelerator PUBLISHED - Apple's accelerator may now match this card";
++	in.armed = true;
++	in.started = false;
++	in.appleKextLoaded = true;
++	in.accelAttached = false;
++	in.deviceId = 0x7590;
++	in.vendorId = 0x1002;
++	in.waited = 20;
++	in.ttlBound = 1;
++	in.ttlCalls = 7;
++	in.ttlSlots = 2;
++	in.firstUnsupported = -1;
++	in.reachedMask = (1ull << 6) | (1ull << 10);
++	return in;
++}
++
++} // namespace
++
++int main(int argc, char **argv) {
++	const std::string root = argc > 1 ? std::string(argv[1]) : std::string(".");
++
++	// ---------------------------------------------------------------- A: the text
++	{
++		const std::string s = render(base());
++		CHECK(has(s, "navi48 report - written by the kext; no photograph needed"));
++		CHECK(has(s, "LoadAccelerator PUBLISHED"));
++		CHECK(has(s, "takeover: NO TAKEOVER - no announce within the wait"));
++		// The only case that is about the device id: kext loaded, nothing attached.
++		CHECK(has(s, "cause: Apple's AMDRadeonX6000 kext is loaded but nothing attached"));
++		CHECK(has(s, "kext loaded=1  accelerator child=0"));
++		CHECK(has(s, "card: device-id 0x7590  vendor-id 0x1002"));
++		CHECK(has(s, "ttl: bound=1 calls=7 slots=2/43 first unsupported=-1"));
++		CHECK(has(s, "ttl slots reached: 06 0a"));
++		CHECK(has(s, "waited: 20 s"));
++	}
++	{
++		n48::ReportFileInputs in = base();
++		in.started = true;
++		in.accelAttached = true;
++		const std::string s = render(in);
++		CHECK(has(s, "takeover: STARTED - Apple's accelerator announced itself"));
++		// A takeover needs no excuse line.
++		CHECK(!has(s, "cause:"));
++		CHECK(has(s, "accelerator child=1"));
++	}
++	{
++		n48::ReportFileInputs in = base();
++		in.appleKextLoaded = false;
++		const std::string s = render(in);
++		CHECK(has(s, "AMDRadeonX6000 kext is not loaded on this boot"));
++		CHECK(has(s, "kext loaded=0"));
++	}
++	{
++		n48::ReportFileInputs in = base();
++		in.accelAttached = true;
++		const std::string s = render(in);
++		CHECK(has(s, "attached to this card but its start() failed before it announced itself"));
++	}
++	{
++		n48::ReportFileInputs in = base();
++		in.armed = false;
++		const std::string s = render(in);
++		CHECK(has(s, "takeover: not tracked - no watcher was armed on this boot"));
++		// Unarmed is still not proof of a takeover; the cause must survive.
++		CHECK(has(s, "cause: "));
++	}
++	{
++		n48::ReportFileInputs in = base();
++		in.deviceId = 0;
++		in.vendorId = 0;
++		const std::string s = render(in);
++		CHECK(has(s, "card: device-id 0x0000  vendor-id 0x0000"));
++	}
++	{
++		n48::ReportFileInputs in = base();
++		in.firstUnsupported = 14;
++		const std::string s = render(in);
++		CHECK(has(s, "first unsupported=14"));
++	}
++	{
++		n48::ReportFileInputs in = base();
++		in.reachedMask = 0;
++		const std::string s = render(in);
++		CHECK(!has(s, "ttl slots reached:"));
++	}
++	{
++		// Slot 42 is the last of the 43, and two hex digits must survive the shift.
++		n48::ReportFileInputs in = base();
++		in.reachedMask = (1ull << 9) | (1ull << 42);
++		const std::string s = render(in);
++		CHECK(has(s, "ttl slots reached: 09 2a"));
++	}
++	{
++		// A headline-less caller still produces a line, not a crash.
++		n48::ReportFileInputs in = base();
++		in.fireHeadline = nullptr;
++		const std::string s = render(in);
++		CHECK(has(s, "acceleration report: (not reported)"));
++	}
++
++	// ---------------------------------------------------------------- B: cap semantics
++	{
++		const n48::ReportFileInputs in = base();
++		const size_t need = n48::report_file_text(nullptr, 0, in);
++		char small[64];
++		memset(small, 'X', sizeof small);
++		const size_t got = n48::report_file_text(small, sizeof small, in);
++		CHECK(need > sizeof small);
++		CHECK(got == need);                     // snprintf semantics: full length, not the cap
++		CHECK(small[sizeof small - 1] == 0);    // always NUL-terminated when cap > 0
++		CHECK(strlen(small) == sizeof small - 1);
++	}
++	{
++		char exact[2048];
++		const n48::ReportFileInputs in = base();
++		const size_t need = n48::report_file_text(nullptr, 0, in);
++		n48::report_file_text(exact, need + 1, in);
++		CHECK(strlen(exact) == need);
++	}
++
++	// ---------------------------------------------------------------- C: the runtime
++	{
++		const std::string rt = slurp(root + "/src/accel_takeover.cpp");
++		const std::string hdr = slurp(root + "/src/accel_report_file.h");
++		const std::string bringup = slurp(root + "/src/Navi48Bringup.cpp");
++		CHECK(!rt.empty());
++		CHECK(!hdr.empty());
++		CHECK(!bringup.empty());
++
++		CHECK(has(rt, "#include \"accel_report_file.h\""));
++		// The file is written with the BSD VFS entry points, from our own thread.
++		CHECK(has(rt, "vnode_open(n48::kReportFilePath"));
++		CHECK(has(rt, "kO_WRONLY | kO_CREAT | kO_TRUNC"));
++		CHECK(has(rt, "in.fireHeadline = (const char *)__atomic_load_n(&gFireHeadline"));
++		CHECK(has(rt, "vn_rdwr(kUIO_WRITE, vp, (char *)text"));
++		CHECK(has(rt, "vn_rdwr(kUIO_WRITE, vp, (char *)text, (int)len, 0, kUIO_SYSSPACE, 0,"));
++		CHECK(has(rt, "vnode_close(vp, kFWRITE, ctx)"));
++		CHECK(has(rt, "vfs_context_create(nullptr)"));
++		CHECK(has(rt, "vfs_context_rele(ctx)"));
++		CHECK(has(rt, "kernel_thread_start(&report_file_thread, nullptr, &th)"));
++		CHECK(has(rt, "if (err == 0 && resid != 0) err = kEIO;"));
++		// One shot per boot, and the headline is stored before the thread can read it.
++		const size_t cas = rt.find("__atomic_compare_exchange_n(&gWriterStarted");
++		const size_t store = rt.find("__atomic_store_n(&gFireHeadline, (uintptr_t)fireHeadline");
++		const size_t start = rt.find("kernel_thread_start(&report_file_thread");
++		CHECK(cas != std::string::npos && store != std::string::npos && start != std::string::npos);
++		CHECK(store > cas && store < start);
++		// The thread waits for the verdict, then for the volume.
++		CHECK(has(rt, "while (waited < n48::kTakeoverWaitSeconds)"));
++		CHECK(has(rt, "IOSleep(n48::kReportFileSettleSeconds * 1000)"));   // IOSleep takes ms
++		// An unarmed boot is never final on a timeout: the pair boot can announce minutes later.
++		CHECK(has(rt, "if (in.started || in.armed) return;"));
++		CHECK(has(rt, "if (waited < n48::kTakeoverWaitSeconds) waited++;"));
++		CHECK(has(rt, "for (uint32_t t = 0; t < n48::kReportFileRetrySeconds; t++)"));
++		CHECK(has(rt, "in.waited = waited;"));
++		// Facts and census are read at write time, not at arm time.
++		const size_t writeLoop = rt.find("for (uint32_t t = 0; t < n48::kReportFileRetrySeconds; t++)");
++		const size_t gather = rt.find("gather_report_inputs()", writeLoop);
++		CHECK(gather != std::string::npos && gather > writeLoop);
++		CHECK(has(rt, "in.deviceId = injected_id(prov, \"device-id\")"));
++		CHECK(has(rt, "mask |= (1ull << s)"));
++
++		// Started on every requested boot - the pair boot never arms the watcher.
++		CHECK(has(bringup, "#include \"accel_report_file.h\""));
++		CHECK(has(bringup, "if (ff.argRequested) n48::takeover_start_writer(head);"));
++		const size_t headAt = bringup.find("const char *head = n48::accel_report_headline(");
++		const size_t writerAt = bringup.find("n48::takeover_start_writer(head)");
++		const size_t armAt = bringup.find("n48::accel_takeover_armed(ff.argRequested");
++		CHECK(headAt != std::string::npos && writerAt != std::string::npos && armAt != std::string::npos);
++		CHECK(headAt < writerAt && writerAt < armAt);
++		CHECK(!has(bringup, "n48::takeover_start_writer(head);\n\t\t\t\tif (fireCalled"));
++
++		// ------------------------------------------------------------ D: header hygiene
++		CHECK(!has(hdr, "IOKit/"));    // the text builder stands alone: no IOKit headers
++		CHECK(!has(hdr, "IOSleep"));
++		CHECK(!has(hdr, "TAKELOG"));
++		CHECK(!has(hdr, "kernel_thread_start"));
++		CHECK(has(hdr, "\"/Volumes/OPENCORE/navi48-report.txt\""));
++		CHECK(has(hdr, "kReportFileRetrySeconds = 120"));
++		CHECK(has(hdr, "kReportFileSettleSeconds = 2"));
++	}
++
++	if (gFailures == 0) printf("OK: %d checks, 0 failures\n", gChecks);
++	else                printf("%d checks, %d failures\n", gChecks, gFailures);
++	return gFailures == 0 ? 0 : 1;
++}
+-- 
+2.52.0.windows.1
+

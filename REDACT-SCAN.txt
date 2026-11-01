@@ -1,0 +1,197 @@
+REDACT-SCAN.txt
+
+Why this file exists: the owner's binding rule is that the machine's real
+serial, MLB, system UUID and ROM (and anything else that identifies the
+hardware) must not be published. config.diff.md and logs/INDEX.md quote those
+values only in masked form; this file is the proof that the masking held and
+that no unmasked copy survived anywhere in the package. It was run last:
+every other file here, MD5SUMS included, was written before it.
+
+How to read it: each block is one recursive grep over the whole of
+D:\Work\gate1\ship\. Hits are printed as file:line with the line content
+suppressed, because a scan report that quotes the string it searched for would
+itself be the leak. A hit is not automatically a leak — "<key>MLB</key>" is a
+key name, the all-zero UUID is a placeholder — so each block carries
+a verdict, and the closing summary counts only the leaks.
+
+The patterns that matter (P1-P7) are the real values taken from
+E:\EFI\OC\config.plist. They are not reproduced here, for the same reason the
+values themselves are not; they are identified only by their masked prefixes so
+that a reader can confirm what was searched for. Anyone re-running the scan can
+rebuild the patterns from their own copy of the stick config.
+
+Identities under scan (first 4 characters only):
+  serial          F5KC...
+  MLB             F5K0...
+  system UUID     BDF3... (dashed and undashed forms)
+  ROM as stored   vPzn... (base64, 6 bytes)
+  ROM as bytes    the 6-byte MAC-shaped value: colon, dash, dot, space and bare
+                  hex, both cases, and byte-reversed
+
+VERDICT KEY:
+  LEAK  an unmasked real value — must be fixed before push
+  KEY   the word SerialNum / MLB / SystemUUID / ROM / MACAddress / HardwareModel
+        used as a key name or in prose — carries no identity
+  PH    a placeholder we put there ourselves (all-zero UUID, 000000000000 ROM,
+        C02TEST027J1, C027J1027J1)
+  PATH  a device path — a leak only if it names an internal disk
+
+Scan run: 2026-11-01T14:36:55Z UTC, working dir D:/Work/gate1/ship
+Files in scope: 23
+
+=== P1  real serial (case-insensitive) ===================================
+P1    0 hits
+    VERDICT: any hit here is a LEAK.
+
+=== P2  real MLB (case-insensitive) =====================================
+P2    0 hits
+    VERDICT: any hit here is a LEAK.
+
+=== P3  real system UUID, dashed ========================================
+P3    0 hits
+    VERDICT: any hit here is a LEAK.
+
+=== P4  real system UUID, undashed (32 hex, either case) ================
+P4    0 hits
+    VERDICT: any hit here is a LEAK.
+
+=== P5  real ROM exactly as the plist stores it (base64) ================
+P5    0 hits
+    VERDICT: any hit here is a LEAK.
+
+=== P6  real ROM as bytes, any separator, any case ======================
+P6    0 hits
+    VERDICT: any hit here is a LEAK.
+
+=== P7  real ROM as bytes, reversed order ===============================
+P7    0 hits
+    VERDICT: any hit here is a LEAK.
+
+=== P8  any MAC-shaped string, colon/dash/space separated ===============
+P8    1 hit(s) (file:line only, content suppressed):
+        ./efi/config.diff.md:283
+    VERDICT: a hit is a LEAK unless it is one of our own placeholders.
+
+=== P9  any MAC-shaped string, Cisco dotted form ========================
+P9    0 hits
+    VERDICT: a hit is a LEAK unless it is a placeholder.
+
+=== P10  any bare 12-hex-digit token ====================================
+P10   15 hit(s) (file:line only, content suppressed):
+        ./efi/config.diff.md:67
+        ./efi/config.diff.md:79
+        ./efi/config.diff.md:92
+        ./efi/config.diff.md:196
+        ./efi/config.diff.md:215
+        ./efi/config.diff.md:227
+        ./efi/config.diff.md:281
+        ./efi/config.diff.md:282
+        ./efi/config.plist.survey-only:1224
+        ./efi/config.plist.survey-only:1229
+        ./efi/config.plist.survey-only:1243
+        ./efi/config.plist.survey-only:1245
+        ./efi/config.plist.survey-only:1272
+        ./efi/config.plist.survey-only:1282
+        ./REDACT-SCAN.txt:35
+    VERDICT: md5 hashes in MD5SUMS are 32 hex, not 12, and cannot match;
+             a hit is a LEAK unless it is 000000000000 (our ROM placeholder).
+
+=== P11  the key names the rule names ===================================
+P11   21 hit(s) (file:line only, content suppressed):
+        ./efi/config.diff.md:58
+        ./efi/config.diff.md:65
+        ./efi/config.diff.md:74
+        ./efi/config.diff.md:77
+        ./efi/config.diff.md:93
+        ./efi/config.diff.md:94
+        ./efi/config.diff.md:207
+        ./efi/config.diff.md:214
+        ./efi/config.diff.md:223
+        ./efi/config.diff.md:226
+        ./efi/config.diff.md:251
+        ./efi/config.diff.md:288
+        ./efi/config.diff.md:289
+        ./efi/config.diff.md:290
+        ./efi/config.plist.survey-only:1265
+        ./efi/config.plist.survey-only:1271
+        ./efi/config.plist.survey-only:1279
+        ./efi/config.plist.survey-only:1281
+        ./README.md:432
+        ./REDACT-SCAN.txt:13
+        ./REDACT-SCAN.txt:33
+    VERDICT: these are KEY, not leaks — the config must still contain the
+             keys, and the two documents must be able to name them.
+
+=== P12  device paths (PciRoot/VenHw) ===================================
+P12   1 hit(s) (file:line only, content suppressed):
+        ./efi/config.diff.md:150
+    VERDICT: PATH. A path is a leak only if it identifies an internal disk;
+             see P13 - no internal disk name appears anywhere in the tree.
+
+=== P13  internal NVMe / disk model names ===============================
+P13   4 hit(s) (file:line only, content suppressed):
+        ./efi/config.plist.survey-only:259
+        ./efi/config.plist.survey-only:261
+        ./efi/config.plist.survey-only:265
+        ./REDACT-SCAN.txt:131
+    VERDICT: any hit here is a LEAK; the conjunction of P12 and P13 would be
+             an internal-disk device path.
+
+=== P14  the word 'provider' (IOPCIDevice provider chains) ==============
+P14   1 hit(s) (file:line only, content suppressed):
+        ./REDACT-SCAN.txt:140
+    VERDICT: prose, KEY. No provider chain is printed anywhere.
+
+=== SUMMARY ============================================================
+Files in scope at the end of the run: 23
+MD5SUMS was generated BEFORE this file and is therefore inside this scan
+(it is the file with only digests, byte counts and paths; it produced no hits
+in P1-P14, and cannot: no pattern here can match a 32-hex digest).
+
+Residual hits, all classified:
+
+  P1-P7  real serial / MLB / UUID / ROM in any encoding   -> 0 hits, 0 LEAK
+         This is the answer to the only question that matters: none of the
+         machine's four identifiers appears anywhere in this package, in any
+         form the config could have carried them.
+
+  P8     MAC-shaped strings                               -> 1 hit
+         efi/config.diff.md:283 is "D3 4D 34 D3 4D 34", which is what our own
+         <data>000000000000</data> placeholder decodes to (finding 4 of
+         config.diff.md). PH, not a leak: it is six bytes we invented.
+
+  P10    bare 12-hex tokens                               -> 16 hits
+         Every hit is one of: our placeholder "000000000000" (PH), the tails of
+         Apple's own NVRAM GUIDs 4BCCA8B38C14 / FE41995C9F82 (KEY; these are
+         OpenCore/Apple constants, identical on every machine), or this file's
+         own legend text. No hit is a machine MAC.
+
+  P11    the key names the rule names                     -> 21 hits
+         The config must still contain <key>SystemSerialNumber</key> etc. (it
+         does, at lines 1265/1271/1279/1281 of config.plist.survey-only), and
+         the two documents must be able to name them. KEY, not a leak.
+
+  P12    device paths                                     -> 1 hit
+         efi/config.diff.md:150 is the GPU's own PCI path, abbreviated to
+         PciRoot(0x0)/Pci(0x3,0x1)/... in the text. It is a graphics card, not
+         a disk; it names no volume, no partition and no model.
+
+  P13    internal NVMe / disk model names                 -> 4 hits
+         config.plist.survey-only hits are the string "NVMeFix" in the NVMeFix
+         kext's BundlePath and Comment - the name of a kext we ship, which says
+         nothing about any disk in this machine. The remaining hit is this
+         file's own P13 heading. No disk manufacturer or model appears.
+
+  P14    'provider'                                       -> 1 hit
+         This file's own P14 heading. No IOPCIDevice provider chain is printed.
+
+  Self-hits: the hits inside REDACT-SCAN.txt are this file's own headings and
+  legend, caught because the file was created (empty) before the greps ran and
+  grows while they run. Line numbers for those refer to the file's state at
+  grep time, not to the finished file. They are proof the scan covered itself,
+  not a finding.
+
+CONCLUSION
+  0 leaks. Nothing publishable was found by this scan, and the scan was run
+  rather than assumed: the commands are in D:/Work/gate1/scratch-ship/
+  redact_scan.sh, which regenerates this file from scratch.

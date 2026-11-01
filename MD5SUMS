@@ -1,0 +1,304 @@
+# MD5SUMS - md5 digests and byte sizes for the rdna4 (Navi 44 / RX 9060 XT) ship package.
+#
+# Format: <md5>  <size in bytes>  <path>   (paths in A and B are relative to this file)
+# Digests from md5sum, sizes from stat -c%s. Computed 2026-11-01T14:36:52Z UTC.
+#
+# REDACT-SCAN.txt is deliberately NOT listed: it is generated after this file,
+# so that it can grep this file rather than the other way round. Verify it with:
+#   md5sum REDACT-SCAN.txt
+#
+# Section A - produced for this package
+
+2fd6426946186e798f5d4df7493b7a7b  37791  efi/config.plist.survey-only
+1ae6ddbb41daa3a55aebc22cbdcbb28a  16596  efi/config.diff.md
+520a49f02986289527f912a5baee1fd0  10852  logs/INDEX.md
+
+# Section B - copied in byte-for-byte unchanged: 16 OpenCore logs from E:\ and
+# NAVI48.TXT from E:\. No trimming: the NUL padding and the empty logs are the evidence.
+
+9b42aa2aca6b86cec82f5d1af2e2e43d  8192  logs/NAVI48.TXT
+1119650d2cec5d4c6ead25b9bd46871e  262144  logs/opencore-2026-10-31-092121.txt
+ec87a838931d4d5d2e94a04644788a55  262144  logs/opencore-2026-10-31-092642.txt
+cd5af608a923367e8ba1a54762ec33d8  262144  logs/opencore-2026-10-31-092802.txt
+ec87a838931d4d5d2e94a04644788a55  262144  logs/opencore-2026-10-31-123024.txt
+ec87a838931d4d5d2e94a04644788a55  262144  logs/opencore-2026-10-31-123056.txt
+b5f34b194d4c393b1d3f81c7cc43a008  262144  logs/opencore-2026-10-31-123147.txt
+25547aa01e27f54f0cda26fa43ff0e8f  262144  logs/opencore-2026-10-31-125135.txt
+a88a7931dab3e0ceb3b6c4e1cd39575f  262144  logs/opencore-2026-10-31-125912.txt
+9b412dc673152fe7115a8a6afd489d54  262144  logs/opencore-2026-10-31-130134.txt
+90143f1e007ab5c996ddd53201342171  262144  logs/opencore-2026-10-31-130817.txt
+c00c1c9ebe9af7199d274a031c661ebd  262144  logs/opencore-2026-10-31-131116.txt
+ec87a838931d4d5d2e94a04644788a55  262144  logs/opencore-2026-10-31-163037.txt
+60a8829774458f69687d01296d729925  262144  logs/opencore-2026-10-31-164255.txt
+e71252350c52233984aabb329db1d2df  262144  logs/opencore-2026-10-31-164435.txt
+84c85c93dba0ef470025386600a2a5a9  262144  logs/opencore-2026-10-31-202533.txt
+ec87a838931d4d5d2e94a04644788a55  262144  logs/opencore-2026-10-31-202748.txt
+
+# The five 0-line logs (092642, 123024, 123056, 163037, 202748) share one digest
+# because each is 262144 NUL bytes and nothing else. That equality is the point.
+
+# Section B2 - duplicates NOT copied twice. D:\Work\gate1\logs\*.txt are
+# byte-identical to three of the logs above (verified with cmp), same digests:
+#   D:/Work/gate1/logs/opencore-2026-10-31-163037.txt  ec87a838931d4d5d2e94a04644788a55  262144
+#   D:/Work/gate1/logs/opencore-2026-10-31-164255.txt  60a8829774458f69687d01296d729925  262144
+#   D:/Work/gate1/logs/opencore-2026-10-31-164435.txt  e71252350c52233984aabb329db1d2df  262144
+
+# Section C - artifacts outside ship/, hashed for provenance
+
+281906f04321b428beab8d62bce96701  7270384  D:/Work/gate1/build/kext-0030b/Navi48Bringup.kext/Contents/MacOS/Navi48Bringup
+cbc157cc8835a6e32d32ba2a93217dca  3620  D:/Work/gate1/build/kext-0030b/Navi48Bringup.kext/Contents/Info.plist
+83dc3fcf11ea6b6407b2c3db95d6ea49  7270304  D:/Work/gate1/build/kext-0030/Navi48Bringup.kext/Contents/MacOS/Navi48Bringup
+cbc157cc8835a6e32d32ba2a93217dca  3620  D:/Work/gate1/build/kext-0030/Navi48Bringup.kext/Contents/Info.plist
+013db6446fb49f19dcaa80fbefc6e55a  7265856  D:/Work/gate1/build/kext-0029/Navi48Bringup.kext/Contents/MacOS/Navi48Bringup
+cbc157cc8835a6e32d32ba2a93217dca  3620  D:/Work/gate1/build/kext-0029/Navi48Bringup.kext/Contents/Info.plist
+09e605fbbece2429f267de8a27b13f65  38720  D:/Work/gate1/0029-survey-report-to-the-stick.patch
+e9816a1a906b15ca9bc01ed699bfa5fb  41635  D:/Work/gate1/0030-survey-progress-marks.patch
+
+# Section D - the two input copies that DO hold the machine real identifiers. Kept
+# outside ship/ on purpose: publishing either one publishes the machine. These are
+# the md5s of copies of E:\EFI\OC\config.plist and E:\EFI\OC\config-armed.plist.
+
+360c78477fed9124165fe09a4cf96ddf  37794  D:/Work/gate1/scratch-ship/config.plist.orig-from-stick
+cdb00b10dcceadd23042aeb70d2dfbe2  37813  D:/Work/gate1/scratch-ship/config-armed.plist.from-stick
+
+# Section E - NOT hashed, on purpose: README.md. It was authored by a different
+# writer during this task and was still growing while this list was built (26749 ->
+# 26979 -> 27083 -> 27317 bytes over ~90 s), so any digest recorded here would be
+# stale before it was pushed. Hash it at push time with: md5sum README.md
+
+## E. added at assembly time (patch series, built kext, build scripts, host tests)
+
+95309d36de6b5b40a30586b3e2797730  34716  README.md
+994db136df1004fcfe97f1f2f441bbd8  9028  REDACT-SCAN.txt
+4fb4bffe40cabb74fa25e524f54ae231  2171  build/0030-build-notes.md
+eadf696bff2733724bced95a59f3eda9  764  build/build-kext.sh
+0ff8fc51aee47d197e669a39390ecb03  4920  build/build-survey.sh
+341200bf8c8aa5add3d9ed72233b44df  811  build/make-report-target.ps1
+5a87dd3f2e34d1789d6d34681a841e48  1581  build/mesa-host-tests.sh
+d4a3881130a24bcc0b01df4458cf1e82  7500  build/xbuild-kext.sh
+1ae6ddbb41daa3a55aebc22cbdcbb28a  16596  efi/config.diff.md
+2fd6426946186e798f5d4df7493b7a7b  37791  efi/config.plist.survey-only
+4ff0e97066816c2a01941c7e825ae5d6  10984  kext-navi48-tests/accel_boot_report_plant.sh
+265410d7b42d3998a6a5f12231af7735  9286  kext-navi48-tests/accel_boot_report_test.cpp
+de491a0963e0d817a6a064527231345f  8627  kext-navi48-tests/accel_fire_at_boot_plant.sh
+49fa1a66fc8675bb5d849e17583fba53  14291  kext-navi48-tests/accel_fire_at_boot_test.cpp
+3f3d578c2479383e758e2ad437ff54b5  8908  kext-navi48-tests/accel_report_file_plant.sh
+9a4505145aa6c452e1cd24a5247e38ac  10714  kext-navi48-tests/accel_report_file_test.cpp
+e923db7419f8c00434ddc1809ef3829b  11534  kext-navi48-tests/accel_report_raw_plant.sh
+3c1f01505bd75b911ed69de9fea1d906  19556  kext-navi48-tests/accel_report_raw_test.cpp
+a7847040782a94f837c75fd7530bb3e9  12508  kext-navi48-tests/accel_takeover_report_plant.sh
+87b423e7e5361fe746476bde67df1219  16598  kext-navi48-tests/accel_takeover_report_test.cpp
+f6d8f2f93dbb7a9cbbb31bf55da76ae7  19640  kext-navi48-tests/ctx_latch_test.cpp
+beb2848dd84d6d7b0e662c49e37213e5  12878  kext-navi48-tests/dcn_liveraster_test.cpp
+11540e51eda49f413dd6f117e3ef7602  36295  kext-navi48-tests/display_pipe_guard_test.cpp
+40a14ca4fb533fb1aa188db3ff65ba58  24263  kext-navi48-tests/f3_reader_test.cpp
+ecb9d0c9d584ff931b6cbbbc8e3b7abe  5614  kext-navi48-tests/fbname_scan_test.cpp
+65d9e5184f8748efe5f92375bb0681cc  4453  kext-navi48-tests/gen_fixture_cycle80_r5.cpp
+2e2391b94f242944d226844409a53467  7023  kext-navi48-tests/gen_fs85_fixture.py
+04126f4849ab4fbb045d9968972024f0  4797  kext-navi48-tests/gen_fslearn_fixture.py
+077d00d3565363a91ff03cfdc95cfe3b  80485  kext-navi48-tests/gfx_admit112_test.cpp
+c2ff720476c7e91dc4484da357118433  48248  kext-navi48-tests/gfx_capture_scan_test.cpp
+b968246f26479f492e0ad1ed7371c777  5861  kext-navi48-tests/gfx_capture_synth.cpp
+211d317b8fc0816252b1452515634188  91226  kext-navi48-tests/gfx_cg84_test.cpp
+e3fdf91a503f6ccf81c22e29001c0483  43977  kext-navi48-tests/gfx_cgredo_test.cpp
+78ba89109cbef4c5c482d9b84164c314  27227  kext-navi48-tests/gfx_classa_test.cpp
+1d1bd7958147dc2153be3b535c37c866  42052  kext-navi48-tests/gfx_clock88_test.cpp
+46a6eaab7264a6bc92313f937c6de4d3  341322  kext-navi48-tests/gfx_commit_test.cpp
+6efb97ece2efa5bcd0b0c0058497e7bb  373836  kext-navi48-tests/gfx_copyguard_test.cpp
+c34cfe304fc1896cf5d0829c8ba4ffe8  27250  kext-navi48-tests/gfx_cycle515_test.cpp
+d7f1e88a3e40b7bde098217eab962fce  74951  kext-navi48-tests/gfx_cycle80_test.cpp
+8e5ce44d9d4966cfdf774a14df00a47f  366043  kext-navi48-tests/gfx_dep_test.cpp
+bef1aae0bc2b7a5a5431e96b9155c4d7  278581  kext-navi48-tests/gfx_desc_port_test.cpp
+6f9e76f6c7709042f571f6780e882130  25471  kext-navi48-tests/gfx_descsw_test.cpp
+c2421bc0dc6e50d41ddc82611b08adbe  24764  kext-navi48-tests/gfx_e1_test.cpp
+a11b808000c3cb690c6837d71c2f9ac9  105164  kext-navi48-tests/gfx_f84_test.cpp
+96571ea9f6dedbb554c62ee252608918  74856  kext-navi48-tests/gfx_fc89_test.cpp
+0a50fca80aa50e9ac811a48dbc9e71bb  72615  kext-navi48-tests/gfx_fence828_test.cpp
+ab0cf2d45bf000c24a6dc66ef7e96f48  59984  kext-navi48-tests/gfx_fillset_test.cpp
+e5e595c4c8b73d37c609962c500ffe50  84580  kext-navi48-tests/gfx_flightring_test.cpp
+8b13ed3838ed85c180c2d4ed23968075  49572  kext-navi48-tests/gfx_flipmode_test.cpp
+fa4d0a9880bc327e31034b03311ebc22  61129  kext-navi48-tests/gfx_forgive_test.cpp
+45b31f39f5901599695041a6022b074b  54279  kext-navi48-tests/gfx_fs85_test.cpp
+3deb48cbb8fb1a32ffeb6155786b3748  40845  kext-navi48-tests/gfx_fslearn_test.cpp
+36104554775408744712bb9bb13473fc  66343  kext-navi48-tests/gfx_hg88_test.cpp
+6973f23ff46c9787cf49f9883a5edcbc  31164  kext-navi48-tests/gfx_hm100_test.cpp
+0ec5a6815437b777aac53e80a2b651f3  56128  kext-navi48-tests/gfx_hw72_test.cpp
+ad2856ecbd541d84e059330c9d9c8fc7  16856  kext-navi48-tests/gfx_judge_unbounded_test.cpp
+a751ff0d3d2ef32af9931bb05aa55773  131922  kext-navi48-tests/gfx_keystone_test.cpp
+75df162309f05f18174c5863e33798b5  32414  kext-navi48-tests/gfx_ks81_test.cpp
+68aeb65a1dcb0adec1a4d39ce91d5126  17424  kext-navi48-tests/gfx_late540_test.cpp
+be70a35fa24a816eba665a7432fc172f  21055  kext-navi48-tests/gfx_long543_test.cpp
+d4a7ef8c7f0d05cd8cdd8f4d638e1702  44618  kext-navi48-tests/gfx_lutfill_test.cpp
+f391ef34e966ecf03e17bdae34973d1f  86431  kext-navi48-tests/gfx_memdst_test.cpp
+912fe71eb07a3f2cf88d156c390be576  38519  kext-navi48-tests/gfx_mib_defer511_checks.h
+c46df1fce2afcd6a6d79a4dd6146a7e7  98040  kext-navi48-tests/gfx_mib_test.cpp
+5845678ec0511ee04a4e858027bb3d0f  140281  kext-navi48-tests/gfx_mib_units_checks.h
+9801d5b092d1b798043595dc8b69b937  41848  kext-navi48-tests/gfx_mib_xib_checks.h
+7ed4b5283cc3b3226132818f5795ad6d  44558  kext-navi48-tests/gfx_mmprio_test.cpp
+45b644515b81db6ab5b80dae37b7b4e0  35932  kext-navi48-tests/gfx_nclear_test.cpp
+bff5bca3e9621feac0cd1bc935edbfdd  66586  kext-navi48-tests/gfx_neuter_test.cpp
+5ce3dc6c0781f15fd1f05f6b516fa27c  47887  kext-navi48-tests/gfx_p86_test.cpp
+4968ad13654c4342200bf6ad441e0910  77920  kext-navi48-tests/gfx_p94_test.cpp
+ef3240c5ba2a20cd3ba23397e9545211  38894  kext-navi48-tests/gfx_perf540_test.cpp
+1c70e0b2d5d53a7a3354859e8a834250  87662  kext-navi48-tests/gfx_pgmid_test.cpp
+b2e991710c09a68bfa1c126592921b04  51721  kext-navi48-tests/gfx_present73_test.cpp
+56a7d329eaac09584fb1183b4b34ff93  5318  kext-navi48-tests/gfx_probe_plan_test.cpp
+cc1af2fd6a3d97289dc4c26805bf4aaf  61833  kext-navi48-tests/gfx_pws93_test.cpp
+aad53550cc79314629e2d3e896501005  35356  kext-navi48-tests/gfx_ramtop_test.cpp
+0f7ce26c1c935aae58cee41c06d755b6  5773  kext-navi48-tests/gfx_rasterarm_pd_test.cpp
+e8ddaeaa3d857b2cb6d2bdfd59a8b93b  9169  kext-navi48-tests/gfx_rasterarm_test.cpp
+481c6a733016e7567a49a20168b533b8  55687  kext-navi48-tests/gfx_rect92_test.cpp
+728eb9104a6e9894e59e367af8316dd1  17306  kext-navi48-tests/gfx_reloc_test.cpp
+4236656cdc0f24cbd848628a4de1fa3e  42233  kext-navi48-tests/gfx_ringidle_test.cpp
+a63a2e0a4d442c73275ba1c819ed9121  29699  kext-navi48-tests/gfx_rnforgive_test.cpp
+eae8b762d459ffcf4f1bec589a2b789d  21395  kext-navi48-tests/gfx_rpunmapq_test.cpp
+a0d025ab3bc7835d4c7be7cc7a88bf0d  52142  kext-navi48-tests/gfx_sk82_test.cpp
+b67a5e79e1e80688ce5882a876e9a8d6  31101  kext-navi48-tests/gfx_spill_test.cpp
+2eaeb6bb486135f6d123d6cb169b98e3  25537  kext-navi48-tests/gfx_src_decide_test.cpp
+9d7e2e662c2d7601add9fe42f0f713d5  84872  kext-navi48-tests/gfx_stale103_test.cpp
+cbb897251c5c9796d450b6b66692aa0e  32933  kext-navi48-tests/gfx_t0src_test.cpp
+e97563c21785ae9e400489e717c23180  14066  kext-navi48-tests/gfx_tc97_test.cpp
+773c61bd2e9d50625c2b549451c901b4  47920  kext-navi48-tests/gfx_tgtsample_test.cpp
+fec8f06689a353b0e2ff23cfbc1ada58  30108  kext-navi48-tests/gfx_tlb83_test.cpp
+fccfe706a10744a133b6feb3adf079db  34122  kext-navi48-tests/gfx_walknop75_test.cpp
+e6b45dbd62513055b55e0c9b61036770  45525  kext-navi48-tests/gfx_wc98_test.cpp
+7e9d27c5cc34509d4e9a539a385c80c8  69616  kext-navi48-tests/gfx_wo99_test.cpp
+66ec0cf7bfc72776ab15f32e05c22021  15764  kext-navi48-tests/gfx_xlat_verdict_test.cpp
+b75762d48adfddffcf4457c859dcb4e8  19151  kext-navi48-tests/native_agdc_plant.sh
+9def6a4b94bed90a0b00d29cea21ccfc  33869  kext-navi48-tests/native_agdc_test.cpp
+4f9cda4029d7e10962d2e08f2e99fbb6  120348  kext-navi48-tests/native_disp2_plant.sh
+e44b5d0c634f01ecc83f1b6944463131  705378  kext-navi48-tests/native_disp2_test.cpp
+52e559754801e7aea13b010980c123e7  84789  kext-navi48-tests/native_disp_plant.sh
+73b8f2418fe4c68189c9a86edd2bd4b9  318284  kext-navi48-tests/native_disp_test.cpp
+f35897ee1156fc6cbad4510be65a4f10  37945  kext-navi48-tests/native_dispread_plant.sh
+aba5cc3f118a0f9a948bfbd051766ee3  150628  kext-navi48-tests/native_dispread_test.cpp
+d63abe130db5b480007417b6fed378be  37367  kext-navi48-tests/native_dmubcmd_plant.sh
+d94f4842f7777504ec992ed95de1fd79  148098  kext-navi48-tests/native_dmubcmd_test.cpp
+66e300d9d55c6a5ba21e4a2bba9f77f4  6265  kext-navi48-tests/native_fb_monb_battery.h
+dbf990f6a0a24f5cab45d47513773294  14058  kext-navi48-tests/native_g1_plant.sh
+680bc8044d88799e56ff950933e10a60  40383  kext-navi48-tests/native_g1_test.cpp
+acb70eb3da7718dd77f6f3aa8431dde4  13300  kext-navi48-tests/native_g2_plant.sh
+9cc288852e82709099bd36e212ce71db  60718  kext-navi48-tests/native_g2_test.cpp
+558696a72d1e95e8355dc5008ad62662  30129  kext-navi48-tests/native_g4_plant.sh
+146829be7c6c26019e3cd9277da0da8d  75281  kext-navi48-tests/native_g4_test.cpp
+4578b1063e228a0c2553d68b63de8d26  17260  kext-navi48-tests/native_g5_plant.sh
+99366c3de2925f5aa1bc5b4e0d4e04b7  45553  kext-navi48-tests/native_g5_test.cpp
+399bfdee162f1fa7dc27d58aece5abd1  14210  kext-navi48-tests/native_g6_plant.sh
+6953e8a6b0caa273ae1d01f7cba2ac7f  20674  kext-navi48-tests/native_g6_test.cpp
+491ee2dc14cedfcbeeef28919cd3c50d  61519  kext-navi48-tests/native_hostimport_test.cpp
+30ca108d985e421145c7a097a15528e4  29632  kext-navi48-tests/native_m6_off_battery.h
+80bf924ef38cb84370d3758a9f844ad0  43131  kext-navi48-tests/native_m6_plant.sh
+0c21638392c72384c709b7e25b4c2478  16793  kext-navi48-tests/native_metal_plant.sh
+3b34de8134b721cee4985b9fca2c3c25  46361  kext-navi48-tests/native_metal_test.cpp
+6cf390a03aacc2beff13dc6a9fd95d86  15504  kext-navi48-tests/native_rebar_plant.sh
+45760e48b15f39f4752f990c4ba472cd  46348  kext-navi48-tests/native_rebar_test.cpp
+11674f06911a74b819b66097e0ef4014  34994  kext-navi48-tests/native_s1b_test.cpp
+98dc4846f644abdcdd0062c8149ab363  13698  kext-navi48-tests/native_s1c_plant.sh
+85ffbf8a6136fe3079db6535ebaf1347  65333  kext-navi48-tests/native_s1c_test.cpp
+5b603fe9f99a3050e7689f37131fd101  23171  kext-navi48-tests/native_s2_dal_plant.sh
+4e3dc9971a703709a173f01e343a68ca  118177  kext-navi48-tests/native_s2_dal_test.cpp
+c25f37df119ede875110f019214f747f  15044  kext-navi48-tests/native_s2a_plant.sh
+0cf9d167959b74b356671dc49c0a77fd  58952  kext-navi48-tests/native_s2a_test.cpp
+86fe977d46336abf01a1302b55e00004  56561  kext-navi48-tests/native_s2d_plant.sh
+d6bcc0028b65b0d6411cc1f3749d0e8b  244191  kext-navi48-tests/native_s2d_test.cpp
+dfad3eb3bcb5c5def5081124aac82ec0  47975  kext-navi48-tests/native_scanx_plant.sh
+db30ad8e4f93c293caced343ee0480a6  116876  kext-navi48-tests/native_scanx_test.cpp
+c01ba20e5c9f187fb39dc735b0a754c1  7074  kext-navi48-tests/native_sdmaorder_plant.sh
+35d3ac34b7af7ec513d5cbf5fceaaece  7656  kext-navi48-tests/native_sdmaorder_test.cpp
+f6a74ac569ce99b2de368a6f53f3716d  29123  kext-navi48-tests/native_ws_open_plant.sh
+30ea368ab7a66e6fdd2b6500187e2afc  32273  kext-navi48-tests/native_ws_open_test.cpp
+bb418b3b06fc188e077edb513fed4c9b  11397  kext-navi48-tests/navi44_arm_gate_plant.sh
+0cdd9243ca3e927375b84d836f6ce249  23022  kext-navi48-tests/navi44_arm_gate_test.cpp
+684444dbce00b5a37051c9dea8cc46f3  42986  kext-navi48-tests/navi44_die_test.cpp
+d12fa6c914e2779cdcf2061c9f88f254  4684  kext-navi48-tests/pairing_policy_test.cpp
+27185a3ab78bab7b1c535589a366d7e4  12445  kext-navi48-tests/pipeshim_verify_test.cpp
+a1a79018d7e46ccd4d35301a91de7bdd  20285  kext-navi48-tests/psp_sos_test.cpp
+08cbe80e4392ebae1d4d379cd2374ea2  16218  kext-navi48-tests/psp_tmr_plant.sh
+076ca3db95ac55a384720aaefbd7306e  53450  kext-navi48-tests/psp_tmr_test.cpp
+b7fd25c33a652cab4462459f8cc16914  18140  kext-navi48-tests/pws93_real_drv.cpp
+0501ddbd09d6f5ee1582faf19f444545  35614  kext-navi48-tests/rootwrite_guards_test.cpp
+aa3065bcfbd3e3f873ed563fb78f2436  13515  kext-navi48-tests/sc_census_test.cpp
+7098c2c0ab72a17329ee3b859f6757b1  17865  kext-navi48-tests/scanout_copy_test.cpp
+eb3475cb8fc25d078438d2260a009a7f  37103  kext-navi48-tests/scanout_full_test.cpp
+d3eb68b341100fb262b9d9a7335a482a  15453  kext-navi48-tests/scanout_selftest_test.cpp
+20a518529912770315da81effede50f9  615  kext-navi48-tests/sdma_census_hostshim.h
+bea6460bd44e37ca8f0fc411afdd7dc2  12191  kext-navi48-tests/sdma_census_plant.sh
+49f38cf58cbeac68144f60f17d0c360a  31753  kext-navi48-tests/sdma_census_test.cpp
+1d588e8089b585739714f0806d79ff21  11816  kext-navi48-tests/sdma_dcc_test.cpp
+f5e15408ab06d865e1d325a12d0123a9  28600  kext-navi48-tests/sdma_drain_xlat_test.cpp
+e5b047d18f09eb0dc0dcad4526b89ab6  12228  kext-navi48-tests/sdma_gcr_test.cpp
+63987e75249cd1e17d8df6e771080b8e  21410  kext-navi48-tests/survey_report_test.cpp
+b889ae0647ef02f7368939a2955a5200  12501  kext-navi48-tests/test_gfx12_descriptors.cpp
+b214c717813f8db8770368a702ebd933  9872  kext-navi48-tests/ttl_gc_topo_plant.sh
+9533532a761d1af0be3fc3a9eb3cc5fb  14860  kext-navi48-tests/ttl_gc_topo_test.cpp
+41f353b1ec5b0575cdd80ea8c1cf88ca  24558  kext-navi48-tests/ws_ident_test.cpp
+687b288c824730a5da02368f9a00f621  19315  kext-navi48-tests/ws_resprov_golden.h
+499e4c8126bab9b65a986a7eccf24dab  202921  kext-navi48-tests/ws_resprov_test.cpp
+6e19a2a33ed0657f5d3f5755817c27ea  39104  kext-navi48-tests/ws_valid_test.cpp
+9522cd626cf2898a39d537d6863b1a78  846  kext-navi48-tests/dalshim/IOKit/IOLib.h
+24ad48dd7bfd973c125361834e8a0ea2  652  kext-navi48-tests/dalshim/IOKit/IOLocks.h
+9de8f58ad7f20646f69d0914140e979b  1650  kext-navi48-tests/dalshim/IOKit/IOReturn.h
+cda487f4f66de8bf68a14a21426a6bf2  150  kext-navi48-tests/dalshim/kern/clock.h
+8790e3fc554180e21e85824261e677e0  91  kext-navi48-tests/dalshim/kern/thread.h
+ef07f7fe9864591c6060df937fe44e4e  203  kext-navi48-tests/dalshim/libkern/OSAtomic.h
+d5b4fd1520aa9350fde69c44dc2a7698  78  kext-navi48-tests/dalshim/pexpert/pexpert.h
+9ea47c8138db8b130b457f447c45f13b  51202  kext-navi48-tests/frozen/gfx_copyguard_f824012f.h
+29cebf4db0bbf9bfb83e302aaf4bf802  4212  kext-navi48-tests/frozen/gfx_dep_check_2c91d368.h
+ee1e31a7de848ae549e5d12900eadac9  35168  kext-navi48-tests/frozen/gfx_fillset_01131813.h
+cea3ee6d517f89595dba9eca2ce74e00  29767  kext-navi48-tests/frozen/gfx_fillset_ab336a80.h
+fc8b1101a833195ac921abe59edc1ad0  16385  kext-navi48-tests/frozen/gfx_fs85_01131813.h
+6b11b21ac50d44406d39a5e16e7b0ef1  12878  kext-navi48-tests/frozen/gfx_p86_6af255a0.h
+817e002e5cab7191995371bdd6c19054  26925  kext-navi48-tests/frozen/gfx_present73_6af255a0.h
+4616a7c807f8e2e10a7e95d987129d14  23476  kext-navi48-tests/frozen/gfx_present73_c4cbc423.h
+f74a079794b6076d508cfde85262ba68  22133  kext-navi48-tests/frozen/sdma_drain_xlat_aed4ff2.h
+cbc157cc8835a6e32d32ba2a93217dca  3620  kext/Navi48Bringup.kext/Contents/Info.plist
+281906f04321b428beab8d62bce96701  7270384  kext/Navi48Bringup.kext/Contents/MacOS/Navi48Bringup
+520a49f02986289527f912a5baee1fd0  10852  logs/INDEX.md
+9b42aa2aca6b86cec82f5d1af2e2e43d  8192  logs/NAVI48.TXT
+1119650d2cec5d4c6ead25b9bd46871e  262144  logs/opencore-2026-10-31-092121.txt
+ec87a838931d4d5d2e94a04644788a55  262144  logs/opencore-2026-10-31-092642.txt
+cd5af608a923367e8ba1a54762ec33d8  262144  logs/opencore-2026-10-31-092802.txt
+ec87a838931d4d5d2e94a04644788a55  262144  logs/opencore-2026-10-31-123024.txt
+ec87a838931d4d5d2e94a04644788a55  262144  logs/opencore-2026-10-31-123056.txt
+b5f34b194d4c393b1d3f81c7cc43a008  262144  logs/opencore-2026-10-31-123147.txt
+25547aa01e27f54f0cda26fa43ff0e8f  262144  logs/opencore-2026-10-31-125135.txt
+a88a7931dab3e0ceb3b6c4e1cd39575f  262144  logs/opencore-2026-10-31-125912.txt
+9b412dc673152fe7115a8a6afd489d54  262144  logs/opencore-2026-10-31-130134.txt
+90143f1e007ab5c996ddd53201342171  262144  logs/opencore-2026-10-31-130817.txt
+c00c1c9ebe9af7199d274a031c661ebd  262144  logs/opencore-2026-10-31-131116.txt
+ec87a838931d4d5d2e94a04644788a55  262144  logs/opencore-2026-10-31-163037.txt
+60a8829774458f69687d01296d729925  262144  logs/opencore-2026-10-31-164255.txt
+e71252350c52233984aabb329db1d2df  262144  logs/opencore-2026-10-31-164435.txt
+84c85c93dba0ef470025386600a2a5a9  262144  logs/opencore-2026-10-31-202533.txt
+ec87a838931d4d5d2e94a04644788a55  262144  logs/opencore-2026-10-31-202748.txt
+f9895c10c5305eb00471677c63b83537  962  patches/0000-mksdk-libkmodcxx-link.patch
+851eb534af281bb760dedf58c621b7bd  2929  patches/0001-navi44-identity-survey.patch
+1396f58c18265b899c15fa5445980fb0  14730  patches/0002-navi44-firmware-set.patch
+8e984b95bafb69a64ab594c77c9649ed  9771  patches/0003-navi44-die-geometry.patch
+37464d02599ac2343e2c1c71cab914e4  22586  patches/0004-navi44-host-test.patch
+78cdb9e1ce3382c33d2685dacf76a7c2  11211  patches/0005-navi44-survey-properties.patch
+bdcfcd9263ae72a48bc57f895b3b5b4d  20508  patches/0006-navi44-psp-chain-host-test.patch
+ea0725d54c156b141d8a6d95adc8f37c  25927  patches/0007-dcn41-dmu-base.patch
+f2a852034b1191c5b4e4ed06e5da9db8  88101  patches/0008-navi44-die-topology.patch
+7221234593489968bace37c09cd51e8b  19635  patches/0009-navi44-firmware-set-from-discovery.patch
+9172faf78f0bbe9d48e0fb3b5d423dca  71098  patches/0010-navi44-psp-tmr-host-test.patch
+de7d2d5a0e5bfb300e602829a53facc6  69304  patches/0011-navi44-sdma-engine-census.patch
+3cdb5e921848d29af1f07ae1a7189f2c  39863  patches/0012-navi44-writing-stage-gate.patch
+0d5b6f40aeb56b9d8b7ed78fd55110e4  44140  patches/0013-dcn41-allowlist-rebases-onto-the-die.patch
+d3fc9962836f9f20e0689938e7e8235f  90008  patches/0014-navi44-die-caps-from-the-gc-info-table.patch
+9a0a496a4d5a292a6dc7789a284f9218  2779  patches/0015-navi44-gc-table-registry-keys.patch
+9dbe1d03e98f01f4e647346a37a0d4c5  21425  patches/0016-navi44-stage-17-shader-isa-decision.patch
+1ff622b9337d16d7fc3e71c1c9c608be  32944  patches/0017-navi44-accel-fire-at-boot.patch
+ed19439e11b86eec63d33fceb1bc447d  38258  patches/0018-navi44-ttl-gc-topology-from-the-die.patch
+fd81de62ee2dbbec4d59c28972f3a4ee  29312  patches/0019-accel-report-on-the-boot-screen.patch
+cee7ee5d75cae6a1019d5fd65a065300  32522  patches/0020-the-screen-answers-whether-apple-took-the-card.patch
+6f5cf429da29e676141daf446858447b  16683  patches/0021-takeover-block-names-the-cause.patch
+b2c87b4328ec3e20a6eea931f4c48a03  3845  patches/0022-takeover-block-reports-the-injected-device-id.patch
+ac2ccb4ad347754f488161cffbfb2111  6904  patches/0023-takeover-block-prints-the-ttl-census.patch
+2c34ae8316905146b6e9670371459750  1144  patches/0024-carriers-request-apple-kext-load.patch
+715c06e7f47e0ab5151fb5a94e045595  2127  patches/0025-takeover-prints-without-a-watcher.patch
+49007fc42742bcd5de87b38145b369ac  6372  patches/0026-takeover-suite-pins-the-unarmed-announce.patch
+13b2700eaa67a50a68ae689e496251ab  35519  patches/0027-verdict-to-the-boot-stick.patch
+8510315d92b39d09b2f792c4976ca6d8  68092  patches/0028-report-with-no-mount.patch
+09e605fbbece2429f267de8a27b13f65  38720  patches/0029-survey-report-to-the-stick.patch
+e9816a1a906b15ca9bc01ed699bfa5fb  41635  patches/0030-survey-progress-marks.patch

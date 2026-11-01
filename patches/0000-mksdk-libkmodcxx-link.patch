@@ -1,0 +1,18 @@
+diff --git a/src/navi48-bringup/Makefile b/src/navi48-bringup/Makefile
+index 06cd83a..f60a5de 100644
+--- a/src/navi48-bringup/Makefile
++++ b/src/navi48-bringup/Makefile
+@@ -111,8 +111,12 @@ COMMON := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
+   -mkernel -fapple-kext -Wall -Os -g
+ CXXFLAGS := $(COMMON) -std=c++17 -fno-exceptions -fno-rtti -fcheck-new -fno-c++-static-destructors
+ CFLAGS   := $(COMMON)
++# libkmodc++.a ships only in Library/universal (Library/x86_64 has libkmod.a
++# alone: checked against MacKernelSDK 05094e5 and 3f75008), so the universal
++# directory must come first or -lkmodc++ cannot resolve.
+ LDFLAGS  := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
+-  -nostdlib -Xlinker -kext -L$(MKSDK)/Library/x86_64 -lkmodc++ -lkmod -Wl,-no_deduplicate
++  -nostdlib -Xlinker -kext -L$(MKSDK)/Library/universal -L$(MKSDK)/Library/x86_64 \
++  -lkmodc++ -lkmod -Wl,-no_deduplicate
+ 
+ all: $(KEXT)
+ 

@@ -1,0 +1,50 @@
+From a59092add7f2e1115faad564383eff131d18ab70 Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Thu, 29 Oct 2026 21:39:48 -0700
+Subject: [PATCH] 0015: report the GC info table through the registry, not only
+ the log
+
+0014 parses the table and the whole port hangs on whether the 9060 XT
+actually files one, but it only said so in a kernel log line - and the
+survey run collects ioreg keys, because a boot nobody can photograph
+tells us nothing. Publish the five caps the table carries as
+Discovery,GcTable,* (the prefix collect-survey.sh already greps) and
+publish "absent" when there is no table, which is an answer rather than
+a silence: it means the die caps came from gfx_default_caps(), not from
+the die.
+
+No ABI change and no version bump, so the build stays 0.0.666 exactly as
+0010-0013 left it at 0.0.665; the binary the keys are in is told apart
+from the one they are not by grep -c Discovery,GcTable.
+---
+ src/navi48-bringup/src/Navi48Bringup.cpp | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/src/navi48-bringup/src/Navi48Bringup.cpp b/src/navi48-bringup/src/Navi48Bringup.cpp
+index 2ebb929..03580d3 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -882,6 +882,20 @@ bool Navi48Bringup::buildDeviceContext() {
+ 	else
+ 		N48LOG("dev: no GC info table (absent, or refused its id/size/checksum) — "
+ 		       "die caps stay at the per-IP-version defaults, TCC unreported");
++	// 0015 — the same numbers as registry keys, because collect-survey.sh harvests `Discovery,`
++	// properties from ioreg and a boot that cannot be photographed is a boot that told us nothing.
++	// "absent" is the answer too: it means the caps came from gfx_default_caps(), not from the die.
++	if (dev.gcTab.valid) {
++		setProperty("Discovery,GcTable", "present");
++		setProperty("Discovery,GcTable,Ver", static_cast<uint64_t>(dev.gcTab.verMajor * 10 + dev.gcTab.verMinor), 10);
++		setProperty("Discovery,GcTable,SE", static_cast<uint64_t>(dev.gcTab.numSe), 10);
++		setProperty("Discovery,GcTable,ShPerSe", static_cast<uint64_t>(dev.gcTab.numShPerSe), 10);
++		setProperty("Discovery,GcTable,CuPerSh", static_cast<uint64_t>(dev.gcTab.numCuPerSh), 10);
++		setProperty("Discovery,GcTable,RbPerSe", static_cast<uint64_t>(dev.gcTab.numRbPerSe), 10);
++		setProperty("Discovery,GcTable,Tccs", static_cast<uint64_t>(dev.gcTab.numTccs), 10);
++	} else {
++		setProperty("Discovery,GcTable", "absent");
++	}
+ 	N48LOG("dev: context ready — MC base 0x%llx, region vram+[0x%llx, 0x%llx), GC base 0x%x MP0 base 0x%x MMHUB base 0x%x",
+ 	       dev.vramMcBase, dev.vramBase, dev.vramLimit, dev.ip.get(amdgpu::IPBlock::GC),
+ 	       dev.ip.get(amdgpu::IPBlock::MP0), dev.ip.get(amdgpu::IPBlock::MMHUB));
+-- 
+2.52.0.windows.1
+

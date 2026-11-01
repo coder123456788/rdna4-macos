@@ -1,0 +1,381 @@
+diff --git a/src/navi48-bringup/src/Navi48Bringup.cpp b/src/navi48-bringup/src/Navi48Bringup.cpp
+index b50c677..8826c50 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -501,6 +501,51 @@ bool Navi48Bringup::loadOnDieDiscovery() {
+ 	return true;
+ }
+ 
++// ---------------------------------------------------------------------------
++// selectFwFromDiscovery — which die's firmware this card gets, decided by the
++// die rather than by its PCI id.
++//
++// probe() picks the set from device_id because it runs before there is anything
++// to read, and its allowlist names exactly three ids. A Navi 44 that shows up
++// under a fourth — the RX 9050's OEM SKUs, whatever ships next — would be handed
++// Navi 48's gc_12_0_1 + psp_14_0_3 + smu_14_0_3 blobs. Nothing would complain
++// until the PSP chain starts refusing TMR-resident LOAD_IP_FW with
++// TEE_BAD_PARAMETERS, three stages downstream of a decision taken in the wrong
++// order. Discovery has been able to name the die since the first survey, so
++// name it here, before any stage can ask for a blob.
++//
++// The window where this is free is exactly here: fw_get() builds the table
++// lazily, so no FwBlob has been handed out yet and none can go stale under us.
++// ---------------------------------------------------------------------------
++void Navi48Bringup::selectFwFromDiscovery() {
++	amdgpu::IPBaseTable ip {};
++	// The return value says whether every block's *bases* resolved. This call
++	// only needs the three versions, and fw_select_from_ip() checks those
++	// itself; a table missing, say, MMHUB is refused later by the stages that
++	// need that base, not by us.
++	const bool basesComplete = amdgpu::fill_ip_base_table(ipDiscovery, ip);
++	const amdgpu::IPVersion gc = ip.getVersion(amdgpu::IPBlock::GC),
++	                          mp0 = ip.getVersion(amdgpu::IPBlock::MP0),
++	                          mp1 = ip.getVersion(amdgpu::IPBlock::MP1);
++	const bool wasNavi44 = amdgpu::fw_is_navi44();
++
++	if (!amdgpu::fw_select_from_ip(gc, mp0, mp1)) {
++		N48LOG("fw-select: discovery reports GC %u.%u.%u / MP0 %u.%u.%u / MP1 %u.%u.%u, which is neither "
++		       "Navi 44 (12.0.0/14.0.2/14.0.2) nor Navi 48 (12.0.1/14.0.3/14.0.3) — keeping the PCI-id pick '%s', "
++		       "whose blobs are therefore an unverified guess",
++		       gc.major, gc.minor, gc.rev, mp0.major, mp0.minor, mp0.rev,
++		       mp1.major, mp1.minor, mp1.rev, amdgpu::fw_set_name());
++		setProperty("FW,SetSource", "PCI id, not confirmed by discovery");
++		return;
++	}
++	N48LOG("fw-select: firmware set '%s'%s from GC %u.%u.%u / MP0 %u.%u.%u / MP1 %u.%u.%u%s",
++	       amdgpu::fw_set_name(), wasNavi44 != amdgpu::fw_is_navi44() ? " — CORRECTED from the PCI-id guess" : "",
++	       gc.major, gc.minor, gc.rev, mp0.major, mp0.minor, mp0.rev, mp1.major, mp1.minor, mp1.rev,
++	       basesComplete ? "" : " (IP base table incomplete)");
++	setProperty("FW,Set", amdgpu::fw_set_name());
++	setProperty("FW,SetSource", "IP discovery");
++}
++
+ void Navi48Bringup::surveyIPs() {
+ 	struct { uint16_t id; const char *name; } kWanted[] = {
+ 		{ IpDiscovery::HwGc, "GC" }, { IpDiscovery::HwMmhub, "MMHUB" }, { IpDiscovery::HwMp0, "PSP" },
+@@ -704,7 +749,7 @@ void Navi48Bringup::stagePSP() {
+ 	n48::PspLoader psp(hw);
+ 	const amdgpu::FwBlob *sos = amdgpu::fw_get(amdgpu::FwId::PSP_SOS);
+ 	if (!sos || !sos->data || sos->size == 0) {
+-		N48LOG("psp-stage: no PSP SOS blob for this die (%s); aborting", amdgpu::fw_is_navi44() ? "navi44" : "navi48");
++		N48LOG("psp-stage: no PSP SOS blob for this die (%s); aborting", amdgpu::fw_set_name());
+ 		setProperty("PSP,Stage", "no-sos-blob"); return;
+ 	}
+ 	if (!psp.parseContainer(sos->data, sos->size)) {
+@@ -7465,9 +7510,11 @@ IOService *Navi48Bringup::probe(IOService *provider, SInt32 *score) {
+ 	// Pick the firmware set before any stage can ask for a blob: Navi 44 and
+ 	// Navi 48 share the role names but ship different files (psp_14_0_2_* +
+ 	// gc_12_0_0_* vs psp_14_0_3_* + gc_12_0_1_*). Defaulting to the Navi 48
+-	// set keeps every existing 0x7550/0x7551 path byte-identical.
++	// set keeps every existing 0x7550/0x7551 path byte-identical. This is a
++	// guess from the PCI id — selectFwFromDiscovery() confirms it against the
++	// die once discovery has run, and publishes FW,SetSource either way.
+ 	amdgpu::fw_select_for_device(device);
+-	setProperty("FW,Set", amdgpu::fw_is_navi44() ? "navi44" : "navi48");
++	setProperty("FW,Set", amdgpu::fw_set_name());
+ 	if (device == 0x7590) {
+ 		// Navi 44 (RX 9050 / 9060 XT): DCN 4.1.0 display, GC 12.0.0, a smaller die.
+ 		// This match arms NOTHING: every writing stage keeps its own boot-arg
+@@ -7505,6 +7552,7 @@ bool Navi48Bringup::start(IOService *provider) {
+ 	if (!loadOnDieDiscovery()) {
+ 		N48LOG("start: IP discovery unavailable — MMIO works, but no register map");
+ 	} else {
++		selectFwFromDiscovery();   // before the surveys: no blob has been handed out yet
+ 		surveyIPs();
+ 		surveyDcn();
+ 		surveyGeometry();
+diff --git a/src/navi48-bringup/src/Navi48Bringup.hpp b/src/navi48-bringup/src/Navi48Bringup.hpp
+index ef6cb93..0a5a71c 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.hpp
++++ b/src/navi48-bringup/src/Navi48Bringup.hpp
+@@ -110,6 +110,7 @@ private:
+ 	// --- stages ---
+ 	bool probeMemSize();
+ 	bool loadOnDieDiscovery();
++	void selectFwFromDiscovery(); // the embedded firmware set, keyed off the die instead of the PCI id
+ 	void surveyIPs();
+ 	void surveyDcn();      // DMU segment bases + whether the write allowlist would arm for them
+ 	void surveyGeometry(); // GB_ADDR_CONFIG decode + MMHUB FB_LOCATION, both read-only
+diff --git a/src/navi48-bringup/src/amd/fw_table.cpp b/src/navi48-bringup/src/amd/fw_table.cpp
+index 152a144..a0ecb23 100644
+--- a/src/navi48-bringup/src/amd/fw_table.cpp
++++ b/src/navi48-bringup/src/amd/fw_table.cpp
+@@ -127,6 +127,24 @@ void put(FwId id, const uint8_t *data, size_t size, const char *name) {
+     g_table[static_cast<uint32_t>(id)] = FwBlob{ data, size, name, id };
+ }
+ 
++// Switch to `want`, rebuilding on the next fw_get(). Idempotent: a repeat call
++// for the set already in place leaves a built table untouched, so a caller that
++// re-selects every boot leaves 0x7550/0x7551 byte-identical.
++//
++// Clearing the rows here (rather than relying on build_table() to overwrite
++// them) keeps fw_get() honest if the caller looks at an id between selection
++// and first use: every row is either the selected die's blob or an explicit
++// {nullptr, 0, name} — never the other die's data.
++void apply_set(uint32_t want) {
++    if (g_set == want) return;
++
++    g_set = want;
++    g_built = false;
++    for (uint32_t i = 0; i < kCount; ++i) {
++        g_table[i] = FwBlob{ nullptr, 0, nullptr, static_cast<FwId>(i) };
++    }
++}
++
+ // Fills g_table[] with ordinary runtime assignments (reads each extern
+ // fw_<blob>_size's actual value — valid the moment this kext's segments
+ // are mapped, well before any bring-up code could call fw_get()). Safe
+@@ -193,28 +211,45 @@ bool str_eq(const char *a, const char *b) {
+ 
+ } // anonymous namespace
+ 
+-// Called once from probe(), before any stage runs. Idempotent: a repeat call
+-// with the same device leaves a built table untouched.
+-//
+-// Clearing the rows here (rather than relying on build_table() to overwrite
+-// them) keeps fw_get() honest if the caller looks at an id between selection
+-// and first use: every row is either the selected die's blob or an explicit
+-// {nullptr, 0, name} — never the other die's data.
++// Called once from probe(), before discovery has run, so the only thing it can
++// key on is the PCI device id. See fw_select_from_ip() for the real answer.
+ void fw_select_for_device(uint16_t deviceId) {
+-    const uint32_t want = (deviceId == 0x7590) ? kSetNavi44 : kSetNavi48;
+-    if (g_set == want) return;
++    apply_set((deviceId == 0x7590) ? kSetNavi44 : kSetNavi48);
++}
+ 
+-    g_set = want;
+-    g_built = false;
+-    for (uint32_t i = 0; i < kCount; ++i) {
+-        g_table[i] = FwBlob{ nullptr, 0, nullptr, static_cast<FwId>(i) };
++// The die is named by the version triple, and only by triples this table can
++// actually carry — deliberately not by arithmetic on the revisions. The two
++// known dies are GC 12.0.0 + PSP/SMU 14.0.2 (Navi 44) and GC 12.0.1 + 14.0.3
++// (Navi 48), which looks like "revision + 2", but linux-firmware also ships
++// psp_14_0_5 for parts with no GC 12.0.x / smu_14_0_5 counterpart here. A rule
++// derived from the pattern would happily select a set whose PSP blobs do not
++// match the silicon, which is the exact failure this function exists to catch.
++// Anything that is not one of the two rows below is refused, and the caller
++// keeps — and logs — the PCI-id guess.
++bool fw_select_from_ip(IPVersion gc, IPVersion mp0, IPVersion mp1) {
++    if (gc.major != 12 || gc.minor != 0 || mp0.major != 14 || mp0.minor != 0 ||
++        mp1.major != 14 || mp1.minor != 0)
++        return false;
++
++    if (gc.rev == 0 && mp0.rev == 2 && mp1.rev == 2) {
++        apply_set(kSetNavi44);
++        return true;
+     }
++    if (gc.rev == 1 && mp0.rev == 3 && mp1.rev == 3) {
++        apply_set(kSetNavi48);
++        return true;
++    }
++    return false;
+ }
+ 
+ bool fw_is_navi44() {
+     return g_set == kSetNavi44;
+ }
+ 
++const char *fw_set_name() {
++    return fw_is_navi44() ? "navi44" : "navi48";
++}
++
+ const FwBlob *fw_get(FwId id) {
+     build_table();
+     uint32_t idx = static_cast<uint32_t>(id);
+diff --git a/src/navi48-bringup/src/amd/psp_v14_0.cpp b/src/navi48-bringup/src/amd/psp_v14_0.cpp
+index 28c395e..90842ac 100644
+--- a/src/navi48-bringup/src/amd/psp_v14_0.cpp
++++ b/src/navi48-bringup/src/amd/psp_v14_0.cpp
+@@ -714,11 +714,20 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
+         return kIOReturnNotReady;
+     }
+ 
+-    PSP_LOG("setup_tmr: pinned PSP IP v%u.%u.%u, discovered MP0 v%u.%u.%u",
+-            kIP_PSP.major, kIP_PSP.minor, kIP_PSP.rev,
+-            dev.ip.version[(int)IPBlock::MP0].major,
+-            dev.ip.version[(int)IPBlock::MP0].minor,
+-            dev.ip.version[(int)IPBlock::MP0].rev);
++    // The PSP version is whatever this die reported, not kIP_PSP: that pin is
++    // Navi 48's 14.0.3 and a Navi 44 says 14.0.2. The branch below behaves the
++    // same for both, but the two lines that *name* the version are the record a
++    // first boot is diagnosed from, and printing "psp_v14_0_3" on 14.0.2 silicon
++    // misleads exactly the person deciding what to try next. Fall back to the
++    // pin only when discovery never filled MP0 — which is also when the MP0 base
++    // is unresolved and this stage could not have reached here. `psp` itself is
++    // the PSPContext, so the version is pspVer.
++    const IPVersion discovered = dev.ip.getVersion(IPBlock::MP0);
++    const IPVersion pspVer = discovered.major ? discovered : kIP_PSP;
++
++    PSP_LOG("setup_tmr: PSP IP v%u.%u.%u from %s (pinned default v%u.%u.%u)",
++            pspVer.major, pspVer.minor, pspVer.rev, discovered.major ? "discovery" : "pin",
++            kIP_PSP.major, kIP_PSP.minor, kIP_PSP.rev);
+ 
+     // psp_v14_0_x: boot_time_tmr + autoload → skip SETUP_TMR. SOS owns the
+     // TMR allocation. But upstream's psp_tmr_init (amdgpu_psp.c:881-890)
+@@ -730,7 +739,7 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
+     // MES/RLC) with TEE_BAD_PARAMETERS (0xFFFF0006) and AUTOLOAD_RLC returns
+     // TEE_ERROR_ITEM_NOT_FOUND (0xFFFF0007). SMU + IMU pass because they
+     // bypass TMR slotting.
+-    if (kIP_PSP.major == 14) {
++    if (pspVer.major == 14) {
+         psp.tmrBusAddr = 0;  // SOS-managed; we have no MC address
+         psp.tmrSize    = 0;
+ 
+@@ -762,10 +771,10 @@ psp_setup_tmr(DeviceContext &dev, PSPContext &psp)
+         }
+ 
+         psp.tmrSetUp = true;
+-        PSP_LOG("setup_tmr: SKIP SETUP_TMR (psp_v14_0_%u — boot_time_tmr by "
++        PSP_LOG("setup_tmr: SKIP SETUP_TMR (psp_v%u_%u_%u — boot_time_tmr by "
+                 "SOS, see psp_skip_tmr in upstream amdgpu_psp.c:906); the "
+                 "reserved TMR slot at vram+%#llx stays unused",
+-                (unsigned)kIP_PSP.rev,
++                (unsigned)pspVer.major, (unsigned)pspVer.minor, (unsigned)pspVer.rev,
+                 (unsigned long long)psp.tmrVRAMOffset);
+         return kIOReturnSuccess;
+     }
+diff --git a/src/navi48-bringup/src/fw/fw_table.h b/src/navi48-bringup/src/fw/fw_table.h
+index ace2142..403e8e9 100644
+--- a/src/navi48-bringup/src/fw/fw_table.h
++++ b/src/navi48-bringup/src/fw/fw_table.h
+@@ -12,6 +12,10 @@
+ #include <stdint.h>
+ #include <stddef.h>
+ 
++// IPVersion + IPBlock. Only the type is needed here, and amdgpu_ip.h includes
++// nothing but <stdint.h>, so this stays free of the driver's register headers.
++#include "../amd/amdgpu_ip.h"
++
+ namespace amdgpu {
+ 
+ // Stable index space for every firmware blob the gfx1201 (Navi 48)
+@@ -60,7 +64,24 @@ const FwBlob *fw_find_by_name(const char *name);
+ // behaviour. Calling it again with a different id rebuilds the table.
+ void fw_select_for_device(uint16_t deviceId);
+ 
++// Re-select from the IP versions the on-die discovery binary reported, as soon
++// as discovery has run. The PCI-id pick above has to guess, because probe()
++// runs before there is anything to read, and it is only right for the ids
++// probe() names: Navi 44 silicon arriving under another device id would be
++// handed Navi 48's gc_12_0_1/psp_14_0_3/smu_14_0_3 blobs, and the PSP chain
++// rejects those with TEE_BAD_PARAMETERS several stages after the mistake.
++//
++// Returns true when the three versions name one of the two sets this table can
++// carry — selecting it, or confirming the one already selected — and false when
++// they name nothing known, {0,0,0} (a block discovery never filled) included.
++// On false the selection is left exactly as it was, so the caller has to log
++// it: silently keeping a guessed set is the failure this exists to avoid.
++bool fw_select_from_ip(IPVersion gc, IPVersion mp0, IPVersion mp1);
++
+ // True when the selected set is Navi 44's (0x7590).
+ bool fw_is_navi44();
+ 
++// The published name of the selected set: "navi44" or "navi48".
++const char *fw_set_name();
++
+ } // namespace amdgpu
+diff --git a/src/navi48-bringup/tests/navi44_die_test.cpp b/src/navi48-bringup/tests/navi44_die_test.cpp
+index 024dd96..5c5d2ac 100644
+--- a/src/navi48-bringup/tests/navi44_die_test.cpp
++++ b/src/navi48-bringup/tests/navi44_die_test.cpp
+@@ -710,6 +710,89 @@ void topoTests()
+     }
+ }
+ 
++// ------------------------------------------------ firmware set from discovery
++//
++// probe() has to guess the die from the PCI id, and its allowlist names three.
++// These cases drive the correction path with version triples and pin two
++// separate properties:
++//
++//   - a triple that names a die moves the table to that die's blobs even when
++//     the guess was the other die (the case that matters: Navi 44 silicon under
++//     an id nobody has seen, which would otherwise load psp_14_0_3_sos), and
++//   - a triple that names nothing leaves the guess exactly where it was, from
++//     either starting set. A half-matched triple must NOT pick a side: the PSP
++//     chain rejecting TMR-resident LOAD_IP_FW three stages later is a far harder
++//     diagnosis than the caller's "keeping the PCI-id pick" log line.
++void fwSelectFromIpTests(const std::string &fwDir)
++{
++    std::printf("\n================ firmware set from IP discovery ================\n");
++
++    const IPVersion kGc44{12, 0, 0}, kGc48{12, 0, 1};
++    const IPVersion kMp44{14, 0, 2}, kMp48{14, 0, 3};
++
++    // The headline case: probe() fell back to Navi 48 because it did not
++    // recognise the id; discovery says 12.0.0 + 14.0.2 and the table moves.
++    fw_select_for_device(0x75A0);            // an id probe()'s allowlist does not name
++    ok("unlisted id starts on the Navi 48 guess", !fw_is_navi44());
++    ok("discovery names Navi 44 -> accepted", fw_select_from_ip(kGc44, kMp44, kMp44));
++    checkSet("discovery: GC 12.0.0 / MP0 14.0.2 / MP1 14.0.2", true, fwDir);
++
++    // The other direction, and it has to be idempotent: probe() already got it
++    // right for 0x7550, so re-selecting changes nothing observable.
++    fw_select_for_device(0x7550);
++    ok("discovery confirms Navi 48 -> accepted", fw_select_from_ip(kGc48, kMp48, kMp48));
++    checkSet("discovery: GC 12.0.1 / MP0 14.0.3 (confirmed, not corrected)", false, fwDir);
++    ok("discovery names Navi 44 over a Navi 48 guess -> accepted",
++       fw_select_from_ip(kGc44, kMp44, kMp44));
++    eqs("corrected set's SOS", fw_get(FwId::PSP_SOS)->name, "psp_14_0_2_sos");
++    ok("re-selecting the set already in place -> accepted",
++       fw_select_from_ip(kGc44, kMp44, kMp44));
++    eqs("re-select rebuilt nothing", fw_get(FwId::PSP_SOS)->name, "psp_14_0_2_sos");
++
++    eqs("fw_set_name follows the selection (navi44)", fw_set_name(), "navi44");
++    fw_select_from_ip(kGc48, kMp48, kMp48);
++    eqs("fw_set_name follows the selection (navi48)", fw_set_name(), "navi48");
++
++    struct Refusal {
++        IPVersion gc, mp0, mp1;
++        const char *why;
++    };
++    const Refusal kRefusals[] = {
++        {kGc44, kMp48, kMp48, "GC 12.0.0 but PSP/SMU 14.0.3"},
++        {kGc48, kMp44, kMp44, "GC 12.0.1 but PSP/SMU 14.0.2"},
++        {kGc44, kMp48, kMp44, "PSP disagrees with GC and SMU"},
++        {kGc44, kMp44, kMp48, "SMU disagrees with GC and PSP"},
++        {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, "nothing discovered (all-zero versions)"},
++        {{12, 0, 0}, {0, 0, 0}, {14, 0, 2}, "MP0 never filled by discovery"},
++        {{12, 0, 4}, {14, 0, 5}, {14, 0, 5}, "psp_14_0_5: no blobs embedded here"},
++        {{12, 1, 0}, {14, 0, 2}, {14, 0, 2}, "GC minor 1: not the 12.0.x family"},
++        {{11, 0, 3}, {14, 0, 2}, {14, 0, 2}, "GC 11.0.3: RDNA3, not this table"},
++        {kGc44, {14, 1, 2}, kMp44, "MP0 minor 1"},
++        {kGc44, kMp44, {15, 0, 2}, "MP1 major 15"},
++    };
++    for (const Refusal &r : kRefusals) {
++        const std::string a44 = "refused (from navi44): ", b44 = "keeps navi44: ",
++                          c44 = "navi44 blob untouched: ", a48 = "refused (from navi48): ",
++                          b48 = "keeps navi48: ", c48 = "navi48 blob untouched: ";
++        fw_select_for_device(0x7590);                    // from the Navi 44 set
++        ok((a44 + r.why).c_str(), !fw_select_from_ip(r.gc, r.mp0, r.mp1));
++        ok((b44 + r.why).c_str(), fw_is_navi44());
++        eqs((c44 + r.why).c_str(), fw_get(FwId::PSP_SOS)->name, "psp_14_0_2_sos");
++
++        fw_select_for_device(0x7550);                    // and from the Navi 48 set
++        ok((a48 + r.why).c_str(), !fw_select_from_ip(r.gc, r.mp0, r.mp1));
++        ok((b48 + r.why).c_str(), !fw_is_navi44());
++        eqs((c48 + r.why).c_str(), fw_get(FwId::PSP_SOS)->name, "psp_14_0_3_sos");
++    }
++
++    // Leave the table on the die this port targets, so anything added after this
++    // function starts from a known set.
++    std::printf("-- refusals: %zu triples x 2 starting sets x 3 checks = %zu checks --\n",
++                sizeof(kRefusals) / sizeof(kRefusals[0]),
++                3 * 2 * (sizeof(kRefusals) / sizeof(kRefusals[0])));
++    fw_select_from_ip(kGc44, kMp44, kMp44);
++}
++
+ } // namespace
+ 
+ int main(int argc, char **argv)
+@@ -717,6 +800,7 @@ int main(int argc, char **argv)
+     const std::string fwDir = argc > 1 ? argv[1] : "firmware";
+     std::printf("navi44_die_test -- Navi 44 firmware set (0002) + die geometry (0003)\n");
+     firmwareTests(fwDir);
++    fwSelectFromIpTests(fwDir);
+     geometryTests();
+     setupRbTests();
+     topoTests();

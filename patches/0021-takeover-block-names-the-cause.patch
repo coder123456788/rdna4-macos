@@ -1,0 +1,303 @@
+From af5beefb7440500194b67a0b5878dbca042d6483 Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Fri, 30 Oct 2026 18:24:36 -0700
+Subject: [PATCH] 0021: name the cause of a takeover timeout, do not guess it
+
+0020 prints one sentence for every miss: "its personality did not match this
+card's device id". On a recovery boot that sentence is false - Apple's
+AMDRadeonX6000 kext is not loaded there, so no personality of Apple's could
+have matched anything, and the owner would chase a device-id spoof that cannot
+help. A timeout has three causes and each one has a different fix.
+
+accel_takeover_diagnosis() turns the miss into one of them: the accelerator
+class is not registered on this boot (recovery, or the kext is missing), the
+accelerator attached but its start() failed before announcing itself, or the
+kext is loaded and nothing attached to the card - only the last one is about
+the device id.
+
+Two facts are gathered after the wait, not at arm time, so a kext that loads
+late still counts: whether AMDRadeonX6000_AMDNavi21GraphicsAccelerator is a
+registered class (OSMetaClass::getMetaClassWithName - libkern/OSKext.h is not
+in MacKernelSDK), and whether any child of the card's provider is a class whose
+name contains "Accelerator". takeover_arm() therefore takes the IOPCIDevice the
+fire block already holds, and the report prints both bits so a photograph can
+be read without a terminal.
+
+The headline for TimedOut stops asserting the id and points at the cause line.
+Host suite 89 checks / 0 failures, plant suite 41/41 caught, 0 escaped.
+---
+ src/navi48-bringup/src/Navi48Bringup.cpp      |  2 +-
+ src/navi48-bringup/src/accel_takeover.cpp     | 58 ++++++++++++++++++-
+ .../src/accel_takeover_report.h               | 26 ++++++++-
+ .../tests/accel_takeover_report_plant.sh      |  8 +--
+ .../tests/accel_takeover_report_test.cpp      | 35 +++++++++--
+ 5 files changed, 115 insertions(+), 14 deletions(-)
+
+diff --git a/src/navi48-bringup/src/Navi48Bringup.cpp b/src/navi48-bringup/src/Navi48Bringup.cpp
+index 06264dd..24677f3 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -7834,7 +7834,7 @@ bool Navi48Bringup::start(IOService *provider) {
+ 			// personality for the gate's decision. The positive side prints from Navi48AccelPeer's
+ 			// kReqAccelStarted handler; this thread is only the timeout.
+ 			if (n48::accel_takeover_armed(ff.argRequested, fireCalled && fireKr == 0)) {
+-				n48::takeover_arm();
++				n48::takeover_arm(pciDevice);
+ 				setProperty("Navi48,AccelTakeover", "watching for Apple's accelerator to announce itself");
+ 				n48::takeover_start_poller();
+ 			}
+diff --git a/src/navi48-bringup/src/accel_takeover.cpp b/src/navi48-bringup/src/accel_takeover.cpp
+index c169452..046a8dd 100644
+--- a/src/navi48-bringup/src/accel_takeover.cpp
++++ b/src/navi48-bringup/src/accel_takeover.cpp
+@@ -11,7 +11,10 @@
+ 
+ #include "amd/n48log.h"
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
+ #include <kern/thread.h>
++#include <libkern/c++/OSMetaClass.h>
++#include <libkern/c++/OSSymbol.h>
+ 
+ #define TAKELOG(fmt, ...) ::amdgpu::n48_logf("takeover: " fmt "\n", ##__VA_ARGS__)
+ 
+@@ -20,8 +23,51 @@ namespace {
+ volatile uint32_t gArmed;
+ volatile uint32_t gStarted;
+ volatile uint32_t gBlockPrinted;
++volatile uintptr_t gProvider;
+ 
+-void print_block(n48::TakeoverVerdict v, uint32_t waited) {
++bool text_contains(const char *hay, const char *needle) {
++    if (!hay || !needle) return false;
++    for (const char *h = hay; *h; h++) {
++        const char *a = h, *b = needle;
++        while (*a && *b && *a == *b) { a++; b++; }
++        if (!*b) return true;
++    }
++    return false;
++}
++
++// The class we instantiate can only be registered while Apple's kext is loaded, so this is
++// the "is there an accelerator to attach" question, asked without OSKext (not in the SDK).
++bool apple_kext_loaded() {
++    const OSSymbol *sym =
++        OSSymbol::withCStringNoCopy("AMDRadeonX6000_AMDNavi21GraphicsAccelerator");
++    if (!sym) return false;
++    const bool present = OSMetaClass::getMetaClassWithName(sym) != nullptr;
++    sym->release();
++    return present;
++}
++
++bool accel_attached() {
++    IOService *prov = (IOService *)__atomic_load_n(&gProvider, __ATOMIC_ACQUIRE);
++    if (!prov) return false;
++    OSIterator *it = prov->getChildIterator(gIOServicePlane);
++    if (!it) return false;
++    bool found = false;
++    while (IOService *c = (IOService *)it->getNextObject()) {
++        const char *cn = c->getMetaClass()->getClassName();
++        if (text_contains(cn, "Accelerator")) { found = true; break; }
++    }
++    it->release();
++    return found;
++}
++
++n48::TakeoverFacts gather_facts() {
++    n48::TakeoverFacts f;
++    f.appleKextLoaded = apple_kext_loaded();
++    f.accelAttached = accel_attached();
++    return f;
++}
++
++void print_block(n48::TakeoverVerdict v, uint32_t waited, const n48::TakeoverFacts &f) {
+     for (uint32_t t = 0; t <= n48::kTakeoverHold; t++) {
+         TAKELOG("========== NAVI 44 TAKEOVER REPORT %u/%u ==========", t, n48::kTakeoverHold);
+         TAKELOG("%s", n48::accel_takeover_headline(v));
+@@ -31,6 +77,9 @@ void print_block(n48::TakeoverVerdict v, uint32_t waited) {
+         } else {
+             TAKELOG("waited %u s after LoadAccelerator was published; no SpecialAMDKey type 0x00 "
+                     "arrived from Apple's accelerator", waited);
++            TAKELOG("%s", n48::accel_takeover_diagnosis(f));
++            TAKELOG("kext loaded=%u  accelerator child=%u", f.appleKextLoaded ? 1u : 0u,
++                    f.accelAttached ? 1u : 0u);
+         }
+         TAKELOG("no terminal needed: photograph this screen");
+         if (t >= n48::kTakeoverHold) break;
+@@ -51,14 +100,17 @@ void takeover_poller(void *, wait_result_t) {
+     if (v == n48::TakeoverVerdict::NotArmed) return;
+     uint32_t expected = 0;
+     if (!__atomic_compare_exchange_n(&gBlockPrinted, &expected, 1u, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+-    print_block(v, waited);
++    // Asked after the wait, not at arm time: a kext that loads late still counts.
++    const n48::TakeoverFacts facts = gather_facts();
++    print_block(v, waited, facts);
+ }
+ 
+ } // namespace
+ 
+ namespace n48 {
+ 
+-void takeover_arm() {
++void takeover_arm(::IOService *provider) {
++    __atomic_store_n(&gProvider, (uintptr_t)provider, __ATOMIC_RELEASE);
+     __atomic_store_n(&gArmed, 1u, __ATOMIC_RELEASE);
+ }
+ 
+diff --git a/src/navi48-bringup/src/accel_takeover_report.h b/src/navi48-bringup/src/accel_takeover_report.h
+index b0b5d96..071523a 100644
+--- a/src/navi48-bringup/src/accel_takeover_report.h
++++ b/src/navi48-bringup/src/accel_takeover_report.h
+@@ -21,6 +21,8 @@
+ 
+ #include <stdint.h>
+ 
++class IOService;   // global: the runtime takes the card as a plain IOService
++
+ namespace n48 {
+ 
+ constexpr uint32_t kTakeoverWaitSeconds = 20;  // 1 s steps; the 0019 hold runs out first
+@@ -43,15 +45,35 @@ inline const char *accel_takeover_headline(TakeoverVerdict v) {
+         return "TAKEOVER: Apple's accelerator started - the handover happened";
+     case TakeoverVerdict::TimedOut:
+         return "NO TAKEOVER: LoadAccelerator was published but Apple's accelerator never "
+-               "announced itself - its personality did not match this card's device id";
++               "announced itself - the line below names the reason";
+     case TakeoverVerdict::NotArmed:
+         return "takeover: not tracked - the report was not requested, or nothing was published";
+     }
+     return "takeover: unknown verdict";
+ }
+ 
++//  A timeout is one bit; it has three causes and they need different fixes. Without these
++//  facts the block can only guess, and guessing "the id did not match" on a boot whose
++//  system has no accelerator kext at all (every recovery boot) sends the owner to the
++//  wrong fix.
++struct TakeoverFacts {
++    bool appleKextLoaded;  // com.apple.kext.AMDRadeonX6000 is loaded on this boot
++    bool accelAttached;    // a child of the card has "Accelerator" in its class name
++};
++
++inline const char *accel_takeover_diagnosis(const TakeoverFacts &f) {
++    if (!f.appleKextLoaded)
++        return "cause: Apple's AMDRadeonX6000 kext is not loaded on this boot, so there is "
++               "no accelerator class to attach - as on a recovery boot";
++    if (f.accelAttached)
++        return "cause: Apple's accelerator attached to this card but its start() failed "
++               "before it announced itself - the personality matched, the bring-up did not";
++    return "cause: Apple's AMDRadeonX6000 kext is loaded but nothing attached to this card "
++           "- its personality did not match the device id Apple sees";
++}
++
+ // ---- runtime, defined in accel_takeover.cpp ----
+-void takeover_arm();
++void takeover_arm(::IOService *provider);
+ void takeover_mark_started(void *accel);
+ void takeover_start_poller();
+ 
+diff --git a/src/navi48-bringup/tests/accel_takeover_report_plant.sh b/src/navi48-bringup/tests/accel_takeover_report_plant.sh
+index 4f46898..d83a951 100644
+--- a/src/navi48-bringup/tests/accel_takeover_report_plant.sh
++++ b/src/navi48-bringup/tests/accel_takeover_report_plant.sh
+@@ -105,8 +105,8 @@ run_plant "hold: 5 becomes forty"                    "$H" 'constexpr uint32_t kT
+ 
+ echo "== plants: the headline an owner photographs =="
+ run_plant "headline: started loses the handover"     "$H" 'return "TAKEOVER: Apple'"'"'s accelerator started - the handover happened";' 'return "TAKEOVER: Apple'"'"'s accelerator started";'
+-run_plant "headline: timeout loses the personality"  "$H" '"announced itself - its personality did not match this card'"'"'s device id";' '"announced itself";'
+-run_plant "headline: timeout loses never-started"    "$H" '"announced itself - its personality did not match this card'"'"'s device id";' '"came back with the wrong device id";'
++run_plant "headline: timeout loses the personality"  "$H" '"announced itself - the line below names the reason";' '"announced itself";'
++run_plant "headline: timeout loses never-started"    "$H" '"announced itself - the line below names the reason";' '"came back with the wrong device id";'
+ run_plant "headline: not-armed reads as the enum"    "$H" 'return "takeover: not tracked - the report was not requested, or nothing was published";' 'return "TakeoverVerdict::NotArmed";'
+ run_plant "headline: an empty screen"                "$H" 'return "TAKEOVER: Apple'"'"'s accelerator started - the handover happened";' 'return "";'
+ run_plant "headline: TimedOut case no longer handled" "$H" 'case TakeoverVerdict::TimedOut:' 'case TakeoverVerdict::TimedOut :'
+@@ -133,7 +133,7 @@ run_plant "rt: the started flag is never set"        "$R" '__atomic_store_n(&gSt
+ run_plant "rt: the mark sleeps on Apple's thread"    "$R" '__atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE);' '__atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE); IOSleep(500);'
+ run_plant "rt: the arming never takes"               "$R" '__atomic_store_n(&gArmed, 1u, __ATOMIC_RELEASE);' '__atomic_store_n(&gArmed, 0u, __ATOMIC_RELEASE);'
+ run_plant "rt: the mark ignores arming"              "$R" 'if (!__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE)) return;' 'if (false) return;'
+-run_plant "rt: the block is never printed"           "$R" 'print_block(v, waited);' ';'
++run_plant "rt: the block is never printed"           "$R" 'print_block(v, waited, facts);' ';'
+ run_plant "rt: the block runs one second long"       "$R" 'if (t >= n48::kTakeoverHold) break;' 'if (t > n48::kTakeoverHold) break;'
+ run_plant "rt: two blocks can print"                 "$R" '__atomic_compare_exchange_n(&gBlockPrinted' '__atomic_compare_exchange_n(&gBlockPrintedX'
+ 
+@@ -142,7 +142,7 @@ run_plant "xsrc: header not included"                "$C" '#include "accel_takeo
+ run_plant "xsrc: armed on any requested boot"        "$C" 'n48::accel_takeover_armed(ff.argRequested, fireCalled && fireKr == 0)' 'n48::accel_takeover_armed(ff.argRequested, true)'
+ run_plant "xsrc: armed on every boot"                "$C" 'n48::accel_takeover_armed(ff.argRequested, fireCalled && fireKr == 0)' 'n48::accel_takeover_armed(true, true)'
+ run_plant "xsrc: an errored fire is still watched"   "$C" 'n48::accel_takeover_armed(ff.argRequested, fireCalled && fireKr == 0)' 'n48::accel_takeover_armed(ff.argRequested, fireCalled)'
+-run_plant "xsrc: arming is dropped"                  "$C" 'n48::takeover_arm();' ';'
++run_plant "xsrc: arming is dropped"                  "$C" 'n48::takeover_arm(pciDevice);' ';'
+ run_plant "xsrc: the poller is never started"        "$C" 'n48::takeover_start_poller();' ';'
+ run_plant "xsrc: the property is renamed"            "$C" 'setProperty("Navi48,AccelTakeover"' 'setProperty("Navi48,AccelTakeoverX"'
+ 
+diff --git a/src/navi48-bringup/tests/accel_takeover_report_test.cpp b/src/navi48-bringup/tests/accel_takeover_report_test.cpp
+index 3c069d4..07b87ad 100644
+--- a/src/navi48-bringup/tests/accel_takeover_report_test.cpp
++++ b/src/navi48-bringup/tests/accel_takeover_report_test.cpp
+@@ -110,11 +110,31 @@ int main(int argc, char **argv) {
+ 	CHECK(!has(started, "never"));
+ 	CHECK(has(timedOut, "NO TAKEOVER"));
+ 	CHECK(has(timedOut, "never"));
+-	CHECK(has(timedOut, "personality"));
+-	CHECK(has(timedOut, "device id"));
++	CHECK(has(timedOut, "reason"));
+ 	CHECK(!has(timedOut, "handover happened"));
+ 	CHECK(has(notArmed, "not tracked"));
+ 
++	// ---------------------------------------------------------------- B2: the diagnosis
++	// A timeout has three causes and they need different fixes, so the block must name the
++	// one that happened. The kext-absent case must not accuse the id: on a recovery boot
++	// there is no accelerator class at all.
++	const n48::TakeoverFacts fNoKext = { false, false };
++	const n48::TakeoverFacts fSilent = { true, true };
++	const n48::TakeoverFacts fNoMatch = { true, false };
++	const char *dNoKext = n48::accel_takeover_diagnosis(fNoKext);
++	const char *dSilent = n48::accel_takeover_diagnosis(fSilent);
++	const char *dNoMatch = n48::accel_takeover_diagnosis(fNoMatch);
++	CHECK(dNoKext && dSilent && dNoMatch);
++	CHECK(std::strcmp(dNoKext, dSilent) != 0);
++	CHECK(std::strcmp(dNoKext, dNoMatch) != 0);
++	CHECK(std::strcmp(dSilent, dNoMatch) != 0);
++	CHECK(has(dNoKext, "not loaded"));
++	CHECK(!has(dNoKext, "personality"));
++	CHECK(!has(dNoKext, "device id"));
++	CHECK(has(dSilent, "start()"));
++	CHECK(has(dNoMatch, "personality"));
++	CHECK(has(dNoMatch, "device id"));
++
+ 	// ---------------------------------------------------------------- C: xsrc wiring
+ 	const std::string bringup = slurp(root + "/src/Navi48Bringup.cpp");
+ 	const std::string peer = slurp(root + "/src/apple/Navi48AccelPeer.cpp");
+@@ -126,7 +146,7 @@ int main(int argc, char **argv) {
+ 	// armed from the fire block, and only when the fire call published
+ 	CHECK(has(bringup, "#include \"accel_takeover_report.h\""));
+ 	CHECK(has(bringup, "n48::accel_takeover_armed(ff.argRequested, fireCalled && fireKr == 0)"));
+-	CHECK(has(bringup, "n48::takeover_arm();"));
++	CHECK(has(bringup, "n48::takeover_arm(pciDevice);"));
+ 	CHECK(has(bringup, "n48::takeover_start_poller();"));
+ 	CHECK(has(bringup, "setProperty(\"Navi48,AccelTakeover\""));
+ 	// ...and after the 0019 block, so the screen carries the decision before the watch starts
+@@ -157,7 +177,13 @@ int main(int argc, char **argv) {
+ 	CHECK(has(rt, "__atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE);"));
+ 	CHECK(has(rt, "if (!__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE)) return;"));
+ 	CHECK(has(rt, "n48::accel_takeover_verdict(__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE) != 0,"));
+-	CHECK(has(rt, "print_block(v, waited);"));
++	CHECK(has(rt, "print_block(v, waited, facts);"));
++	CHECK(has(rt, "n48::TakeoverFacts gather_facts()"));
++	CHECK(has(rt, "OSMetaClass::getMetaClassWithName(sym)"));
++	CHECK(has(rt, "AMDRadeonX6000_AMDNavi21GraphicsAccelerator"));
++	CHECK(has(rt, "getChildIterator(gIOServicePlane)"));
++	CHECK(has(rt, "__atomic_store_n(&gProvider, (uintptr_t)provider, __ATOMIC_RELEASE);"));
++	CHECK(has(rt, "n48::accel_takeover_diagnosis(f)"));
+ 	CHECK(has(rt, "if (t >= n48::kTakeoverHold) break;"));
+ 	// The positive side runs inside Apple's start(): it must not hold the screen for kTakeoverHold.
+ 	const size_t markDef = rt.find("void takeover_mark_started(");
+@@ -179,6 +205,7 @@ int main(int argc, char **argv) {
+ 	CHECK(count_of(hdr, "kTakeoverHold") == 1);
+ 	CHECK(has(hdr, "case TakeoverVerdict::TimedOut:"));
+ 	CHECK(has(hdr, "return reportRequested && published;"));
++	CHECK(has(hdr, "accel_takeover_diagnosis"));
+ 
+ 	if (gFailures == 0) printf("OK: %d checks, 0 failures\n", gChecks);
+ 	else                printf("%d checks, %d failures\n", gChecks, gFailures);
+-- 
+2.52.0.windows.1
+

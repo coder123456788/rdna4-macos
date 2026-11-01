@@ -1,0 +1,1338 @@
+From 05ae8f484bd0b32d8f0bded0ac5bc721d0dcf972 Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Sat, 31 Oct 2026 12:15:07 -0700
+Subject: [PATCH] 0028: the report reaches the stick with no mount
+
+A 0027 report needs /Volumes/OPENCORE to exist, and this machine has boots where macOS
+never mounts the stick, so nothing comes back. The same report now also goes into the
+pre-created NAVI48.TXT through the block device: find the IOMedia in the stick's size
+class, accept it only if sector 0 is a FAT32 BPB labelled OPENCORE, the root directory
+holds the exact 8.3 entry NAVI48.TXT, and the file starts with "navi"; then rewrite the
+fixed 1536-byte text region of its first cluster. FAT, directory and other clusters are
+never written. The VFS path is tried first and keeps working when the volume mounts; the
+raw path runs only when it does not. Same fixed length on both, no truncation, so the
+Windows-created 8 KiB target keeps its shape. Host suite and a mutation harness cover the
+BPB parser, the directory scan and the write-safety predicate.
+---
+ src/navi48-bringup/src/Navi48Bringup.cpp      |   7 +-
+ src/navi48-bringup/src/accel_report_file.h    |  23 +-
+ src/navi48-bringup/src/accel_report_raw.cpp   | 176 +++++++
+ src/navi48-bringup/src/accel_report_raw.h     | 206 ++++++++
+ src/navi48-bringup/src/accel_takeover.cpp     |  47 +-
+ .../tests/accel_report_file_plant.sh          |   7 +-
+ .../tests/accel_report_file_test.cpp          |  25 +-
+ .../tests/accel_report_raw_plant.sh           | 167 +++++++
+ .../tests/accel_report_raw_test.cpp           | 462 ++++++++++++++++++
+ 9 files changed, 1086 insertions(+), 34 deletions(-)
+ create mode 100644 src/navi48-bringup/src/accel_report_raw.cpp
+ create mode 100644 src/navi48-bringup/src/accel_report_raw.h
+ create mode 100644 src/navi48-bringup/tests/accel_report_raw_plant.sh
+ create mode 100644 src/navi48-bringup/tests/accel_report_raw_test.cpp
+
+diff --git a/src/navi48-bringup/src/Navi48Bringup.cpp b/src/navi48-bringup/src/Navi48Bringup.cpp
+index 468b20a..63066e6 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -7812,10 +7812,11 @@ bool Navi48Bringup::start(IOService *provider) {
+ 			const n48::AccelBootReport rmode =
+ 				n48::accel_report_mode(ff.argRequested, holdRequested);
+ 			const char *head = n48::accel_report_headline(fv, fireCalled, fireKr, ff.gateMode);
+-			// 0027: the same sentence goes to the stick as well, from a thread that waits for the
+-			// verdict and then for /Volumes/OPENCORE - so a boot reports itself with no
++			// 0027/0028: the same sentence goes to the stick as well, from a thread that waits for
++			// the verdict and then writes NAVI48.TXT - through /Volumes/OPENCORE when the volume
++			// mounts, through the block device when it does not. So a boot reports itself with no
+ 			// photograph. Started on every requested boot, not only when this port fired.
+-			if (ff.argRequested) n48::takeover_start_writer(head);
++			if (ff.argRequested) n48::takeover_start_writer(head, this);
+ 			if (rmode != n48::AccelBootReport::Off) {
+ 				const uint32_t secs = (rmode == n48::AccelBootReport::PrintAndHold)
+ 				                    ? n48::accel_report_hold_seconds(holdRequested) : 0;
+diff --git a/src/navi48-bringup/src/accel_report_file.h b/src/navi48-bringup/src/accel_report_file.h
+index 2b1d5dc..d1f0f0b 100644
+--- a/src/navi48-bringup/src/accel_report_file.h
++++ b/src/navi48-bringup/src/accel_report_file.h
+@@ -1,14 +1,16 @@
+-//  accel_report_file.h — patch 0027: the verdict leaves the screen and lands on the stick.
++//  accel_report_file.h — patches 0027/0028: the verdict leaves the screen and lands on the stick.
+ //
+ //  0019-0025 answer the two questions a boot has to answer - did this port publish
+ //  LoadAccelerator, and did Apple's accelerator then take the card - but every answer is printed
+ //  to the -v console and needs a photograph to come back. This machine has no camera in the loop,
+ //  so the answer has to survive the boot by itself.
+ //
+-//  The boot stick is a plain FAT32 data partition (not an ESP), so macOS auto-mounts it as
+-//  /Volumes/OPENCORE at every boot with the stick attached. accel_report_file.cpp writes this
+-//  text there from a kernel thread after the verdict is settled; the owner only has to hand the
+-//  stick back, and the file is readable from Windows as E:\navi48-report.txt.
++//  The boot stick is a plain FAT32 data partition (not an ESP). The report belongs in the file
++//  E:\NAVI48.TXT, 8.3-named so FAT needs no long-name entry. 0027 wrote it through
++//  /Volumes/OPENCORE once diskarbitrationd mounted the volume; 0028 keeps that path but falls
++//  back to writing the file's data cluster through the block device (accel_report_raw.h), so a
++//  boot whose stick macOS never mounts still leaves the answer behind. The owner only has to open
++//  the file in Windows. No photograph, no terminal.
+ //
+ //  The text is built here, with no IOKit, so the host suite can check every line and every
+ //  variant without a Mac - the same split as accel_takeover_report.h / accel_takeover.cpp.
+@@ -19,9 +21,15 @@
+ 
+ #include "accel_takeover_report.h"
+ 
++class IOService;
++
+ namespace n48 {
+ 
+-constexpr const char *kReportFilePath = "/Volumes/OPENCORE/navi48-report.txt";
++constexpr const char *kReportFilePath = "/Volumes/OPENCORE/NAVI48.TXT";
++// Fixed write length: sector-aligned, shorter than the 8 KiB cluster the file occupies, and long
++// enough for every line the report can hold. Writing the same length every boot keeps stale text
++// out of the tail without truncating the Windows-created file.
++constexpr uint32_t kReportFileWriteCap = 1536;
+ constexpr uint32_t kReportFileRetrySeconds = 120;  // the FAT volume mounts when diskarbitrationd gets there
+ constexpr uint32_t kReportFileSettleSeconds = 2;   // let Apple's last calls land in the census
+ 
+@@ -123,6 +131,7 @@ inline size_t report_file_text(char *out, size_t cap, const ReportFileInputs &in
+ }
+ 
+ // ---- runtime, defined in accel_takeover.cpp ----
+-void takeover_start_writer(const char *fireHeadline);
++// client is the IOService the block-device channel opens the stick as; the VFS channel ignores it.
++void takeover_start_writer(const char *fireHeadline, ::IOService *client);
+ 
+ } // namespace n48
+diff --git a/src/navi48-bringup/src/accel_report_raw.cpp b/src/navi48-bringup/src/accel_report_raw.cpp
+new file mode 100644
+index 0000000..3429ec4
+--- /dev/null
++++ b/src/navi48-bringup/src/accel_report_raw.cpp
+@@ -0,0 +1,176 @@
++//  accel_report_raw.cpp — patch 0028: the report reaches the stick without a mount.
++//
++//  Why not just the VFS: 0027's write needed diskarbitrationd to mount the FAT32 volume, and this
++//  machine produced boots where nothing was mounted, so nothing came back. The storage stack
++//  itself is always there - OpenCore booted from this stick - so the fallback opens the partition
++//  as an IOMedia and writes the report into the one file the kit pre-creates for it.
++//
++//  What keeps that safe: the media must parse as FAT32 with the OPENCORE label, the root
++//  directory must hold the exact 8.3 entry NAVI48.TXT, the entry must describe a file big enough
++//  for the fixed write, and the file's first bytes must be "navi". Only the first write length of
++//  that file's data cluster is written; no FAT, directory or other cluster is ever touched. A
++//  media that fails any check is left exactly as it was.
++
++#include "accel_report_raw.h"
++
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IOService.h>
++#include <IOKit/storage/IOMedia.h>
++#include <IOKit/storage/IOStorage.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSIterator.h>
++#include <string.h>
++
++namespace {
++
++constexpr size_t kProbeBytes = 512;  // enough for the BPB, the label and a FAT entry
++
++IOReturn read_at(IOStorage *media, IOService *client, uint64_t offset, void *out, size_t len) {
++    IOBufferMemoryDescriptor *md =
++        IOBufferMemoryDescriptor::withCapacity((vm_size_t)len, kIODirectionIn, false);
++    if (!md) return kIOReturnNoMemory;
++    UInt64 actual = 0;
++    const IOReturn kr = media->read(client, offset, md, nullptr, &actual);
++    const void *src = md->getBytesNoCopy();
++    const bool ok = kr == kIOReturnSuccess && src && actual >= (UInt64)len;
++    if (ok) memcpy(out, src, len);
++    md->release();
++    return ok ? kIOReturnSuccess : kIOReturnError;
++}
++
++// Reader-level probe: the media is only trusted after its own sector 0 describes this kit's stick.
++bool stick_geometry(IOMedia *media, IOService *client, n48::Fat32Geometry *out) {
++    const UInt64 size = media->getSize();
++    if (size < n48::kRawReportMinMediaBytes || size > n48::kRawReportMaxMediaBytes) return false;
++    if (!media->open(client, 0, kIOStorageAccessReader)) return false;
++    uint8_t boot[kProbeBytes];
++    n48::Fat32Geometry g = {};
++    bool ok = read_at(media, client, 0, boot, sizeof boot) == kIOReturnSuccess;
++    if (ok) {
++        g = n48::fat32_parse_bpb(boot, sizeof boot, size);
++        ok = g.valid && n48::fat32_label_matches(boot, sizeof boot, n48::kRawReportLabel);
++    }
++    media->close(client, 0);
++    if (ok) *out = g;
++    return ok;
++}
++
++int fat_entry(IOStorage *media, IOService *client, const n48::Fat32Geometry &g, uint32_t cluster,
++              uint32_t *value) {
++    const uint64_t off = g.fatStart + (uint64_t)cluster * 4;
++    if (off + 4 > g.fatStart + (uint64_t)g.fatSizeSectors * g.bytesPerSector)
++        return n48::kRawIoError;
++    uint8_t sector[kProbeBytes];
++    const uint64_t aligned = off & ~(uint64_t)(kProbeBytes - 1);
++    if (read_at(media, client, aligned, sector, sizeof sector) != kIOReturnSuccess)
++        return n48::kRawIoError;
++    *value = n48::fat32_chain_value(n48::raw_rd32(sector + (uint32_t)(off - aligned)));
++    return n48::kRawOk;
++}
++
++// The root directory is a cluster chain; walk it (at most kRawReportMaxChainClusters) until the
++// entry appears, the 0x00 terminator ends the directory, or the chain does.
++int find_file(IOStorage *media, IOService *client, const n48::Fat32Geometry &g,
++              n48::Fat32DirHit *hit) {
++    uint32_t cluster = g.rootCluster;
++    for (uint32_t hops = 0; hops < n48::kRawReportMaxChainClusters; hops++) {
++        if (!n48::fat32_cluster_in_fat(g, cluster)) return n48::kRawIoError;
++        const uint64_t off = n48::fat32_cluster_offset(g, cluster);
++        if (off + g.clusterBytes > g.mediaBytes) return n48::kRawIoError;
++        IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::withCapacity(
++            (vm_size_t)g.clusterBytes, kIODirectionIn, false);
++        if (!md) return n48::kRawIoError;
++        UInt64 actual = 0;
++        const IOReturn kr = media->read(client, off, md, nullptr, &actual);
++        const uint8_t *p = (const uint8_t *)md->getBytesNoCopy();
++        n48::Fat32DirHit h = {};
++        if (kr == kIOReturnSuccess && p && actual >= g.clusterBytes)
++            h = n48::fat32_scan_dir(p, (size_t)g.clusterBytes, n48::kRawReportName);
++        md->release();
++        if (kr != kIOReturnSuccess) return n48::kRawIoError;
++        if (h.found || h.end) {
++            *hit = h;
++            return n48::kRawOk;
++        }
++        uint32_t next = 0;
++        const int err = fat_entry(media, client, g, cluster, &next);
++        if (err != n48::kRawOk) return err;
++        if (!n48::fat32_chain_ok(next)) return n48::kRawOk;  // hit stays empty: no such file
++        cluster = next;
++    }
++    return n48::kRawOk;
++}
++
++int write_to_stick(IOMedia *media, IOService *client, const n48::Fat32Geometry &g,
++                   const char *text, size_t len) {
++    n48::Fat32DirHit hit = {};
++    int err = find_file(media, client, g, &hit);
++    if (err != n48::kRawOk) return err;
++    if (!hit.found) return n48::kRawNoFile;
++
++    uint64_t fileOff = 0;
++    if (!n48::fat32_file_target(g, hit.firstCluster, hit.fileSize, (uint32_t)len, &fileOff))
++        return n48::kRawNoFile;
++
++    uint8_t head[kProbeBytes];
++    if (read_at(media, client, fileOff, head, sizeof head) != kIOReturnSuccess)
++        return n48::kRawIoError;
++    for (int i = 0; i < 4; i++) {
++        if (head[i] != n48::kRawReportMagic[i]) return n48::kRawBadMagic;
++    }
++
++    // Block devices take sector multiples; the pad bytes are spaces so the visible text is clean.
++    const uint64_t aligned =
++        ((uint64_t)len + g.bytesPerSector - 1) / g.bytesPerSector * g.bytesPerSector;
++    if (aligned > hit.fileSize || aligned > g.clusterBytes) return n48::kRawNoFile;
++
++    if (!media->open(client, 0, kIOStorageAccessReaderWriter)) return n48::kRawIoError;
++    int result = n48::kRawIoError;
++    IOBufferMemoryDescriptor *out =
++        IOBufferMemoryDescriptor::withCapacity((vm_size_t)aligned, kIODirectionOut, false);
++    if (out) {
++        uint8_t *p = (uint8_t *)out->getBytesNoCopy();
++        if (p) {
++            memcpy(p, text, len);
++            memset(p + len, ' ', (size_t)(aligned - len));
++            UInt64 actual = 0;
++            const IOReturn kr = media->write(client, fileOff, out, nullptr, &actual);
++            if (kr == kIOReturnSuccess && actual == aligned) {
++                media->synchronize(client, fileOff, aligned);  // best effort; data is out
++                result = n48::kRawOk;
++            }
++        }
++        out->release();
++    }
++    media->close(client, 0);
++    return result;
++}
++
++} // namespace
++
++namespace n48 {
++
++int report_raw_write(::IOService *client, const char *text, size_t len) {
++    if (!client || !text || len == 0 || len > kReportFileWriteCap) return kRawBadArgs;
++    OSDictionary *match = ::IOService::serviceMatching("IOMedia");
++    if (!match) return kRawNoStick;
++    OSIterator *it = ::IOService::getMatchingServices(match);
++    match->release();
++    if (!it) return kRawNoStick;
++
++    int result = kRawNoStick;
++    while (::IOService *svc = (::IOService *)it->getNextObject()) {
++        IOMedia *media = OSDynamicCast(IOMedia, svc);
++        if (!media) continue;
++        Fat32Geometry g = {};
++        if (!stick_geometry(media, client, &g)) continue;
++        result = write_to_stick(media, client, g, text, len);
++        if (result == kRawOk) break;
++    }
++    it->release();
++    return result;
++}
++
++} // namespace n48
+diff --git a/src/navi48-bringup/src/accel_report_raw.h b/src/navi48-bringup/src/accel_report_raw.h
+new file mode 100644
+index 0000000..4d4ab6f
+--- /dev/null
++++ b/src/navi48-bringup/src/accel_report_raw.h
+@@ -0,0 +1,206 @@
++//  accel_report_raw.h — patch 0028: the verdict reaches the stick even when macOS never mounts it.
++//
++//  0027 wrote the report to /Volumes/OPENCORE, which needs diskarbitrationd to mount the FAT32
++//  volume. A boot where that never happens leaves nothing behind, and this machine has no other
++//  way to carry an answer back. So the same text now also goes straight into the file's data
++//  cluster through the block device: no mount, no filesystem driver, no VFS.
++//
++//  A raw write is only safe when it cannot land anywhere but one file this kit made for it, so
++//  the runtime accepts a device only after five checks: the IOMedia is in the stick's size class,
++//  sector 0 parses as a FAT32 BPB, the volume label is OPENCORE, the root directory holds the 8.3
++//  entry NAVI48.TXT, and that file's first four bytes are "navi". Only the first bytes of that one
++//  file are written; the FAT, the root directory and every other cluster stay read-only.
++//
++//  The FAT32 parsing lives here, with no IOKit, so the host suite can feed it synthetic sectors.
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include "accel_report_file.h"
++
++class IOService;  // the IOStorage open() client; IOKit defines it, this header stays IOKit-free
++
++namespace n48 {
++
++enum : int {
++    kRawOk = 0,
++    kRawNoStick = -1,  // no media in the stick size class carried the FAT32 BPB + OPENCORE label
++    kRawNoFile = -2,   // the root directory has no NAVI48.TXT of the size this kit creates
++    kRawBadMagic = -3, // NAVI48.TXT exists but does not start with "navi" - not this kit's file
++    kRawIoError = -4,  // an open/read/write through the media failed
++    kRawBadArgs = -5,  // len outside (0, kReportFileWriteCap]
++};
++
++// "navi": the first four bytes of every report this kit writes, so the file is proof of its author
++// both on the Windows-created target and after an earlier boot overwrote it.
++constexpr uint8_t kRawReportMagic[4] = { 'n', 'a', 'v', 'i' };
++constexpr char kRawReportName[11] = { 'N', 'A', 'V', 'I', '4', '8', ' ', ' ', 'T', 'X', 'T' };
++constexpr char kRawReportLabel[11] = { 'O', 'P', 'E', 'N', 'C', 'O', 'R', 'E', ' ', ' ', ' ' };
++constexpr uint64_t kRawReportMinMediaBytes = 1ull << 30;
++constexpr uint64_t kRawReportMaxMediaBytes = 128ull << 30;
++constexpr uint32_t kRawReportMaxClusterBytes = 16384;
++constexpr uint32_t kRawReportMaxChainClusters = 64;
++
++struct Fat32Geometry {
++    uint32_t bytesPerSector;
++    uint32_t sectorsPerCluster;
++    uint32_t reservedSectors;
++    uint32_t fatCount;
++    uint32_t fatSizeSectors;
++    uint32_t rootCluster;
++    uint32_t totalSectors;
++    uint64_t fatStart;    // byte offset of FAT 0
++    uint64_t dataStart;   // byte offset of cluster 2 ("the data region")
++    uint64_t clusterBytes;
++    uint64_t mediaBytes;  // what IOMedia said the partition holds
++    bool valid;
++};
++
++struct Fat32DirHit {
++    uint32_t firstCluster;
++    uint32_t fileSize;
++    uint32_t entryOffset;  // byte offset of the 32-byte entry inside the cluster scanned
++    bool found;
++    bool end;              // a 0x00 entry ended the directory before a match
++};
++
++inline uint16_t raw_rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
++inline uint32_t raw_rd32(const uint8_t *p) {
++    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
++           ((uint32_t)p[3] << 24);
++}
++
++// Sector 0 of a FAT32 partition: the BPB, plus the "FAT32" string and the label the formatter
++// left there. Every field is bounds-checked against the media size, so a plausible-looking MBR or
++// an exFAT/exFAT-plus boot sector cannot pass as this filesystem.
++inline Fat32Geometry fat32_parse_bpb(const uint8_t *s, size_t len, uint64_t mediaBytes) {
++    Fat32Geometry g = {};
++    if (!s || len < 512 || s[510] != 0x55 || s[511] != 0xAA) return g;
++    g.bytesPerSector = raw_rd16(s + 0x0B);
++    g.sectorsPerCluster = s[0x0D];
++    g.reservedSectors = raw_rd16(s + 0x0E);
++    g.fatCount = s[0x10];
++    const uint32_t rootEntries = raw_rd16(s + 0x11);
++    const uint32_t total16 = raw_rd16(s + 0x13);
++    const uint32_t fat16 = raw_rd16(s + 0x16);
++    g.totalSectors = total16 ? total16 : raw_rd32(s + 0x20);
++    g.fatSizeSectors = fat16 ? fat16 : raw_rd32(s + 0x24);
++    g.rootCluster = raw_rd32(s + 0x2C);
++    g.mediaBytes = mediaBytes;
++
++    // FAT32 is exactly the layout where the 16-bit FAT size is 0 and the root is a cluster chain.
++    if (fat16 != 0 || rootEntries != 0 || g.fatSizeSectors == 0) return g;
++    if (s[0x52] != 'F' || s[0x53] != 'A' || s[0x54] != 'T' || s[0x55] != '3' || s[0x56] != '2')
++        return g;
++    if (g.bytesPerSector < 512 || g.bytesPerSector > 4096 ||
++        (g.bytesPerSector & (g.bytesPerSector - 1)) != 0)
++        return g;
++    if (g.sectorsPerCluster == 0 || g.sectorsPerCluster > 128 ||
++        (g.sectorsPerCluster & (g.sectorsPerCluster - 1)) != 0)
++        return g;
++    if (g.reservedSectors == 0 || g.fatCount == 0 || g.fatCount > 4) return g;
++    if (g.rootCluster < 2 || g.totalSectors == 0) return g;
++
++    g.clusterBytes = (uint64_t)g.bytesPerSector * g.sectorsPerCluster;
++    g.fatStart = (uint64_t)g.reservedSectors * g.bytesPerSector;
++    g.dataStart = (uint64_t)(g.reservedSectors + (uint64_t)g.fatCount * g.fatSizeSectors) *
++                  g.bytesPerSector;
++    const uint64_t fatBytes = (uint64_t)g.fatSizeSectors * g.bytesPerSector;
++    const uint64_t totalBytes = (uint64_t)g.totalSectors * g.bytesPerSector;
++    if (g.dataStart > totalBytes) return g;
++    if (mediaBytes != 0 && totalBytes > mediaBytes) return g;
++    if ((uint64_t)g.rootCluster * 4 + 4 > fatBytes) return g;
++    const uint64_t rootOffset = g.dataStart + (uint64_t)(g.rootCluster - 2) * g.clusterBytes;
++    if (rootOffset + g.clusterBytes > totalBytes) return g;
++    if (mediaBytes != 0 && rootOffset + g.clusterBytes > mediaBytes) return g;
++    g.valid = true;
++    return g;
++}
++
++// The formatter's label, compared without caring about case (FAT stores it uppercase).
++inline bool fat32_label_matches(const uint8_t *s, size_t len, const char *label) {
++    if (!s || !label || len < 0x52) return false;
++    for (int i = 0; i < 11; i++) {
++        uint8_t a = s[0x47 + i];
++        uint8_t b = (uint8_t)label[i];
++        if (a >= 'a' && a <= 'z') a = (uint8_t)(a - 32);
++        if (b >= 'a' && b <= 'z') b = (uint8_t)(b - 32);
++        if (a != b) return false;
++    }
++    return true;
++}
++
++// One 32-byte entry per iteration. Long-name fragments, deleted entries, volume labels and
++// subdirectories are skipped; the 0x00 terminator means no later entry can match.
++inline Fat32DirHit fat32_scan_dir(const uint8_t *dir, size_t len, const char *name11) {
++    Fat32DirHit hit = {};
++    if (!dir || !name11) return hit;
++    const size_t count = len / 32;
++    for (size_t i = 0; i < count; i++) {
++        const uint8_t *e = dir + i * 32;
++        if (e[0] == 0x00) {
++            hit.end = true;
++            return hit;
++        }
++        if (e[0] == 0xE5) continue;
++        const uint8_t attr = e[0x0B];
++        if ((attr & 0x3F) == 0x0F) continue;  // long-file-name fragment
++        if (attr & 0x18) continue;            // volume id or directory
++        bool same = true;
++        for (int k = 0; k < 11; k++) {
++            if (e[k] != (uint8_t)name11[k]) {
++                same = false;
++                break;
++            }
++        }
++        if (!same) continue;
++        hit.found = true;
++        hit.firstCluster = (uint32_t)raw_rd16(e + 0x1A) | ((uint32_t)raw_rd16(e + 0x14) << 16);
++        hit.fileSize = raw_rd32(e + 0x1C);
++        hit.entryOffset = (uint32_t)(i * 32);
++        return hit;
++    }
++    return hit;
++}
++
++inline uint64_t fat32_cluster_offset(const Fat32Geometry &g, uint32_t cluster) {
++    return g.dataStart + (uint64_t)(cluster - 2) * g.clusterBytes;
++}
++
++inline bool fat32_cluster_in_fat(const Fat32Geometry &g, uint32_t cluster) {
++    return (uint64_t)cluster * 4 + 4 <= (uint64_t)g.fatSizeSectors * g.bytesPerSector;
++}
++
++inline uint32_t fat32_chain_value(uint32_t entry) { return entry & 0x0FFFFFFFu; }
++inline bool fat32_chain_done(uint32_t c) { return c >= 0x0FFFFFF8u; }
++inline bool fat32_chain_ok(uint32_t c) { return c >= 2 && c < 0x0FFFFFF7u; }
++
++// The whole write-safety condition in one place: a cluster inside the FAT, a file big enough for
++// the fixed write, and a byte offset that ends inside the partition.
++inline bool fat32_file_target(const Fat32Geometry &g, uint32_t firstCluster, uint32_t fileSize,
++                              uint32_t writeLen, uint64_t *offset) {
++    if (!g.valid || firstCluster < 2 || writeLen == 0) return false;
++    if (!fat32_cluster_in_fat(g, firstCluster)) return false;
++    if (fileSize < writeLen || g.clusterBytes < writeLen) return false;
++    const uint64_t off = fat32_cluster_offset(g, firstCluster);
++    if (off + writeLen > g.mediaBytes) return false;
++    if (offset) *offset = off;
++    return true;
++}
++
++inline const char *raw_write_error_text(int code) {
++    switch (code) {
++    case kRawOk: return "ok";
++    case kRawNoStick: return "no FAT32 media with the OPENCORE label in the stick size class";
++    case kRawNoFile: return "NAVI48.TXT is not in the root directory (or is not the size this kit creates)";
++    case kRawBadMagic: return "NAVI48.TXT does not start with navi - not this kit's file";
++    case kRawIoError: return "a storage open/read/write failed";
++    default: return "bad arguments";
++    }
++}
++
++// ---- runtime, defined in accel_report_raw.cpp ----
++int report_raw_write(::IOService *client, const char *text, size_t len);
++
++} // namespace n48
+diff --git a/src/navi48-bringup/src/accel_takeover.cpp b/src/navi48-bringup/src/accel_takeover.cpp
+index 71a5bd9..d30751d 100644
+--- a/src/navi48-bringup/src/accel_takeover.cpp
++++ b/src/navi48-bringup/src/accel_takeover.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include "accel_takeover_report.h"
+ #include "accel_report_file.h"
++#include "accel_report_raw.h"
+ 
+ #include "amd/n48log.h"
+ #include "apple/Navi48Ttl.hpp"
+@@ -44,7 +45,6 @@ int vn_rdwr(int rw, vnode_t vp, char *base, int len, long long offset, int segfl
+ namespace {
+ constexpr int kO_WRONLY = 0x0001;
+ constexpr int kO_CREAT = 0x0200;
+-constexpr int kO_TRUNC = 0x0400;
+ constexpr int kUIO_WRITE = 1;
+ constexpr int kUIO_SYSSPACE = 2;
+ constexpr int kFWRITE = 0x0002;
+@@ -61,6 +61,7 @@ volatile uint32_t gBlockPrinted;
+ volatile uintptr_t gProvider;
+ volatile uint32_t gWriterStarted;
+ volatile uintptr_t gFireHeadline;
++volatile uintptr_t gWriterClient;  // IOService the raw channel opens the stick as
+ 
+ bool text_contains(const char *hay, const char *needle) {
+     if (!hay || !needle) return false;
+@@ -178,12 +179,13 @@ n48::ReportFileInputs gather_report_inputs() {
+ }
+ 
+ // A plain kernel-thread write to the mounted FAT32 stick. 0 on success, the VFS errno otherwise;
+-// a short write is reported as EIO so the caller retries rather than leaving half a file.
++// a short write is reported as EIO so the caller retries rather than leaving half a file. No
++// O_TRUNC: the target file is 8 KiB on purpose and the same fixed length is rewritten at offset 0.
+ int write_report_file(const char *text, size_t len) {
+     vfs_context_t ctx = vfs_context_create(nullptr);
+     if (!ctx) return kEIO;
+     vnode_t vp = nullptr;
+-    int err = vnode_open(n48::kReportFilePath, kO_WRONLY | kO_CREAT | kO_TRUNC, 0644, 0, &vp, ctx);
++    int err = vnode_open(n48::kReportFilePath, kO_WRONLY | kO_CREAT, 0644, 0, &vp, ctx);
+     if (err == 0 && vp) {
+         int resid = 0;
+         err = vn_rdwr(kUIO_WRITE, vp, (char *)text, (int)len, 0, kUIO_SYSSPACE, 0,
+@@ -197,11 +199,12 @@ int write_report_file(const char *text, size_t len) {
+     return err;
+ }
+ 
+-// Waits for the verdict, then for the stick. The volume appears when diskarbitrationd mounts it,
+-// which is well after this kext starts, so failure to open is expected for a while and is
+-// retried instead of reported as a verdict. On an unarmed boot (the 0x73BF pair) the negative
+-// verdict is never final - Apple's own driver can publish much later - so the file keeps being
+-// rewritten until an announce arrives or the window closes.
++// Waits for the verdict, then for the stick. The mounted volume appears when diskarbitrationd
++// gets there; if it never does, 0028's block-device channel writes the same bytes into
++// NAVI48.TXT's data cluster instead. Failure on both is expected for a while and is retried
++// instead of reported as a verdict. On an unarmed boot (the 0x73BF pair) the negative verdict is
++// never final - Apple's own driver can publish much later - so the file keeps being rewritten
++// until an announce arrives or the window closes.
+ void report_file_thread(void *, wait_result_t) {
+     uint32_t waited = 0;
+     while (waited < n48::kTakeoverWaitSeconds) {
+@@ -210,24 +213,35 @@ void report_file_thread(void *, wait_result_t) {
+         if (__atomic_load_n(&gStarted, __ATOMIC_ACQUIRE)) break;
+     }
+     IOSleep(n48::kReportFileSettleSeconds * 1000);
+-    char text[2048];
++    IOService *client = (IOService *)__atomic_load_n(&gWriterClient, __ATOMIC_ACQUIRE);
++    char text[n48::kReportFileWriteCap];
+     bool wroteOnce = false;
+     for (uint32_t t = 0; t < n48::kReportFileRetrySeconds; t++) {
+         n48::ReportFileInputs in = gather_report_inputs();
+         in.waited = waited;
+-        const size_t n = n48::report_file_text(text, sizeof text, in);
+-        const int err = write_report_file(text, n);
++        size_t n = n48::report_file_text(text, sizeof text, in);
++        if (n >= sizeof text) n = sizeof text - 1;
++        // A fixed-length write: the report plus spaces. What an earlier boot wrote past its own
++        // last line is overwritten too, so the file never shows two reports glued together.
++        for (size_t i = n; i < sizeof text; i++) text[i] = ' ';
++        const int vfsErr = write_report_file(text, sizeof text);
++        int err = vfsErr;
++        const char *channel = "the mounted volume";
++        if (err != 0) {
++            err = n48::report_raw_write(client, text, sizeof text);
++            channel = "the block device (stick not mounted)";
++        }
+         if (err == 0) {
+             if (!wroteOnce) {
+-                TAKELOG("report written to %s (%llu bytes) - no photograph needed",
+-                        n48::kReportFilePath, (unsigned long long)n);
++                TAKELOG("report written to %s through %s (%llu bytes) - no photograph needed",
++                        n48::kReportFilePath, channel, (unsigned long long)sizeof text);
+                 wroteOnce = true;
+             }
+             // Started is final; an armed timeout is final; an unarmed quiet boot is not.
+             if (in.started || in.armed) return;
+         } else if (t == 0) {
+-            TAKELOG("report file not writable yet (%d); retrying up to %u s",
+-                    err, n48::kReportFileRetrySeconds);
++            TAKELOG("report not writable yet: volume %d, block device %d (%s); retrying up to %u s",
++                    vfsErr, err, n48::raw_write_error_text(err), n48::kReportFileRetrySeconds);
+         }
+         IOSleep(1000);
+         if (waited < n48::kTakeoverWaitSeconds) waited++;
+@@ -327,11 +341,12 @@ void takeover_start_poller() {
+ // 0027: started whenever the report was requested - not only when this port's fire path
+ // published. On the 0x73BF pair boot Apple's own driver publishes LoadAccelerator and our gate
+ // never fires; that is exactly the boot whose verdict has to survive without a photograph.
+-void takeover_start_writer(const char *fireHeadline) {
++void takeover_start_writer(const char *fireHeadline, ::IOService *client) {
+     uint32_t expected = 0;
+     if (!__atomic_compare_exchange_n(&gWriterStarted, &expected, 1u, false, __ATOMIC_ACQ_REL,
+                                      __ATOMIC_ACQUIRE)) return;
+     __atomic_store_n(&gFireHeadline, (uintptr_t)fireHeadline, __ATOMIC_RELEASE);
++    __atomic_store_n(&gWriterClient, (uintptr_t)client, __ATOMIC_RELEASE);
+     thread_t th = nullptr;
+     const kern_return_t kr = kernel_thread_start(&report_file_thread, nullptr, &th);
+     if (kr != KERN_SUCCESS) {
+diff --git a/src/navi48-bringup/tests/accel_report_file_plant.sh b/src/navi48-bringup/tests/accel_report_file_plant.sh
+index 176e2a1..4098d38 100644
+--- a/src/navi48-bringup/tests/accel_report_file_plant.sh
++++ b/src/navi48-bringup/tests/accel_report_file_plant.sh
+@@ -110,7 +110,8 @@ run_plant "text: the buffer is never terminated"     "$F" 'void finish() { if (o
+ 
+ echo "== plants: the write itself (VFS from our own thread) =="
+ run_plant "writer: the path leaves the stick"        "$R" 'vnode_open(n48::kReportFilePath' 'vnode_open("/tmp/navi48-report.txt"'
+-run_plant "writer: opened without write access"      "$R" 'kO_WRONLY | kO_CREAT | kO_TRUNC' 'kO_CREAT | kO_TRUNC'
++run_plant "writer: opened without write access"      "$R" 'kO_WRONLY | kO_CREAT' 'kO_CREAT'
++run_plant "writer: the 8 KiB target is truncated"    "$R" 'kO_WRONLY | kO_CREAT' 'kO_WRONLY | kO_CREAT | kO_TRUNC'
+ run_plant "writer: the uio is a read"                "$R" 'vn_rdwr(kUIO_WRITE, vp, (char *)text' 'vn_rdwr(0, vp, (char *)text'
+ run_plant "writer: a user-space buffer"              "$R" '0, kUIO_SYSSPACE, 0,' '0, 0, 0,'
+ run_plant "writer: the vnode is leaked"              "$R" 'vnode_close(vp, kFWRITE, ctx);' ';'
+@@ -129,8 +130,8 @@ run_plant "header: the retry window is one second"   "$F" 'kReportFileRetrySecon
+ 
+ echo "== plants: the xsrc wiring (every requested boot writes) =="
+ run_plant "xsrc: the header is not included"         "$C" '#include "accel_report_file.h"' '#include "accel_report_file_gone.h"'
+-run_plant "xsrc: the writer is never started"        "$C" 'if (ff.argRequested) n48::takeover_start_writer(head);' ';'
+-run_plant "xsrc: only a fired boot writes"           "$C" 'if (ff.argRequested) n48::takeover_start_writer(head);' 'if (fireCalled) n48::takeover_start_writer(head);'
++run_plant "xsrc: the writer is never started"        "$C" 'if (ff.argRequested) n48::takeover_start_writer(head, this);' ';'
++run_plant "xsrc: only a fired boot writes"           "$C" 'if (ff.argRequested) n48::takeover_start_writer(head, this);' 'if (fireCalled) n48::takeover_start_writer(head, this);'
+ 
+ echo "== summary =="
+ # Plain integers: `${#ARR[@]}` on an empty array is an unbound-variable fatal under set -u.
+diff --git a/src/navi48-bringup/tests/accel_report_file_test.cpp b/src/navi48-bringup/tests/accel_report_file_test.cpp
+index 38aac28..f47d6a0 100644
+--- a/src/navi48-bringup/tests/accel_report_file_test.cpp
++++ b/src/navi48-bringup/tests/accel_report_file_test.cpp
+@@ -182,7 +182,15 @@ int main(int argc, char **argv) {
+ 		CHECK(has(rt, "#include \"accel_report_file.h\""));
+ 		// The file is written with the BSD VFS entry points, from our own thread.
+ 		CHECK(has(rt, "vnode_open(n48::kReportFilePath"));
+-		CHECK(has(rt, "kO_WRONLY | kO_CREAT | kO_TRUNC"));
++		CHECK(has(rt, "kO_WRONLY | kO_CREAT"));
++		// 0028: the Windows-created 8 KiB target keeps its size; the fixed-length write replaces
++		// the text region instead of truncating the file.
++		CHECK(!has(rt, "kO_TRUNC"));
++		CHECK(has(rt, "const int vfsErr = write_report_file(text, sizeof text);"));
++		CHECK(has(rt, "n48::report_raw_write(client, text, sizeof text)"));
++		CHECK(has(rt, "n48::raw_write_error_text(err)"));
++		CHECK(has(rt, "char text[n48::kReportFileWriteCap];"));
++		CHECK(has(rt, "for (size_t i = n; i < sizeof text; i++) text[i] = ' ';"));
+ 		CHECK(has(rt, "in.fireHeadline = (const char *)__atomic_load_n(&gFireHeadline"));
+ 		CHECK(has(rt, "vn_rdwr(kUIO_WRITE, vp, (char *)text"));
+ 		CHECK(has(rt, "vn_rdwr(kUIO_WRITE, vp, (char *)text, (int)len, 0, kUIO_SYSSPACE, 0,"));
+@@ -212,11 +220,14 @@ int main(int argc, char **argv) {
+ 		CHECK(has(rt, "in.deviceId = injected_id(prov, \"device-id\")"));
+ 		CHECK(has(rt, "mask |= (1ull << s)"));
+ 
+-		// Started on every requested boot - the pair boot never arms the watcher.
++		// Started on every requested boot - the pair boot never arms the watcher - and handed a
++		// real registry service so the raw channel can open the stick as that client.
+ 		CHECK(has(bringup, "#include \"accel_report_file.h\""));
+-		CHECK(has(bringup, "if (ff.argRequested) n48::takeover_start_writer(head);"));
++		CHECK(has(bringup, "if (ff.argRequested) n48::takeover_start_writer(head, this);"));
++		CHECK(has(rt, "void takeover_start_writer(const char *fireHeadline, ::IOService *client) {"));
++		CHECK(has(rt, "__atomic_store_n(&gWriterClient, (uintptr_t)client, __ATOMIC_RELEASE);"));
+ 		const size_t headAt = bringup.find("const char *head = n48::accel_report_headline(");
+-		const size_t writerAt = bringup.find("n48::takeover_start_writer(head)");
++		const size_t writerAt = bringup.find("n48::takeover_start_writer(head, this)");
+ 		const size_t armAt = bringup.find("n48::accel_takeover_armed(ff.argRequested");
+ 		CHECK(headAt != std::string::npos && writerAt != std::string::npos && armAt != std::string::npos);
+ 		CHECK(headAt < writerAt && writerAt < armAt);
+@@ -227,9 +238,13 @@ int main(int argc, char **argv) {
+ 		CHECK(!has(hdr, "IOSleep"));
+ 		CHECK(!has(hdr, "TAKELOG"));
+ 		CHECK(!has(hdr, "kernel_thread_start"));
+-		CHECK(has(hdr, "\"/Volumes/OPENCORE/navi48-report.txt\""));
++		CHECK(has(hdr, "\"/Volumes/OPENCORE/NAVI48.TXT\""));
++		CHECK(has(hdr, "kReportFileWriteCap = 1536"));
+ 		CHECK(has(hdr, "kReportFileRetrySeconds = 120"));
+ 		CHECK(has(hdr, "kReportFileSettleSeconds = 2"));
++		// The raw channel opens this file as the registry service that asked for the report.
++		CHECK(has(hdr, "void takeover_start_writer(const char *fireHeadline, ::IOService *client);"));
++		CHECK(has(hdr, "class IOService;"));
+ 	}
+ 
+ 	if (gFailures == 0) printf("OK: %d checks, 0 failures\n", gChecks);
+diff --git a/src/navi48-bringup/tests/accel_report_raw_plant.sh b/src/navi48-bringup/tests/accel_report_raw_plant.sh
+new file mode 100644
+index 0000000..24d43a3
+--- /dev/null
++++ b/src/navi48-bringup/tests/accel_report_raw_plant.sh
+@@ -0,0 +1,167 @@
++#!/usr/bin/env bash
++#
++#  accel_report_raw_plant.sh — prove the 0028 suite can actually fail.
++#
++#  Usage (from anywhere):  ZIG=/path/to/zig.exe bash tests/accel_report_raw_plant.sh
++#
++#  One break at a time, planted into a COPY of the real sources, and the suite must catch it.
++#  The raw channel writes into a FAT32 volume with no filesystem above it, so a wrong parser
++#  decision is a corruption, not a misprinted line: every gate that keeps the write inside
++#  NAVI48.TXT is planted here, and the suite is what makes that recoverable.
++#
++#  Rules (same as the other *_plant.sh here):
++#    * needles are SINGLE-LINE, because the checkout is CRLF and a multi-line needle never
++#      matches;
++#    * every needle must be found, or the run aborts - a drifted needle silently becomes
++#      "no plant applied", which reads exactly like a passing suite;
++#    * the pristine checksum is taken up front and re-checked at the end;
++#    * `control` runs the untouched copy first.
++#
++set -u
++
++ZIG="${ZIG:?set ZIG to the zig (or zig c++) driver to use}"
++HERE="$(cd "$(dirname "$0")" && pwd)"
++ROOT="$(cd "$HERE/.." && pwd)"
++SCR="$(mktemp -d)"
++mkdir -p "$SCR" || { echo "cannot make $SCR"; exit 2; }
++trap 'rm -rf "$SCR"' EXIT
++
++cp -R "$ROOT/src" "$SCR/src" || { echo "copy of src failed"; exit 2; }
++cp -R "$ROOT/tests/dalshim" "$SCR/dalshim" 2>/dev/null
++
++PRISTINE=$(find "$SCR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) \
++    | sort | xargs cat | cksum | awk '{print $1}')
++
++build_run() {
++	"$ZIG" c++ -std=c++17 -O1 -I "$SCR/dalshim" -I "$SCR/src" \
++		"$HERE/accel_report_raw_test.cpp" -o "$SCR/t" >"$SCR/build.log" 2>&1 || {
++		echo "    BUILD FAILED"; sed -n '1,6p' "$SCR/build.log"; return 2; }
++	"$SCR/t" "$SCR" >"$SCR/run.log" 2>&1
++	return $?
++}
++
++count_matches() { # file needle -> echoes the number of occurrences
++	N="$2" perl -0777 -ne 'my $c = () = $_ =~ /\Q$ENV{N}\E/g; print $c' "$1"
++}
++
++plant() {
++	local file="$1" needle="$2" repl="$3" occ="${4:-1}"
++	local path="$SCR/$file"
++	cp "$ROOT/$file" "$path"                       # always plant from pristine
++	local found
++	found=$(count_matches "$path" "$needle")
++	if [ "${found:-0}" -lt "$occ" ]; then
++		echo "    NEEDLE MISSING (occ $occ of $found): $needle"
++		return 9
++	fi
++	N="$needle" R="$repl" O="$occ" perl -0777 -i -pe '
++		my $n = $ENV{N}; my $r = $ENV{R}; my $want = $ENV{O}; my $i = 0;
++		s/\Q$n\E/$i++; ($i == $want) ? $r : $n/ge;
++	' "$path"
++	local after afterRepl
++	after=$(count_matches "$path" "$needle")
++	afterRepl=$(count_matches "$path" "$repl")
++	if [ "$after" -ge "$occ" ] && [ "${afterRepl:-0}" -eq 0 ]; then
++		echo "    PLANT DID NOT LAND"
++		return 9
++	fi
++	return 0
++}
++
++restore_all() { rm -rf "$SCR/src"; cp -R "$ROOT/src" "$SCR/src"; }
++
++H=src/accel_report_raw.h
++R=src/accel_report_raw.cpp
++T=src/accel_takeover.cpp
++X=src/Navi48Bringup.cpp
++
++declare -a FAIL MISS
++PASSN=0 FAILN=0 MISSN=0
++run_plant() { # LABEL FILE NEEDLE REPL [OCC]
++	local label="$1"; shift
++	printf '  %-58s' "$label"
++	if ! plant "$@"; then echo "PLANT-ERROR"; MISS+=("$label"); MISSN=$((MISSN + 1)); restore_all; return; fi
++	build_run
++	local rc=$?
++	if [ "$rc" -eq 0 ]; then echo "ESCAPED (suite still passed)"; FAIL+=("$label"); FAILN=$((FAILN + 1));
++	else echo "caught (rc=$rc)"; PASS+=("$label"); PASSN=$((PASSN + 1)); fi
++	restore_all
++}
++
++echo "== control: the untouched copy =="
++if build_run; then echo "  control PASSED - plants below are meaningful"
++else echo "  control FAILED - the copy/build step is broken, stopping"; exit 1; fi
++
++echo "== plants: what counts as a FAT32 volume =="
++run_plant "bpb: the boot signature is not checked"   "$H" 'if (!s || len < 512 || s[510] != 0x55 || s[511] != 0xAA) return g;' 'if (!s || len < 512) return g;'
++run_plant "bpb: a 16-bit FAT passes as FAT32"        "$H" 'if (fat16 != 0 || rootEntries != 0 || g.fatSizeSectors == 0) return g;' 'if (rootEntries != 0 || g.fatSizeSectors == 0) return g;'
++run_plant "bpb: the FAT32 string is not checked"     "$H" "if (s[0x52] != 'F' || s[0x53] != 'A' || s[0x54] != 'T' || s[0x55] != '3' || s[0x56] != '2')" 'if (0)'
++run_plant "bpb: a non-power-of-two sector passes"    "$H" '(g.bytesPerSector & (g.bytesPerSector - 1)) != 0)' '(g.bytesPerSector & (g.bytesPerSector - 1)) == 0xFFFF)'
++run_plant "bpb: a non-power-of-two cluster passes"   "$H" '(g.sectorsPerCluster & (g.sectorsPerCluster - 1)) != 0)' '(g.sectorsPerCluster & (g.sectorsPerCluster - 1)) == 0xFFFF)'
++run_plant "bpb: zero reserved sectors pass"          "$H" 'if (g.reservedSectors == 0 || g.fatCount == 0 || g.fatCount > 4) return g;' 'if (g.fatCount == 0 || g.fatCount > 4) return g;'
++run_plant "bpb: the partition may exceed the media"  "$H" 'if (mediaBytes != 0 && totalBytes > mediaBytes) return g;' ';'
++run_plant "label: case is significant"               "$H" "if (a >= 'a' && a <= 'z') a = (uint8_t)(a - 32);" ';'
++run_plant "label: only eight bytes are compared"     "$H" 'for (int i = 0; i < 11; i++) {' 'for (int i = 0; i < 8; i++) {'
++
++echo "== plants: what counts as the file's directory entry =="
++# An LFN fragment (attr 0x0F) and a deleted entry (first byte 0xE5) are both already skipped by
++# the volume/directory test and by the name comparison, so removing those two checks is a no-op
++# by construction - no plant for them here. The checks that change behaviour are below.
++run_plant "dir: directories are files"               "$H" 'if (attr & 0x18) continue;' ';'
++run_plant "dir: the terminator is ignored"           "$H" 'if (e[0] == 0x00) {' 'if (e[0] == 0x01) {'
++run_plant "dir: the high cluster word is dropped"    "$H" 'hit.firstCluster = (uint32_t)raw_rd16(e + 0x1A) | ((uint32_t)raw_rd16(e + 0x14) << 16);' 'hit.firstCluster = (uint32_t)raw_rd16(e + 0x1A);'
++run_plant "dir: the size is read from the wrong field" "$H" 'hit.fileSize = raw_rd32(e + 0x1C);' 'hit.fileSize = raw_rd32(e + 0x10);'
++
++echo "== plants: the write-safety predicate =="
++run_plant "target: a short file is accepted"         "$H" 'if (fileSize < writeLen || g.clusterBytes < writeLen) return false;' 'if (g.clusterBytes < writeLen) return false;'
++run_plant "target: a zero-length write is allowed"   "$H" 'if (!g.valid || firstCluster < 2 || writeLen == 0) return false;' 'if (!g.valid || firstCluster < 2) return false;'
++run_plant "target: unparsed geometry is accepted"    "$H" 'if (!g.valid || firstCluster < 2 || writeLen == 0) return false;' 'if (firstCluster < 2 || writeLen == 0) return false;'
++run_plant "target: a write may leave the media"      "$H" 'if (off + writeLen > g.mediaBytes) return false;' ';'
++run_plant "chain: the FAT mask keeps all 32 bits"    "$H" 'inline uint32_t fat32_chain_value(uint32_t entry) { return entry & 0x0FFFFFFFu; }' 'inline uint32_t fat32_chain_value(uint32_t entry) { return entry; }'
++run_plant "chain: 0x0FFFFFF7 is a next cluster"      "$H" 'inline bool fat32_chain_ok(uint32_t c) { return c >= 2 && c < 0x0FFFFFF7u; }' 'inline bool fat32_chain_ok(uint32_t c) { return c >= 2 && c < 0x0FFFFFF8u; }'
++run_plant "chain: 0x0FFFFFF8 is not the end"         "$H" 'inline bool fat32_chain_done(uint32_t c) { return c >= 0x0FFFFFF8u; }' 'inline bool fat32_chain_done(uint32_t c) { return c >= 0x0FFFFFFFu; }'
++run_plant "header: the 8.3 name is misspelled"       "$H" "constexpr char kRawReportName[11] = { 'N', 'A', 'V', 'I', '4', '8', ' ', ' ', 'T', 'X', 'T' };" "constexpr char kRawReportName[11] = { 'N', 'A', 'V', 'I', '4', '8', ' ', ' ', 'T', 'X', 'Y' };"
++run_plant "header: the magic stops being navi"       "$H" "constexpr uint8_t kRawReportMagic[4] = { 'n', 'a', 'v', 'i' };" "constexpr uint8_t kRawReportMagic[4] = { 'n', 'a', 'v', 'j' };"
++
++echo "== plants: the block-device runtime =="
++run_plant "runtime: the size class is ignored"       "$R" 'if (size < n48::kRawReportMinMediaBytes || size > n48::kRawReportMaxMediaBytes) return false;' ';'
++run_plant "runtime: the reader-writer open is gone"  "$R" 'if (!media->open(client, 0, kIOStorageAccessReaderWriter)) return n48::kRawIoError;' ';'
++run_plant "runtime: sector 0 is read elsewhere"      "$R" 'read_at(media, client, 0, boot, sizeof boot)' 'read_at(media, client, 512, boot, sizeof boot)'
++run_plant "runtime: the label is not checked"        "$R" 'ok = g.valid && n48::fat32_label_matches(boot, sizeof boot, n48::kRawReportLabel);' 'ok = g.valid;'
++run_plant "runtime: the directory walk is unbounded" "$R" 'for (uint32_t hops = 0; hops < n48::kRawReportMaxChainClusters; hops++)' 'for (uint32_t hops = 0; hops < 1000000; hops++)'
++run_plant "runtime: a bad chain value is followed"   "$R" 'if (!n48::fat32_chain_ok(next)) return n48::kRawOk;' 'if (next == 0) return n48::kRawOk;'
++run_plant "runtime: the scan uses another name"      "$R" 'n48::fat32_scan_dir(p, (size_t)g.clusterBytes, n48::kRawReportName)' 'n48::fat32_scan_dir(p, (size_t)g.clusterBytes, "NAVI48  TXT")'
++run_plant "runtime: the file magic is not required"  "$R" 'if (head[i] != n48::kRawReportMagic[i]) return n48::kRawBadMagic;' ';'
++run_plant "runtime: the write length is not rounded" "$R" '((uint64_t)len + g.bytesPerSector - 1) / g.bytesPerSector * g.bytesPerSector;' '(uint64_t)len;'
++run_plant "runtime: the pad is NULs"                 "$R" "memset(p + len, ' ', (size_t)(aligned - len));" 'memset(p + len, 0, (size_t)(aligned - len));'
++run_plant "runtime: the write lands at the partition" "$R" 'media->write(client, fileOff, out, nullptr, &actual)' 'media->write(client, 0, out, nullptr, &actual)'
++run_plant "runtime: a short write is success"        "$R" 'if (kr == kIOReturnSuccess && actual == aligned) {' 'if (kr == kIOReturnSuccess) {'
++run_plant "runtime: the iterator is leaked"          "$R" 'it->release();' ';'
++run_plant "runtime: the match dictionary is leaked"  "$R" 'match->release();' ';'
++run_plant "runtime: the scan stops at a failure"     "$R" 'if (result == kRawOk) break;' 'return result;'
++
++echo "== plants: the writer thread uses it as the fallback =="
++run_plant "writer: the block device is never tried"  "$T" 'err = n48::report_raw_write(client, text, sizeof text);' 'err = -1;'
++run_plant "writer: the vfs is skipped"               "$T" 'const int vfsErr = write_report_file(text, sizeof text);' 'const int vfsErr = -1;'
++run_plant "writer: the client is dropped"            "$T" '__atomic_store_n(&gWriterClient, (uintptr_t)client, __ATOMIC_RELEASE);' ';'
++run_plant "writer: the stale tail is kept"           "$T" "for (size_t i = n; i < sizeof text; i++) text[i] = ' ';" ';'
++run_plant "writer: the raw channel gets a short len" "$T" 'n48::report_raw_write(client, text, sizeof text)' 'n48::report_raw_write(client, text, n)'
++
++echo "== plants: the xsrc wiring =="
++run_plant "xsrc: no client is passed"                "$X" 'if (ff.argRequested) n48::takeover_start_writer(head, this);' 'if (ff.argRequested) n48::takeover_start_writer(head, nullptr);'
++run_plant "xsrc: the writer is never started"        "$X" 'if (ff.argRequested) n48::takeover_start_writer(head, this);' ';'
++
++echo "== summary =="
++echo "caught:   $PASSN"
++echo "escaped:  $FAILN  ${FAIL[*]:-}"
++echo "plant-errors: $MISSN  ${MISS[*]:-}"
++
++AFTER=$(find "$SCR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) \
++    | sort | xargs cat | cksum | awk '{print $1}')
++if [ "$AFTER" != "$PRISTINE" ]; then
++	echo "PRISTINE CHECKSUM CHANGED - the copy is polluted; investigate before trusting any result"
++	exit 3
++fi
++echo "pristine tree unchanged after the run (checksum $PRISTINE)"
++
++[ "$FAILN" -eq 0 ] && [ "$MISSN" -eq 0 ]
+diff --git a/src/navi48-bringup/tests/accel_report_raw_test.cpp b/src/navi48-bringup/tests/accel_report_raw_test.cpp
+new file mode 100644
+index 0000000..ccb9330
+--- /dev/null
++++ b/src/navi48-bringup/tests/accel_report_raw_test.cpp
+@@ -0,0 +1,462 @@
++//  accel_report_raw_test.cpp — host suite for the mount-independent channel (patch 0028).
++//
++//  Build (any machine, no Mac, no disk):
++//    zig c++ -std=c++17 -Wall -Wextra -O1 -I tests/dalshim -I src \
++//        tests/accel_report_raw_test.cpp -o /tmp/accel_report_raw_test.exe
++//    /tmp/accel_report_raw_test.exe .
++//
++//  argv[1] is the navi48-bringup root, used by the source-pin sections.
++//
++//  Why this suite exists: a raw write that picks the wrong media, the wrong cluster or the wrong
++//  file corrupts a volume instead of reporting. The parser decides all three, so every acceptance
++//  and every refusal here is fed synthetic sectors - an MBR, a FAT16 BPB, an LFN entry, a deleted
++//  entry, a directory that happens to share the name - and the runtime's write-safety predicate is
++//  checked against its boundaries. No field is trusted because it "looked plausible".
++
++#include "accel_report_raw.h"
++#include "accel_report_file.h"
++
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <sstream>
++#include <string>
++
++namespace {
++
++int gChecks = 0, gFailures = 0;
++void report(const char *file, int line, const char *what, bool ok) {
++	gChecks++;
++	if (ok) return;
++	gFailures++;
++	printf("FAIL %s:%d: %s\n", file, line, what);
++}
++#define CHECK(cond) report(__FILE__, __LINE__, #cond, (cond))
++
++std::string slurp(const std::string &path) {
++	std::ifstream in(path, std::ios::binary);
++	if (!in) return "";
++	std::ostringstream ss;
++	ss << in.rdbuf();
++	return ss.str();
++}
++
++bool has(const std::string &hay, const char *needle) {
++	return hay.find(needle) != std::string::npos;
++}
++
++void wr16(uint8_t *p, uint16_t v) {
++	p[0] = (uint8_t)(v & 0xFF);
++	p[1] = (uint8_t)(v >> 8);
++}
++void wr32(uint8_t *p, uint32_t v) {
++	p[0] = (uint8_t)(v & 0xFF);
++	p[1] = (uint8_t)((v >> 8) & 0xFF);
++	p[2] = (uint8_t)((v >> 16) & 0xFF);
++	p[3] = (uint8_t)((v >> 24) & 0xFF);
++}
++void put(uint8_t *p, int off, const char *s, size_t n) { memcpy(p + off, s, n); }
++
++// The real stick's shape: 512-byte sectors, 8 KiB clusters, FAT32 with two FATs, label OPENCORE.
++constexpr uint32_t kBps = 512;
++constexpr uint32_t kSpc = 16;
++constexpr uint32_t kReserved = 32;
++constexpr uint32_t kFatSize = 16384;
++constexpr uint32_t kTotalSectors = 500000;  // 256 MB at 512 B: also exercises tiny-media bounds
++constexpr uint64_t kMediaBytes = (uint64_t)kTotalSectors * kBps;
++constexpr uint64_t kDataStart = (uint64_t)(kReserved + 2 * kFatSize) * kBps;  // 16793600
++
++void make_bpb(uint8_t *s) {
++	memset(s, 0, 512);
++	s[0] = 0xEB;
++	s[1] = 0x58;
++	s[2] = 0x90;
++	put(s, 3, "MSWIN4.1", 8);
++	wr16(s + 0x0B, (uint16_t)kBps);
++	s[0x0D] = (uint8_t)kSpc;
++	wr16(s + 0x0E, (uint16_t)kReserved);
++	s[0x10] = 2;      // FATs
++	wr16(s + 0x11, 0);  // root entries: 0 in FAT32
++	wr16(s + 0x13, 0);  // 16-bit total: 0
++	s[0x15] = 0xF8;     // media descriptor
++	wr16(s + 0x16, 0);  // 16-bit FAT size: 0 in FAT32
++	wr32(s + 0x20, kTotalSectors);
++	wr32(s + 0x24, kFatSize);
++	wr32(s + 0x2C, 2);  // root cluster
++	wr16(s + 0x30, 1);  // FSInfo sector
++	wr16(s + 0x32, 6);  // backup boot sector
++	put(s, 0x47, n48::kRawReportLabel, 11);
++	put(s, 0x52, "FAT32   ", 8);
++	s[510] = 0x55;
++	s[511] = 0xAA;
++}
++
++void make_entry(uint8_t *e, const char *name11, uint8_t attr, uint32_t cluster, uint32_t size) {
++	memset(e, 0, 32);
++	memcpy(e, name11, 11);
++	e[0x0B] = attr;
++	wr16(e + 0x14, (uint16_t)(cluster >> 16));
++	wr16(e + 0x1A, (uint16_t)(cluster & 0xFFFF));
++	wr32(e + 0x1C, size);
++}
++
++} // namespace
++
++int main(int argc, char **argv) {
++	const std::string root = argc > 1 ? std::string(argv[1]) : std::string(".");
++
++	// ---------------------------------------------------------------- A: the BPB
++	{
++		uint8_t s[512];
++		make_bpb(s);
++		const n48::Fat32Geometry g = n48::fat32_parse_bpb(s, sizeof s, kMediaBytes);
++		CHECK(g.valid);
++		CHECK(g.bytesPerSector == kBps);
++		CHECK(g.sectorsPerCluster == kSpc);
++		CHECK(g.clusterBytes == 8192);
++		CHECK(g.fatStart == 16384);
++		CHECK(g.dataStart == kDataStart);
++		CHECK(g.rootCluster == 2);
++		CHECK(n48::fat32_cluster_offset(g, 2) == kDataStart);
++		CHECK(n48::fat32_cluster_offset(g, 5) == kDataStart + 3 * 8192);
++		CHECK(g.mediaBytes == kMediaBytes);
++		CHECK(n48::fat32_cluster_in_fat(g, 5));
++		CHECK(n48::fat32_cluster_in_fat(g, (uint32_t)((uint64_t)kFatSize * kBps / 4 - 1)));
++		CHECK(!n48::fat32_cluster_in_fat(g, (uint32_t)((uint64_t)kFatSize * kBps / 4)));
++	}
++	{
++		// Every one of these is a plausible-looking sector the parser must refuse.
++		uint8_t s[512];
++		n48::Fat32Geometry g;
++
++		make_bpb(s);
++		s[510] = 0;
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);  // no 55AA
++
++		make_bpb(s);
++		put(s, 0x52, "FAT16   ", 8);
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);  // FAT16 text
++
++		make_bpb(s);
++		memset(s, 0, 512);  // an MBR: no BPB fields at all
++		s[510] = 0x55;
++		s[511] = 0xAA;
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);
++
++		make_bpb(s);
++		wr16(s + 0x0B, 1000);
++		wr32(s + 0x20, 200000);  // keeps the media bound out of the answer: only the PO2 rule may refuse
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);  // bps not a power of two
++
++		make_bpb(s);
++		wr16(s + 0x0B, 256);
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);  // bps below 512
++
++		make_bpb(s);
++		wr16(s + 0x0B, 8192);
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);  // bps above 4096
++
++		make_bpb(s);
++		s[0x0D] = 0;
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);  // no clusters
++
++		make_bpb(s);
++		s[0x0D] = 3;
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);  // spc not a power of two
++
++		make_bpb(s);
++		s[0x0D] = 128;
++		CHECK(n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);   // the largest legal spc
++		s[0x0D] = 0x80 | 0x01;
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);  // 129, still not a power of two
++
++		make_bpb(s);
++		wr16(s + 0x16, 512);  // a 16-bit FAT size means FAT12/16
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);
++
++		make_bpb(s);
++		wr16(s + 0x11, 512);  // fixed root directory means FAT12/16
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);
++
++		make_bpb(s);
++		wr32(s + 0x24, 0);
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);  // no FAT
++
++		make_bpb(s);
++		s[0x10] = 0;
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);  // no FAT copies
++
++		make_bpb(s);
++		s[0x10] = 5;
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);  // too many FATs
++
++		make_bpb(s);
++		wr16(s + 0x0E, 0);
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);  // no reserved sectors
++
++		make_bpb(s);
++		wr32(s + 0x2C, 1);
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);  // cluster 1 is not data
++
++		make_bpb(s);
++		wr32(s + 0x20, 0);
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);  // no sectors at all
++
++		make_bpb(s);
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes - 1).valid);  // partition exceeds media
++
++		make_bpb(s);
++		CHECK(!n48::fat32_parse_bpb(s, 511, kMediaBytes).valid);  // short sector
++
++		make_bpb(s);
++		g = n48::fat32_parse_bpb(s, sizeof s, 0);  // 0 = media size unknown: skip that bound
++		CHECK(g.valid);
++
++		make_bpb(s);
++		wr32(s + 0x2C, 2097152);  // the first cluster the FAT here cannot describe
++		CHECK(!n48::fat32_parse_bpb(s, sizeof s, kMediaBytes).valid);
++	}
++	{
++		uint8_t s[512];
++		make_bpb(s);
++		CHECK(n48::fat32_label_matches(s, sizeof s, n48::kRawReportLabel));
++		put(s, 0x47, "opencore   ", 11);
++		CHECK(n48::fat32_label_matches(s, sizeof s, n48::kRawReportLabel));  // case-insensitive
++		put(s, 0x47, "OPENCOREX  ", 11);
++		CHECK(!n48::fat32_label_matches(s, sizeof s, n48::kRawReportLabel));
++		put(s, 0x47, "OPENCORE   ", 11);
++		CHECK(!n48::fat32_label_matches(s, 0x51, n48::kRawReportLabel));  // not even the label fits
++	}
++
++	// ---------------------------------------------------------------- B: the directory
++	{
++		uint8_t dir[8192];
++		memset(dir, 0xE5, sizeof dir);  // "free" entries that cannot match
++		memset(dir, 0, 32 * 8);          // then a run of terminators past entry 7
++		uint8_t *e = dir;
++		make_entry(e, n48::kRawReportName, 0x0F, 11, 8192);       // a long-name fragment
++		make_entry(e + 32, n48::kRawReportName, 0x20, 9, 8192);   // deleted
++		(e + 32)[0] = 0xE5;
++		make_entry(e + 64, n48::kRawReportLabel, 0x08, 0, 0);     // volume id
++		make_entry(e + 96, n48::kRawReportName, 0x10, 7, 0);      // a DIRECTORY with the same name
++		make_entry(e + 128, "NOTES   TXT", 0x20, 8, 100);         // another file
++		make_entry(e + 160, n48::kRawReportName, 0x20, 5, 8192);  // the file
++
++		const n48::Fat32DirHit h = n48::fat32_scan_dir(dir, sizeof dir, n48::kRawReportName);
++		CHECK(h.found);
++		CHECK(h.firstCluster == 5);
++		CHECK(h.fileSize == 8192);
++		CHECK(h.entryOffset == 160);
++		CHECK(!h.end);
++	}
++	{
++		uint8_t dir[8192];
++		memset(dir, 0, sizeof dir);  // first entry 0x00: nothing after it can exist
++		make_entry(dir + 32, n48::kRawReportName, 0x20, 5, 8192);
++		const n48::Fat32DirHit h = n48::fat32_scan_dir(dir, sizeof dir, n48::kRawReportName);
++		CHECK(!h.found);
++		CHECK(h.end);
++	}
++	{
++		uint8_t dir[8192];
++		memset(dir, 0xE5, sizeof dir);  // no match and no terminator in this cluster
++		const n48::Fat32DirHit h = n48::fat32_scan_dir(dir, sizeof dir, n48::kRawReportName);
++		CHECK(!h.found);
++		CHECK(!h.end);
++	}
++	{
++		uint8_t dir[8192];
++		memset(dir, 0, sizeof dir);
++		make_entry(dir, n48::kRawReportName, 0x20, 0x20003, 4096);  // high word of the cluster
++		const n48::Fat32DirHit h = n48::fat32_scan_dir(dir, sizeof dir, n48::kRawReportName);
++		CHECK(h.found);
++		CHECK(h.firstCluster == 0x20003);
++		CHECK(h.fileSize == 4096);
++	}
++	{
++		uint8_t dir[8192];
++		memset(dir, 0xE5, sizeof dir);
++		make_entry(dir, n48::kRawReportName, 0x20, 5, 8192);
++		const n48::Fat32DirHit whole = n48::fat32_scan_dir(dir, 32, n48::kRawReportName);
++		CHECK(whole.found);
++		const n48::Fat32DirHit none = n48::fat32_scan_dir(dir, 31, n48::kRawReportName);
++		CHECK(!none.found);  // a partial entry is not an entry
++	}
++	{
++		// 0x28 is "volume id + archive": still metadata, never the file.
++		uint8_t dir[8192];
++		memset(dir, 0xE5, sizeof dir);
++		make_entry(dir, n48::kRawReportName, 0x28, 5, 8192);
++		CHECK(!n48::fat32_scan_dir(dir, sizeof dir, n48::kRawReportName).found);
++	}
++	{
++		// The names themselves: the 8.3 form has no dot and no long-name entry.
++		CHECK(sizeof n48::kRawReportName == 11);
++		CHECK(memcmp(n48::kRawReportName, "NAVI48  TXT", 11) == 0);
++		CHECK(memcmp(n48::kRawReportLabel, "OPENCORE   ", 11) == 0);
++		CHECK(memcmp(n48::kRawReportMagic, "navi", 4) == 0);
++		// The text builder's first line is the magic, so a report written by an earlier boot
++		// keeps the file valid for the next one.
++		n48::ReportFileInputs in = {};
++		in.fireHeadline = "x";
++		char buf[2048];
++		n48::report_file_text(buf, sizeof buf, in);
++		CHECK(memcmp(buf, n48::kRawReportMagic, 4) == 0);
++	}
++
++	// ---------------------------------------------------------------- C: the write target
++	{
++		uint8_t s[512];
++		make_bpb(s);
++		const n48::Fat32Geometry g = n48::fat32_parse_bpb(s, sizeof s, kMediaBytes);
++		const uint32_t len = n48::kReportFileWriteCap;
++		uint64_t off = 0;
++		CHECK(n48::fat32_file_target(g, 5, 8192, len, &off));
++		CHECK(off == kDataStart + 3 * 8192);
++		CHECK(n48::fat32_file_target(g, 5, 8192, len, nullptr));  // out-pointer is optional
++	}
++	{
++		uint8_t s[512];
++		make_bpb(s);
++		n48::Fat32Geometry g = n48::fat32_parse_bpb(s, sizeof s, kMediaBytes);
++		const uint32_t len = n48::kReportFileWriteCap;
++		uint64_t off = 0;
++		CHECK(!n48::fat32_file_target(g, 5, len - 1, len, &off));       // file too small
++		CHECK(!n48::fat32_file_target(g, 5, 8192, 0, &off));            // nothing to write
++		CHECK(!n48::fat32_file_target(g, 0, 8192, len, &off));          // cluster 0
++		CHECK(!n48::fat32_file_target(g, 1, 8192, len, &off));          // cluster 1
++		// A cluster the FAT cannot describe is refused even when the media is big enough that the
++		// byte offset alone would look fine.
++		g.mediaBytes = (uint64_t)1 << 40;
++		CHECK(!n48::fat32_file_target(g, (uint32_t)((uint64_t)kFatSize * kBps / 4), 8192, len, &off));
++		g.mediaBytes = kMediaBytes;
++		g.valid = false;
++		CHECK(!n48::fat32_file_target(g, 5, 8192, len, &off));          // unparsed geometry
++		g.valid = true;
++		g.clusterBytes = 512;
++		CHECK(!n48::fat32_file_target(g, 5, 8192, len, &off));          // cluster smaller than the write
++		g.clusterBytes = 8192;
++		g.mediaBytes = n48::fat32_cluster_offset(g, 5) + len - 1;
++		CHECK(!n48::fat32_file_target(g, 5, 8192, len, &off));          // the write would leave the media
++		g.mediaBytes = n48::fat32_cluster_offset(g, 5) + len;
++		CHECK(n48::fat32_file_target(g, 5, 8192, len, &off));           // ends exactly at the edge
++	}
++	{
++		// A 4 KiB-sector stick rounds the fixed write up to 4 KiB, never past the file.
++		uint8_t s[512];
++		make_bpb(s);
++		wr16(s + 0x0B, 4096);
++		s[0x0D] = 2;                    // 8 KiB clusters again
++		wr32(s + 0x20, 62500);          // 62500 * 4096 = the same media size
++		const n48::Fat32Geometry g = n48::fat32_parse_bpb(s, sizeof s, kMediaBytes);
++		CHECK(g.valid);
++		CHECK(g.clusterBytes == 8192);
++		CHECK(n48::fat32_file_target(g, 5, 8192, n48::kReportFileWriteCap, nullptr));
++		CHECK(n48::fat32_file_target(g, 5, 4096, 4096, nullptr));
++	}
++	{
++		n48::Fat32Geometry g = {};
++		CHECK(!n48::fat32_file_target(g, 5, 8192, 1536, nullptr));
++		CHECK(n48::fat32_chain_value(0xFFFFFFFFu) == 0x0FFFFFFFu);
++		CHECK(n48::fat32_chain_done(0x0FFFFFF8u));
++		CHECK(!n48::fat32_chain_done(0x0FFFFFF7u));
++		CHECK(n48::fat32_chain_ok(2));
++		CHECK(!n48::fat32_chain_ok(1));
++		CHECK(!n48::fat32_chain_ok(0x0FFFFFF7u));
++	}
++
++	// ---------------------------------------------------------------- D: error codes
++	{
++		const char *codes[] = { n48::raw_write_error_text(n48::kRawNoStick),
++			                    n48::raw_write_error_text(n48::kRawNoFile),
++			                    n48::raw_write_error_text(n48::kRawBadMagic),
++			                    n48::raw_write_error_text(n48::kRawIoError) };
++		CHECK(strcmp(n48::raw_write_error_text(n48::kRawOk), "ok") == 0);
++		for (const char *c : codes) CHECK(c && *c && strcmp(c, "bad arguments") != 0);
++		CHECK(strcmp(n48::raw_write_error_text(n48::kRawBadArgs), "bad arguments") == 0);
++		CHECK(strcmp(n48::raw_write_error_text(999), "bad arguments") == 0);
++		CHECK(strcmp(codes[0], codes[1]) != 0 && strcmp(codes[1], codes[2]) != 0);
++	}
++
++	// ---------------------------------------------------------------- E: the runtime
++	{
++		const std::string rt = slurp(root + "/src/accel_report_raw.cpp");
++		const std::string hdr = slurp(root + "/src/accel_report_raw.h");
++		const std::string sh = slurp(root + "/src/accel_report_file.h");
++		const std::string tk = slurp(root + "/src/accel_takeover.cpp");
++		const std::string bringup = slurp(root + "/src/Navi48Bringup.cpp");
++		CHECK(!rt.empty());
++		CHECK(!hdr.empty());
++		CHECK(!sh.empty());
++		CHECK(!tk.empty());
++		CHECK(!bringup.empty());
++
++		// Header hygiene: the FAT32 logic is host-testable and IOKit-free.
++		CHECK(!has(hdr, "IOKit/"));
++		CHECK(!has(hdr, "IOSleep"));
++		CHECK(!has(hdr, "TAKELOG"));
++		CHECK(!has(hdr, "kernel_thread_start"));
++		CHECK(has(hdr, "#include \"accel_report_file.h\""));
++		CHECK(has(sh, "\"/Volumes/OPENCORE/NAVI48.TXT\""));
++		CHECK(has(sh, "kReportFileWriteCap = 1536"));
++
++		// The discovery: every IOMedia in the stick's size class, one probe per media.
++		CHECK(has(rt, "#include \"accel_report_raw.h\""));
++		CHECK(has(rt, "::IOService::serviceMatching(\"IOMedia\")"));
++		CHECK(has(rt, "::IOService::getMatchingServices(match)"));
++		CHECK(has(rt, "if (size < n48::kRawReportMinMediaBytes || size > n48::kRawReportMaxMediaBytes) return false;"));
++		CHECK(has(rt, "if (!stick_geometry(media, client, &g)) continue;"));
++		CHECK(has(rt, "IOMedia *media = OSDynamicCast(IOMedia, svc);"));
++		CHECK(has(rt, "match->release();"));
++		CHECK(has(rt, "it->release();"));
++		CHECK(has(rt, "if (result == kRawOk) break;"));
++
++		// The five gates, in order: reader open, BPB, label, file entry, magic.
++		CHECK(has(rt, "if (!media->open(client, 0, kIOStorageAccessReader)) return false;"));
++		CHECK(has(rt, "read_at(media, client, 0, boot, sizeof boot)"));
++		CHECK(has(rt, "n48::fat32_parse_bpb(boot, sizeof boot, size)"));
++		CHECK(has(rt, "n48::fat32_label_matches(boot, sizeof boot, n48::kRawReportLabel)"));
++		CHECK(has(rt, "n48::fat32_scan_dir(p, (size_t)g.clusterBytes, n48::kRawReportName)"));
++		CHECK(has(rt, "if (!n48::fat32_file_target(g, hit.firstCluster, hit.fileSize, (uint32_t)len, &fileOff))"));
++		CHECK(has(rt, "if (head[i] != n48::kRawReportMagic[i]) return n48::kRawBadMagic;"));
++
++		// The walk: bounded, only through valid chain values, and only within the partition.
++		CHECK(has(rt, "for (uint32_t hops = 0; hops < n48::kRawReportMaxChainClusters; hops++)"));
++		CHECK(has(rt, "if (!n48::fat32_cluster_in_fat(g, cluster)) return n48::kRawIoError;"));
++		CHECK(has(rt, "if (off + g.clusterBytes > g.mediaBytes) return n48::kRawIoError;"));
++		CHECK(has(rt, "if (!n48::fat32_chain_ok(next)) return n48::kRawOk;"));
++
++		// The write: reader-writer open, sector-aligned, spaces after the text, then closed.
++		CHECK(has(rt, "if (!media->open(client, 0, kIOStorageAccessReaderWriter)) return n48::kRawIoError;"));
++		CHECK(has(rt, "((uint64_t)len + g.bytesPerSector - 1) / g.bytesPerSector * g.bytesPerSector;"));
++		CHECK(has(rt, "if (aligned > hit.fileSize || aligned > g.clusterBytes) return n48::kRawNoFile;"));
++		CHECK(has(rt, "memcpy(p, text, len);"));
++		CHECK(has(rt, "memset(p + len, ' ', (size_t)(aligned - len));"));
++		CHECK(has(rt, "media->write(client, fileOff, out, nullptr, &actual)"));
++		CHECK(has(rt, "kr == kIOReturnSuccess && actual == aligned"));
++		CHECK(has(rt, "media->synchronize(client, fileOff, aligned)"));
++		CHECK(has(rt, "media->close(client, 0);"));
++		CHECK(has(rt, "return kRawBadArgs;"));
++
++		// The writer thread: VFS first, block device second, same bytes on both.
++		CHECK(has(tk, "#include \"accel_report_raw.h\""));
++		CHECK(has(tk, "const int vfsErr = write_report_file(text, sizeof text);"));
++		CHECK(has(tk, "err = n48::report_raw_write(client, text, sizeof text);"));
++		const size_t vfsAt = tk.find("write_report_file(text, sizeof text)");
++		const size_t rawAt = tk.find("report_raw_write(client, text, sizeof text)");
++		CHECK(vfsAt != std::string::npos && rawAt != std::string::npos && vfsAt < rawAt);
++		CHECK(has(tk, "const char *channel = \"the mounted volume\";"));
++		CHECK(has(tk, "channel = \"the block device (stick not mounted)\";"));
++		CHECK(has(tk, "report written to %s through %s"));
++		CHECK(has(tk, "for (size_t i = n; i < sizeof text; i++) text[i] = ' ';"));
++		// One client, stored before the thread can read it.
++		const size_t store = tk.find("__atomic_store_n(&gWriterClient, (uintptr_t)client");
++		const size_t start = tk.find("kernel_thread_start(&report_file_thread");
++		CHECK(store != std::string::npos && start != std::string::npos && store < start);
++		CHECK(has(bringup, "n48::takeover_start_writer(head, this);"));
++	}
++
++	if (gFailures == 0) printf("OK: %d checks, 0 failures\n", gChecks);
++	else                printf("%d checks, %d failures\n", gChecks, gFailures);
++	return gFailures == 0 ? 0 : 1;
++}
+-- 
+2.52.0.windows.1
+

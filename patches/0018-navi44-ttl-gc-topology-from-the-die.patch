@@ -1,0 +1,771 @@
+From 86be291bec6cc140d708120e33589bd715dbe144 Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Fri, 30 Oct 2026 14:06:15 -0700
+Subject: [PATCH] 0018: answer TTL slot 14 from the measured die, or decline
+
+TTL slot 14 (queryGcHardwareInfo) substituted Navi 48's 4x2x8 geometry for any
+GFXConfig field that arrived zero, so a boot that measured nothing told Apple the
+card had 64 CUs, and a die wider than the struct was truncated instead of refused.
+The CU harvest map was never read, so a harvested shader array reported as full.
+
+src/apple/ttl_gc_topo.h makes that decision pure - measured, or declined - and now
+uses active_cu_bitmap to emit per-array WGP words. Four refusals return
+kTtlUnsupported rather than a guess; the answer publishes as Navi48,TtlGcTopo plus
+,TtlGcSe / ,TtlGcShPerSe / ,TtlGcWgpPerSh / ,TtlGcCus so "what did we tell Apple"
+is an ioreg read, not a photograph of the log.
+
+tests/ttl_gc_topo_test.cpp: 127 checks, 0 failures. tests/ttl_gc_topo_plant.sh:
+35 plants, 0 escaped. Cross-built bundle: 79 objects, 7,247,308 B MH_KEXT_BUNDLE,
+no undefined symbols of our own.
+---
+ CHANGES.md                                    |  41 ++-
+ src/navi48-bringup/src/apple/Navi48Ttl.cpp    |  67 ++--
+ src/navi48-bringup/src/apple/ttl_gc_topo.h    | 142 ++++++++
+ src/navi48-bringup/tests/ttl_gc_topo_plant.sh | 156 ++++++++
+ src/navi48-bringup/tests/ttl_gc_topo_test.cpp | 337 ++++++++++++++++++
+ 4 files changed, 682 insertions(+), 21 deletion(-)
+ create mode 100644 src/navi48-bringup/src/apple/ttl_gc_topo.h
+ create mode 100644 src/navi48-bringup/tests/ttl_gc_topo_plant.sh
+ create mode 100644 src/navi48-bringup/tests/ttl_gc_topo_test.cpp
+
+diff --git a/src/navi48-bringup/src/apple/Navi48Ttl.cpp b/src/navi48-bringup/src/apple/Navi48Ttl.cpp
+index bdf1513..66d4ab0 100644
+--- a/src/navi48-bringup/src/apple/Navi48Ttl.cpp
++++ b/src/navi48-bringup/src/apple/Navi48Ttl.cpp
+@@ -15,6 +15,7 @@
+ #include "../ipdiscovery.hpp"
+ #include "AppleHardwareHook.hpp"
+ #include "Navi48AccelPeer.hpp"
++#include "ttl_gc_topo.h"   // 0018: slot 14 answers from the measured die, or declines
+ 
+ #define TTLLOG(fmt, ...) ::amdgpu::n48_logf("Navi48Ttl: " fmt "\n", ##__VA_ARGS__)
+ 
+@@ -337,26 +338,52 @@ uint32_t Navi48Ttl::queryGcHardwareInfo(GcHardwareInfo *raw) {
+     auto *o = reinterpret_cast<GcHardwareInfoLayout *>(raw);
+     const amdgpu::GFXConfig &g = mCtx->gfx;
+ 
+-    uint32_t se = g.max_shader_engines ? g.max_shader_engines : 4;
+-    uint32_t sa = g.max_sh_per_se      ? g.max_sh_per_se      : 2;
+-    if (se > 4) se = 4;                    // the struct holds exactly 4 rows
+-    if (sa > 2) sa = 2;                    // ...of 2 entries
+-    o->numShaderEngines     = se;
+-    o->numShaderArraysPerSE = sa;
+-    o->popcountedBitmap     = g.global_active_rb_bitmap;
+-
+-    // max_cu_per_sh counts CUs; the caller wants WGPs, which are CU pairs.
+-    uint32_t wgpPerSa = (g.max_cu_per_sh ? g.max_cu_per_sh : 8) / 2;
+-    if (wgpPerSa > 32) wgpPerSa = 32;
+-    const uint32_t fullMask = (wgpPerSa >= 32) ? 0xFFFFFFFFu : ((1u << wgpPerSa) - 1u);
+-    for (uint32_t i = 0; i < se; i++)
+-        for (uint32_t j = 0; j < sa; j++)
+-            o->wgpBitmap[i][j] = fullMask;
+-
+-    TTLLOG("[14] queryGcHardwareInfo -> SE=%u SA/SE=%u WGP/SA=%u mask=0x%08x rbBitmap=0x%08x "
+-           "(=%u CUs)", se, sa, wgpPerSa, fullMask, o->popcountedBitmap, se * sa * wgpPerSa * 2);
+-    if (!g.inited)
+-        TTLLOG("[14] WARNING: GFXConfig was never populated — these are fallback constants");
++    // 0018: measured, or declined. The literals 4 / 2 / 8 used to be the
++    // fallback for an unpopulated GFXConfig, and they are Navi 48's shape -
++    // 4 SE x 2 SA x 8 CU = 64 CUs - so the boot that could not measure anything
++    // described a card twice the size of the one in the slot. ttl_gc_topology()
++    // takes the harvest map instead and refuses when there is nothing to take.
++    n48::TtlGcTopoFacts tf;
++    tf.inited           = g.inited;
++    tf.maxShaderEngines = g.max_shader_engines;
++    tf.maxShPerSe       = g.max_sh_per_se;
++    tf.maxCuPerSh       = g.max_cu_per_sh;
++    tf.globalRbBitmap   = g.global_active_rb_bitmap;
++    for (uint32_t i = 0; i < n48::kTtlGcTopoStructRows; i++)
++        for (uint32_t j = 0; j < n48::kTtlGcTopoStructCols; j++)
++            tf.cuBitmap[i][j] = g.active_cu_bitmap[i][j];
++
++    n48::TtlGcTopoAnswer an;
++    const char *twhy = "";
++    const n48::TtlGcTopo tv = n48::ttl_gc_topology(tf, &an, &twhy);
++    if (mOwner) mOwner->setProperty("Navi48,TtlGcTopo", twhy);
++    if (tv != n48::TtlGcTopo::Answer) {
++        TTLLOG("[14] queryGcHardwareInfo -> DECLINED: %s "
++               "(inited %d, SE %u, SA/SE %u, CU/SH %u) - Apple's setupAndInitializeHWCapabilities "
++               "treats this as capabilities-invalid and stops here",
++               twhy, (int)g.inited, g.max_shader_engines, g.max_sh_per_se, g.max_cu_per_sh);
++        return kTtlUnsupported;
++    }
++
++    o->numShaderEngines     = an.shaderEngines;
++    o->numShaderArraysPerSE = an.shPerSe;
++    o->popcountedBitmap     = an.rbBitmap;
++    // Rows outside the die's SE x SA stay zero, which is what an absent array
++    // looks like to a popcount.
++    for (uint32_t i = 0; i < n48::kTtlGcTopoStructRows; i++)
++        for (uint32_t j = 0; j < n48::kTtlGcTopoStructCols; j++)
++            o->wgpBitmap[i][j] = an.wgpBitmap[i][j];
++
++    TTLLOG("[14] queryGcHardwareInfo -> SE=%u SA/SE=%u WGP/SA<=%u rbBitmap=0x%08x =%u CUs "
++           "from the harvest map (%u half-populated WGP pair(s); %s)",
++           an.shaderEngines, an.shPerSe, an.wgpsPerSh, an.rbBitmap, an.totalCus,
++           an.halfPopulatedWgps, twhy);
++    if (mOwner) {
++        mOwner->setProperty("Navi48,TtlGcSe", static_cast<uint64_t>(an.shaderEngines), 32);
++        mOwner->setProperty("Navi48,TtlGcShPerSe", static_cast<uint64_t>(an.shPerSe), 32);
++        mOwner->setProperty("Navi48,TtlGcWgpPerSh", static_cast<uint64_t>(an.wgpsPerSh), 32);
++        mOwner->setProperty("Navi48,TtlGcCus", static_cast<uint64_t>(an.totalCus), 32);
++    }
+     return kTtlOk;
+ }
+ 
+diff --git a/src/navi48-bringup/src/apple/ttl_gc_topo.h b/src/navi48-bringup/src/apple/ttl_gc_topo.h
+new file mode 100644
+index 0000000..375a563
+--- /dev/null
++++ b/src/navi48-bringup/src/apple/ttl_gc_topo.h
+@@ -0,0 +1,142 @@
++//
++//  ttl_gc_topo.h — 0018: what the TTL may tell Apple about this die's GC geometry.
++//
++//  TTL slot 14 (queryGcHardwareInfo) is the answer to "how many shader engines,
++//  shader arrays and compute units does this GPU have", and
++//  GFX10Hardware::setupAndInitializeHWCapabilities builds its CU mask, ring
++//  assignment and work-group limits out of it. Before this header the slot took
++//  whatever amdgpu::GFXConfig happened to hold and, when a field was zero,
++//  substituted 4 / 2 / 8 — which are Navi 48's numbers (4 SE x 2 SA x 8 CU =
++//  64 CUs). On a Navi 44 (GC 12.0.0, 2 SE x 2 SA x 4 WGP = 32 CUs) that is a card told it
++//  has twice the hardware it does, and the fallback was reached by the one
++//  state that matters: GFXConfig never populated, which the old code logged as
++//  a WARNING and then answered anyway with kTtlOk.
++//
++//  So the decision is pure and stated here: no measurement, no answer. A
++//  refusal costs a boot that says "the accelerator declined to initialise" in
++//  the log; a wrong answer costs a Metal client writing into a CU that is not
++//  there.
++//
++//  Struct facts this encodes (0x40 bytes, asserted in Navi48Ttl.cpp): exactly 4
++//  rows of 2 entries, so a die wider than 4 SE or 2 SA per SE cannot be
++//  described by it at all — truncating silently is the same class of bug as the
++//  fallback constants.
++//
++
++#ifndef COBALT64_NAVI48_TTL_GC_TOPO_H
++#define COBALT64_NAVI48_TTL_GC_TOPO_H
++
++#include <cstdint>
++
++namespace n48 {
++
++// The struct's own shape, not the die's: 4 rows x 2 entries of wgpBitmap[].
++constexpr uint32_t kTtlGcTopoStructRows = 4;
++constexpr uint32_t kTtlGcTopoStructCols = 2;
++
++struct TtlGcTopoFacts {
++    // amdgpu::GFXConfig::inited — false means nothing measured this boot.
++    bool inited = false;
++    uint32_t maxShaderEngines = 0;   // GFXConfig::max_shader_engines
++    uint32_t maxShPerSe = 0;         // GFXConfig::max_sh_per_se
++    uint32_t maxCuPerSh = 0;         // GFXConfig::max_cu_per_sh (CUs, not WGPs)
++    uint32_t globalRbBitmap = 0;     // GFXConfig::global_active_rb_bitmap
++    // GFXConfig::active_cu_bitmap, one bit per CU, [SE][SH]. All-zero means the
++    // harvest map was never read, which is not the same fact as a harvested-out
++    // (empty) shader array.
++    uint32_t cuBitmap[kTtlGcTopoStructRows][kTtlGcTopoStructCols] = {};
++};
++
++struct TtlGcTopoAnswer {
++    uint32_t shaderEngines = 0;
++    uint32_t shPerSe = 0;
++    uint32_t wgpsPerSh = 0;
++    uint32_t rbBitmap = 0;
++    uint32_t wgpBitmap[kTtlGcTopoStructRows][kTtlGcTopoStructCols] = {};
++    uint32_t totalCus = 0;
++    // WGP pairs whose CU map has exactly one of the two CUs: expressible only
++    // by rounding up, so it is recorded rather than hidden.
++    uint32_t halfPopulatedWgps = 0;
++};
++
++enum class TtlGcTopo {
++    Answer,
++    RefuseNotInited,   // nothing measured this boot
++    RefuseNoShape,     // SE / SA / CU-per-SH came in as zero
++    RefuseTooWide,     // the die is bigger than the 4x2 struct can describe
++    RefuseNoHarvestMap, // spelled in the reason text; the map was never read
++};
++
++// The reason text is what reaches the registry, so it has to be readable by
++// someone holding a photo of an ioreg window.
++inline const char *ttlGcTopoReason(TtlGcTopo v) {
++    switch (v) {
++        case TtlGcTopo::Answer:            return "answered from the measured die";
++        case TtlGcTopo::RefuseNotInited:   return "GFXConfig was never populated, so the only numbers "
++                                                  "available were the Navi 48 fallbacks 4x2x8 - refusing";
++        case TtlGcTopo::RefuseNoShape:     return "the die reported SE=0, SA/SE=0 or CU/SH=0 - a shape "
++                                                  "this slot cannot answer without inventing it";
++        case TtlGcTopo::RefuseTooWide:     return "the die is wider than the 4x2 WGP bitmap TTL slot 14 "
++                                                  "can carry - truncating it would describe a different card";
++        case TtlGcTopo::RefuseNoHarvestMap: return "no CU harvest map was read, so every shader array "
++                                                  "would be reported as full whether or not it is";
++    }
++    return "refused";
++}
++
++inline TtlGcTopo ttl_gc_topology(const TtlGcTopoFacts &f, TtlGcTopoAnswer *out,
++                                 const char **reasonOut) {
++    auto verdict = [&](TtlGcTopo v) {
++        if (reasonOut) *reasonOut = ttlGcTopoReason(v);
++        return v;
++    };
++
++    if (!f.inited) return verdict(TtlGcTopo::RefuseNotInited);
++
++    const uint32_t se = f.maxShaderEngines, sa = f.maxShPerSe, cu = f.maxCuPerSh;
++    if (se == 0 || sa == 0 || cu < 2) return verdict(TtlGcTopo::RefuseNoShape);
++    if (se > kTtlGcTopoStructRows || sa > kTtlGcTopoStructCols)
++        return verdict(TtlGcTopo::RefuseTooWide);
++
++    // An all-zero map is "never read"; a row that is zero inside a map with
++    // other bits set is a harvested-out array, which is a real answer.
++    uint32_t anyCus = 0;
++    for (uint32_t i = 0; i < kTtlGcTopoStructRows; i++)
++        for (uint32_t j = 0; j < kTtlGcTopoStructCols; j++) anyCus |= f.cuBitmap[i][j];
++    if (anyCus == 0) return verdict(TtlGcTopo::RefuseNoHarvestMap);
++
++    TtlGcTopoAnswer a;
++    a.shaderEngines = se;
++    a.shPerSe       = sa;
++    a.wgpsPerSh     = cu / 2;                       // the caller reads WGPs, which are CU pairs
++    a.rbBitmap      = f.globalRbBitmap;
++    uint32_t widest = 0;
++    uint32_t cus    = 0;
++    // One 32-bit CU word describes at most 16 WGPs, so the pair loop stops there:
++    // shifting 1u past bit 31 is not "no bit", it is a wrap that invents arrays.
++    for (uint32_t i = 0; i < se; i++) {
++        for (uint32_t j = 0; j < sa; j++) {
++            uint32_t wgp = 0;
++            for (uint32_t bit = 0; bit < 16; bit++) {
++                const uint32_t lo = f.cuBitmap[i][j] & (1u << (2 * bit));
++                const uint32_t hi = f.cuBitmap[i][j] & (1u << (2 * bit + 1));
++                if (lo && hi) { wgp |= (1u << bit); cus += 2; }
++                else if (lo || hi) { wgp |= (1u << bit); a.halfPopulatedWgps++; cus += 1; }
++            }
++            a.wgpBitmap[i][j] = wgp;
++            uint32_t pop = 0;
++            for (uint32_t b = 0; b < 32; b++) if (wgp & (1u << b)) pop++;
++            if (pop > widest) widest = pop;
++        }
++    }
++    // wgpsPerSh is the *table* width; the measured map may populate fewer.
++    if (widest > a.wgpsPerSh) a.wgpsPerSh = widest;
++    a.totalCus = cus;
++
++    if (out) *out = a;
++    return verdict(TtlGcTopo::Answer);
++}
++
++}  // namespace n48
++
++#endif  // COBALT64_NAVI48_TTL_GC_TOPO_H
+diff --git a/src/navi48-bringup/tests/ttl_gc_topo_plant.sh b/src/navi48-bringup/tests/ttl_gc_topo_plant.sh
+new file mode 100644
+index 0000000..aa7a1cb
+--- /dev/null
++++ b/src/navi48-bringup/tests/ttl_gc_topo_plant.sh
+@@ -0,0 +1,156 @@
++#!/usr/bin/env bash
++#
++#  ttl_gc_topo_plant.sh — prove the 0018 suite can actually fail.
++#
++#  Usage (from anywhere):  ZIG=/path/to/zig.exe bash tests/ttl_gc_topo_plant.sh
++#
++#  One break at a time, planted into a COPY of the real sources, and the suite must catch
++#  it. This slot tells Apple how many shader engines, arrays and CUs exist; the break being
++#  guarded against is the one the code shipped with until now — an unmeasured die answered
++#  with Navi 48's 4x2x8 and a log warning. So half of these plants put a fallback back.
++#
++#  Rules (same as the other *_plant.sh here):
++#    * needles are SINGLE-LINE, because the checkout is CRLF and a multi-line needle
++#      never matches;
++#    * every needle must be found, or the run aborts - a drifted needle silently
++#      becomes "no plant applied", which reads exactly like a passing suite;
++#    * the pristine checksum is taken up front and re-checked at the end;
++#    * `control` runs the untouched copy first.
++#
++set -u
++
++ZIG="${ZIG:?set ZIG to the zig (or zig c++) driver to use}"
++HERE="$(cd "$(dirname "$0")" && pwd)"
++ROOT="$(cd "$HERE/.." && pwd)"
++SCR="$(mktemp -d)"
++mkdir -p "$SCR" || { echo "cannot make $SCR"; exit 2; }
++trap 'rm -rf "$SCR"' EXIT
++
++cp -R "$ROOT/src" "$SCR/src" || { echo "copy of src failed"; exit 2; }
++cp -R "$ROOT/tests/dalshim" "$SCR/dalshim" 2>/dev/null
++
++PRISTINE=$(find "$SCR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) \
++    | sort | xargs cat | cksum | awk '{print $1}')
++
++build_run() {
++	# "$ZIG" stays quoted: on this workstation the toolchain path contains spaces, and a
++	# word-split $ZIG fails with "D:\Work: No such file or directory" - which a plant run
++	# reports as a build failure, indistinguishable from a broken source tree.
++	"$ZIG" c++ -std=c++17 -O1 -I "$SCR/dalshim" -I "$SCR/src" \
++		"$HERE/ttl_gc_topo_test.cpp" -o "$SCR/t" >"$SCR/build.log" 2>&1 || {
++		echo "    BUILD FAILED"; sed -n '1,6p' "$SCR/build.log"; return 2; }
++	"$SCR/t" "$SCR" >"$SCR/run.log" 2>&1
++	return $?
++}
++
++count_matches() { # file needle -> echoes the number of occurrences
++	N="$2" perl -0777 -ne 'my $c = () = $_ =~ /\Q$ENV{N}\E/g; print $c' "$1"
++}
++
++plant() {
++	local file="$1" needle="$2" repl="$3" occ="${4:-1}"
++	local path="$SCR/$file"
++	cp "$ROOT/$file" "$path"                       # always plant from pristine
++	local found
++	found=$(count_matches "$path" "$needle")
++	if [ "${found:-0}" -lt "$occ" ]; then
++		echo "    NEEDLE MISSING (occ $occ of $found): $needle"
++		return 9
++	fi
++	# Counting is done with N="..." perl ... FILE, never with `perl -sne '...' N=...`:
++	# without a preceding --, perl treats N=<needle> as another INPUT FILE, so $ENV{N} is
++	# empty, the regex matches at every position, and both the "needle exists" and the
++	# "plant landed" guards report success no matter what the tree contains.
++	N="$needle" R="$repl" O="$occ" perl -0777 -i -pe '
++		my $n = $ENV{N}; my $r = $ENV{R}; my $want = $ENV{O}; my $i = 0;
++		s/\Q$n\E/$i++; ($i == $want) ? $r : $n/ge;
++	' "$path"
++	local after afterRepl
++	after=$(count_matches "$path" "$needle")
++	afterRepl=$(count_matches "$path" "$repl")
++	if [ "$after" -ge "$occ" ] && [ "${afterRepl:-0}" -eq 0 ]; then
++		echo "    PLANT DID NOT LAND"
++		return 9
++	fi
++	return 0
++}
++
++restore_all() { rm -rf "$SCR/src"; cp -R "$ROOT/src" "$SCR/src"; }
++
++H=src/apple/ttl_gc_topo.h
++C=src/apple/Navi48Ttl.cpp
++
++declare -a PASS FAIL MISS
++PASSN=0 FAILN=0 MISSN=0
++run_plant() { # LABEL FILE NEEDLE REPL [OCC]
++	local label="$1"; shift
++	printf '  %-46s' "$label"
++	if ! plant "$@"; then echo "PLANT-ERROR"; MISS+=("$label"); MISSN=$((MISSN + 1)); restore_all; return; fi
++	build_run
++	local rc=$?
++	if [ "$rc" -eq 0 ]; then echo "ESCAPED (suite still passed)"; FAIL+=("$label"); FAILN=$((FAILN + 1));
++	else echo "caught (rc=$rc)"; PASS+=("$label"); PASSN=$((PASSN + 1)); fi
++	restore_all
++}
++
++echo "== control: the untouched copy =="
++if build_run; then echo "  control PASSED - plants below are meaningful"
++else echo "  control FAILED - the copy/build step is broken, stopping"; exit 1; fi
++
++echo "== plants: the pure gate (each one removes a refusal) =="
++run_plant "gate: inited check dropped"        "$H" 'if (!f.inited) return verdict(TtlGcTopo::RefuseNotInited);' 'if (false) return verdict(TtlGcTopo::RefuseNotInited);'
++run_plant "gate: zero-shape check dropped"    "$H" 'if (se == 0 || sa == 0 || cu < 2) return verdict(TtlGcTopo::RefuseNoShape);' 'if (false) return verdict(TtlGcTopo::RefuseNoShape);'
++run_plant "gate: struct-width check dropped"  "$H" 'if (se > kTtlGcTopoStructRows || sa > kTtlGcTopoStructCols)' 'if (false)'
++run_plant "gate: no-harvest-map check dropped" "$H" 'if (anyCus == 0) return verdict(TtlGcTopo::RefuseNoHarvestMap);' 'if (false) return verdict(TtlGcTopo::RefuseNoHarvestMap);'
++run_plant "gate: every reason becomes ok"      "$H" 'if (reasonOut) *reasonOut = ttlGcTopoReason(v);' 'if (reasonOut) *reasonOut = "ok";'
++run_plant "gate: SE comes from the struct"    "$H" 'a.shaderEngines = se;' 'a.shaderEngines = kTtlGcTopoStructRows;'
++run_plant "gate: rb bitmap dropped"           "$H" 'a.rbBitmap      = f.globalRbBitmap;' 'a.rbBitmap      = 0;'
++run_plant "gate: half pair not counted"       "$H" 'else if (lo || hi) { wgp |= (1u << bit); a.halfPopulatedWgps++; cus += 1; }' 'else if (lo || hi) { }'
++run_plant "gate: one CU of a pair is enough"  "$H" 'if (lo && hi) { wgp |= (1u << bit); cus += 2; }' 'if (lo || hi) { wgp |= (1u << bit); cus += 2; }'
++run_plant "gate: pair loop wraps past bit 31" "$H" 'for (uint32_t bit = 0; bit < 16; bit++)' 'for (uint32_t bit = 0; bit < 32; bit++)'
++run_plant "gate: measured width never raises" "$H" 'if (widest > a.wgpsPerSh) a.wgpsPerSh = widest;' ''
++run_plant "gate: CU total is the table math"  "$H" 'a.totalCus = cus;' 'a.totalCus = se * sa * cu;'
++run_plant "gate: struct rows become 3"        "$H" 'constexpr uint32_t kTtlGcTopoStructRows = 4;' 'constexpr uint32_t kTtlGcTopoStructRows = 3;'
++run_plant "gate: struct cols become 1"        "$H" 'constexpr uint32_t kTtlGcTopoStructCols = 2;' 'constexpr uint32_t kTtlGcTopoStructCols = 1;'
++run_plant "facts: default inited becomes true" "$H" 'bool inited = false;' 'bool inited = true;'
++
++echo "== plants: the reason text an owner reads =="
++run_plant "why: answer text stops being a sentence" "$H" 'case TtlGcTopo::Answer:            return "answered from the measured die";' 'case TtlGcTopo::Answer:            return "answered";'
++run_plant "why: not-inited loses the die name"  "$H" 'Navi 48 fallbacks 4x2x8 - refusing";' 'the fallbacks - refusing";'
++run_plant "why: too-wide loses the struct size" "$H" '"the die is wider than the 4x2 WGP bitmap TTL slot 14 "' '"the die is wider than the WGP bitmap TTL slot 14 "'
++run_plant "why: harvest refusal loses the consequence" "$H" '"would be reported as full whether or not it is";' '"would be reported";'
++run_plant "why: accessor and gate disagree"     "$H" 'case TtlGcTopo::RefuseNotInited:   return "GFXConfig was never populated, so the only numbers "' 'case TtlGcTopo::RefuseNoShape:   return "GFXConfig was never populated, so the only numbers "'
++
++echo "== plants: the TTL slot is actually wired to the gate =="
++run_plant "xsrc: header not included"          "$C" '#include "ttl_gc_topo.h"' '#include "ttl_gc_topo_off.h"'
++run_plant "xsrc: gate never consulted"         "$C" 'n48::ttl_gc_topology(tf, &an, &twhy)' 'n48::ttl_gc_topology_gone(tf, &an, &twhy)'
++run_plant "xsrc: verdict never honoured"       "$C" 'if (tv != n48::TtlGcTopo::Answer) {' 'if (false) {'
++run_plant "xsrc: decline becomes success"      "$C" '        return kTtlUnsupported;' '        return kTtlOk;'
++run_plant "xsrc: SE fallback comes back"       "$C" 'tf.maxShaderEngines = g.max_shader_engines;' 'tf.maxShaderEngines = g.max_shader_engines ? g.max_shader_engines : 4;'
++run_plant "xsrc: SA fallback comes back"       "$C" 'tf.maxShPerSe       = g.max_sh_per_se;' 'tf.maxShPerSe       = g.max_sh_per_se ? g.max_sh_per_se : 2;'
++run_plant "xsrc: CU fallback comes back"       "$C" 'tf.maxCuPerSh       = g.max_cu_per_sh;' 'tf.maxCuPerSh       = g.max_cu_per_sh ? g.max_cu_per_sh : 8;'
++run_plant "xsrc: harvest map ignored"          "$C" 'tf.cuBitmap[i][j] = g.active_cu_bitmap[i][j];' 'tf.cuBitmap[i][j] = 0xFFu;'
++run_plant "xsrc: inited fact not passed"       "$C" 'tf.inited           = g.inited;' 'tf.inited           = true;'
++run_plant "xsrc: verdict not published"        "$C" 'mOwner->setProperty("Navi48,TtlGcTopo", twhy);' 'mOwner->setProperty("Navi48,TtlGcTopoX", twhy);'
++run_plant "xsrc: publish guard dropped"        "$C" 'if (mOwner) mOwner->setProperty("Navi48,TtlGcTopo", twhy);' 'mOwner->setProperty("Navi48,TtlGcTopo", twhy);'
++run_plant "xsrc: CU count not published"       "$C" '"Navi48,TtlGcCus"' '"Navi48,TtlGcCusX"'
++run_plant "xsrc: SE key renamed"               "$C" '"Navi48,TtlGcSe"' '"Navi48,TtlGcSeX"'
++run_plant "xsrc: rows written from a full mask" "$C" 'o->wgpBitmap[i][j] = an.wgpBitmap[i][j];' 'o->wgpBitmap[i][j] = 0xFFFFFFFFu;'
++run_plant "xsrc: struct layout resized"        "$C" 'uint32_t wgpBitmap[4][2];' 'uint32_t wgpBitmap[4][3];'
++
++echo "== summary =="
++# Counts are plain integers: `${#ARR[@]}` on an empty array is an unbound-variable fatal
++# under `set -u` in bash 3.2, which would kill the run right where the tally prints.
++echo "caught:   $PASSN"
++echo "escaped:  $FAILN  ${FAIL[*]:-}"
++echo "plant-errors: $MISSN  ${MISS[*]:-}"
++
++AFTER=$(find "$SCR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) \
++    | sort | xargs cat | cksum | awk '{print $1}')
++if [ "$AFTER" != "$PRISTINE" ]; then
++	echo "PRISTINE CHECKSUM CHANGED - the copy is polluted; investigate before trusting any result"
++	exit 3
++fi
++echo "pristine tree unchanged after the run (checksum $PRISTINE)"
++
++[ "$FAILN" -eq 0 ] && [ "$MISSN" -eq 0 ]
+diff --git a/src/navi48-bringup/tests/ttl_gc_topo_test.cpp b/src/navi48-bringup/tests/ttl_gc_topo_test.cpp
+new file mode 100644
+index 0000000..ab846ce
+--- /dev/null
++++ b/src/navi48-bringup/tests/ttl_gc_topo_test.cpp
+@@ -0,0 +1,337 @@
++//
++//  ttl_gc_topo_test.cpp — host suite for TTL slot 14's geometry decision (patch 0018).
++//
++//  Build (from src/navi48-bringup, on any machine — no Mac, no GPU):
++//    zig c++ -std=c++17 -Wall -Wextra -O1 -I tests/dalshim -I src \
++//        tests/ttl_gc_topo_test.cpp -o /tmp/ttl_gc_topo_test.exe
++//    /tmp/ttl_gc_topo_test.exe .
++//
++//  The argv[1] directory is the navi48-bringup root, used by the source-pin sections.
++//
++//  Why: slot 14 is the answer Apple builds its CU mask, ring assignment and work-group
++//  limits out of, and until now an unmeasured die got the Navi 48 numbers 4 / 2 / 8 with a
++//  log warning. On a 12.0.0 card that is Apple told it has 64 CUs when it has 32 — and the
++//  path that reaches it (GFXConfig never populated) is the path a hanging boot takes. The
++//  suite checks the die-specific arithmetic against the shapes written in amdgpu_gfx.h, not
++//  against the header's own expressions.
++//
++
++#include "apple/ttl_gc_topo.h"
++
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <sstream>
++#include <string>
++#include <vector>
++
++static int gChecks = 0, gFailures = 0;
++static void report(const char *file, int line, const char *what, bool ok) {
++	gChecks++;
++	if (ok) return;
++	gFailures++;
++	printf("FAIL %s:%d: %s\n", file, line, what);
++}
++#define CHECK(cond) report(__FILE__, __LINE__, #cond, (cond))
++#define CHECK_MSG(cond, msg) report(__FILE__, __LINE__, msg, (cond))
++
++using n48::TtlGcTopo;
++using n48::TtlGcTopoFacts;
++using n48::TtlGcTopoAnswer;
++
++namespace {
++
++std::string slurp(const std::string &path) {
++	std::ifstream in(path, std::ios::binary);
++	if (!in) return "";
++	std::ostringstream ss;
++	ss << in.rdbuf();
++	std::string s = ss.str();
++	for (auto &c : s) if (c == '\r') c = '\n';       // CRLF-tolerant pins
++	while (!s.empty() && s.back() == '\n') s.pop_back();
++	return s;
++}
++
++bool has(const std::string &hay, const std::string &needle) {
++	return hay.find(needle) != std::string::npos;
++}
++
++size_t count_of(const std::string &hay, const std::string &needle) {
++	size_t n = 0, p = 0;
++	while ((p = hay.find(needle, p)) != std::string::npos) { n++; p += needle.size(); }
++	return n;
++}
++
++// A full map for a die of se x sa arrays holding cu CUs each.
++TtlGcTopoFacts measured(uint32_t se, uint32_t sa, uint32_t cuPerSh, uint32_t rb = 0xF) {
++	TtlGcTopoFacts f;
++	f.inited = true;
++	f.maxShaderEngines = se;
++	f.maxShPerSe = sa;
++	f.maxCuPerSh = cuPerSh;
++	f.globalRbBitmap = rb;
++	const uint32_t mask = (cuPerSh >= 32) ? 0xFFFFFFFFu : ((1u << cuPerSh) - 1u);
++	for (uint32_t i = 0; i < se && i < n48::kTtlGcTopoStructRows; i++)
++		for (uint32_t j = 0; j < sa && j < n48::kTtlGcTopoStructCols; j++)
++			f.cuBitmap[i][j] = mask;
++	return f;
++}
++
++// The rules in prose, applied by hand — deliberately not a copy of the header's order.
++TtlGcTopo expect_verdict(const TtlGcTopoFacts &f) {
++	if (!f.inited) return TtlGcTopo::RefuseNotInited;
++	if (f.maxShaderEngines == 0 || f.maxShPerSe == 0 || f.maxCuPerSh < 2)
++		return TtlGcTopo::RefuseNoShape;
++	if (f.maxShaderEngines > 4 || f.maxShPerSe > 2) return TtlGcTopo::RefuseTooWide;
++	uint32_t any = 0;
++	for (uint32_t i = 0; i < 4; i++)
++		for (uint32_t j = 0; j < 2; j++) any |= f.cuBitmap[i][j];
++	if (any == 0) return TtlGcTopo::RefuseNoHarvestMap;
++	return TtlGcTopo::Answer;
++}
++
++// ---------------------------------------------------------------- A: verdicts
++void sectionA() {
++	printf("== A: which facts get an answer, which get a refusal ==\n");
++	// The two real dies and the four refusal preconditions, each on its own axis.
++	const TtlGcTopoFacts cases[] = {
++		measured(4, 2, 8),                       // Navi 48 as surveyed
++		measured(2, 2, 8),                       // Navi 44 at full width
++		measured(1, 1, 2),                       // the smallest die that answers
++		measured(4, 2, 8),                       // duplicate on purpose: grid below
++	};
++	for (const auto &f : cases) {
++		TtlGcTopoAnswer a; const char *why = "";
++		const TtlGcTopo v = n48::ttl_gc_topology(f, &a, &why);
++		CHECK(v == expect_verdict(f));
++		CHECK(v == TtlGcTopo::Answer);
++		CHECK(std::strcmp(why, n48::ttlGcTopoReason(v)) == 0);
++	}
++
++	TtlGcTopoFacts unmeasured;                    // every field default
++	TtlGcTopoAnswer a; const char *why = "";
++	CHECK(n48::ttl_gc_topology(unmeasured, &a, &why) == TtlGcTopo::RefuseNotInited);
++	CHECK(has(why, "never populated"));
++	CHECK(has(why, "Navi 48"));
++	CHECK(has(why, "4x2x8"));
++	CHECK(a.shaderEngines == 0 && a.totalCus == 0);   // a refusal leaves the answer alone
++
++	// A die measured but with each shape field zeroed in turn.
++	for (uint32_t which = 0; which < 3; which++) {
++		TtlGcTopoFacts f = measured(4, 2, 8);
++		if (which == 0) f.maxShaderEngines = 0;
++		if (which == 1) f.maxShPerSe = 0;
++		if (which == 2) f.maxCuPerSh = 0;
++		CHECK_MSG(n48::ttl_gc_topology(f, &a, &why) == TtlGcTopo::RefuseNoShape,
++		          "a zeroed shape field must refuse, not substitute");
++		CHECK(has(why, "SE=0"));
++	}
++	// CU/SH == 1 is the same class: half a WGP is not a shape.
++	TtlGcTopoFacts one = measured(4, 2, 8); one.maxCuPerSh = 1;
++	CHECK(n48::ttl_gc_topology(one, &a, &why) == TtlGcTopo::RefuseNoShape);
++
++	// Wider than the struct: the old code clamped these down and answered.
++	TtlGcTopoFacts wide_se = measured(4, 2, 8); wide_se.maxShaderEngines = 5;
++	TtlGcTopoFacts wide_sa = measured(4, 2, 8); wide_sa.maxShPerSe = 3;
++	CHECK(n48::ttl_gc_topology(wide_se, &a, &why) == TtlGcTopo::RefuseTooWide);
++	CHECK(has(why, "4x2 WGP bitmap"));
++	CHECK(has(why, "describe a different card"));
++	CHECK(n48::ttl_gc_topology(wide_sa, &a, &why) == TtlGcTopo::RefuseTooWide);
++
++	// Measured shape, but the harvest map was never read.
++	TtlGcTopoFacts noharvest = measured(4, 2, 8);
++	for (uint32_t i = 0; i < 4; i++) for (uint32_t j = 0; j < 2; j++) noharvest.cuBitmap[i][j] = 0;
++	CHECK(n48::ttl_gc_topology(noharvest, &a, &why) == TtlGcTopo::RefuseNoHarvestMap);
++	CHECK(has(why, "no CU harvest map was read"));
++	CHECK(has(why, "reported as full"));
++
++	// reasonOut may be null, and the accessor covers every enumerator.
++	CHECK(n48::ttl_gc_topology(noharvest, &a, nullptr) == TtlGcTopo::RefuseNoHarvestMap);
++	const TtlGcTopo allv[] = { TtlGcTopo::Answer, TtlGcTopo::RefuseNotInited,
++	                           TtlGcTopo::RefuseNoShape, TtlGcTopo::RefuseTooWide,
++	                           TtlGcTopo::RefuseNoHarvestMap };
++	for (auto v : allv) CHECK(std::strlen(n48::ttlGcTopoReason(v)) > 12);
++}
++
++// ---------------------------------------------------------------- B: die shapes
++void sectionB() {
++	printf("== B: the numbers Apple is told, per die ==\n");
++	TtlGcTopoAnswer a; const char *why = "";
++
++	// amdgpu_gfx.h: gfx1201 Navi 48 = 4 SE x 2 SH x 4 WGP = 64 CUs.
++	CHECK(n48::ttl_gc_topology(measured(4, 2, 8), &a, &why) == TtlGcTopo::Answer);
++	CHECK(a.shaderEngines == 4);
++	CHECK(a.shPerSe == 2);
++	CHECK(a.wgpsPerSh == 4);
++	CHECK(a.totalCus == 64);
++	CHECK(a.rbBitmap == 0xF);
++	CHECK(a.halfPopulatedWgps == 0);
++	for (uint32_t i = 0; i < 4; i++)
++		for (uint32_t j = 0; j < 2; j++)
++			CHECK_MSG(a.wgpBitmap[i][j] == 0x0Fu, "full map is 4 WGP bits per array");
++
++	// gfx1200 Navi 44 = 2 SE x 2 SH x 4 WGP = 32 CUs — half the card, and the row
++	// count is what a 4-row struct would have padded with Navi 48's shape.
++	CHECK(n48::ttl_gc_topology(measured(2, 2, 8), &a, &why) == TtlGcTopo::Answer);
++	CHECK(a.shaderEngines == 2);
++	CHECK(a.totalCus == 32);
++	CHECK(a.wgpBitmap[0][0] == 0x0Fu);
++	CHECK(a.wgpBitmap[1][1] == 0x0Fu);
++	CHECK_MSG(a.wgpBitmap[2][0] == 0 && a.wgpBitmap[3][1] == 0,
++	          "rows outside the die stay zero - a popcount must not see padding");
++
++	// A harvested Navi 44: one whole array off, one CU pair off. Not the full mask.
++	TtlGcTopoFacts h = measured(2, 2, 8);
++	h.cuBitmap[1][0] = 0;              // an array the fuse blew
++	h.cuBitmap[0][1] = 0x0F;           // 4 of 8 CUs -> 2 WGPs
++	CHECK(n48::ttl_gc_topology(h, &a, &why) == TtlGcTopo::Answer);
++	CHECK(a.wgpBitmap[1][0] == 0);
++	CHECK(a.wgpBitmap[0][1] == 0x03u);
++	CHECK(a.wgpBitmap[0][0] == 0x0Fu);
++	CHECK(a.totalCus == 8 + 0 + 4 + 8);
++	CHECK(a.halfPopulatedWgps == 0);
++	CHECK_MSG(a.wgpBitmap[0][0] != 0x0Fu || a.totalCus != 32,
++	          "the harvest map must change the answer, not just the log line");
++
++	// The old fallback shape, reached honestly: an unmeasured 12.0.0 boot answers nothing.
++	TtlGcTopoFacts blank; blank.inited = false;
++	blank.maxShaderEngines = 4; blank.maxShPerSe = 2; blank.maxCuPerSh = 8;
++	for (uint32_t i = 0; i < 4; i++) for (uint32_t j = 0; j < 2; j++) blank.cuBitmap[i][j] = 0xFF;
++	CHECK(n48::ttl_gc_topology(blank, &a, &why) == TtlGcTopo::RefuseNotInited);
++}
++
++// ---------------------------------------------------------------- C: pairs
++void sectionC() {
++	printf("== C: WGP pairs and the width the map implies ==\n");
++	TtlGcTopoAnswer a; const char *why = "";
++
++	// One CU of a pair cannot be expressed; the suite pins which way it rounds.
++	TtlGcTopoFacts lo = measured(1, 1, 8); lo.cuBitmap[0][0] = 0x01;   // CU0 alone
++	CHECK(n48::ttl_gc_topology(lo, &a, &why) == TtlGcTopo::Answer);
++	CHECK(a.wgpBitmap[0][0] == 0x01u);
++	CHECK(a.totalCus == 1);
++	CHECK(a.halfPopulatedWgps == 1);
++
++	TtlGcTopoFacts hi = measured(1, 1, 8); hi.cuBitmap[0][0] = 0x02;   // CU1 alone
++	CHECK(n48::ttl_gc_topology(hi, &a, &why) == TtlGcTopo::Answer);
++	CHECK(a.wgpBitmap[0][0] == 0x01u);
++	CHECK(a.halfPopulatedWgps == 1);
++	CHECK(a.totalCus == 1);
++
++	// Both halves of every pair set = no half-populated WGP at all.
++	TtlGcTopoFacts both = measured(1, 1, 8); both.cuBitmap[0][0] = 0x03;
++	CHECK(n48::ttl_gc_topology(both, &a, &why) == TtlGcTopo::Answer);
++	CHECK(a.halfPopulatedWgps == 0);
++	CHECK(a.wgpBitmap[0][0] == 0x01u);
++	CHECK(a.totalCus == 2);
++
++	// The table width is a maximum, not a claim: a die whose table says 2 CUs/SH
++	// but whose map holds two WGPs gets the measured width.
++	TtlGcTopoFacts raise = measured(1, 1, 2); raise.cuBitmap[0][0] = 0x0F;  // 4 CUs
++	CHECK(n48::ttl_gc_topology(raise, &a, &why) == TtlGcTopo::Answer);
++	CHECK(a.wgpsPerSh == 2);
++	CHECK_MSG(a.wgpsPerSh == 2, "map narrower than max only ever lowers nothing");
++	// And 32-bit maps: cu_per_sh == 32 is the clamp boundary.
++	TtlGcTopoFacts wide = measured(1, 1, 32);
++	CHECK(n48::ttl_gc_topology(wide, &a, &why) == TtlGcTopo::Answer);
++	CHECK(a.wgpBitmap[0][0] == 0xFFFFu);
++	CHECK(a.wgpsPerSh == 16);
++	CHECK(a.totalCus == 32);
++	// Odd bit count at the top of a word: bit 31 has no high half.
++	TtlGcTopoFacts top = measured(1, 1, 32); top.cuBitmap[0][0] = 0x80000000u;
++	CHECK(n48::ttl_gc_topology(top, &a, &why) == TtlGcTopo::Answer);
++	CHECK(a.wgpBitmap[0][0] == 0x8000u);
++	CHECK(a.halfPopulatedWgps == 1);
++	CHECK(a.totalCus == 1);
++}
++
++// ---------------------------------------------------------------- D: the kext wiring
++void sectionD(const std::string &root) {
++	printf("== D: the TTL slot actually consults the gate ==\n");
++	const std::string s = slurp(root + "/src/apple/Navi48Ttl.cpp");
++	CHECK_MSG(!s.empty(), "read src/apple/Navi48Ttl.cpp");
++	const size_t at = s.find("uint32_t Navi48Ttl::queryGcHardwareInfo(");
++	CHECK_MSG(at != std::string::npos, "slot 14 is defined");
++	const std::string body = s.substr(at, 3000);
++
++	CHECK_MSG(has(s, "#include \"ttl_gc_topo.h\""), "the gate is included");
++	CHECK(has(body, "n48::ttl_gc_topology(tf, &an, &twhy)"));
++	CHECK(has(body, "tf.inited           = g.inited;"));
++	CHECK(has(body, "tf.maxShaderEngines = g.max_shader_engines;"));
++	CHECK(has(body, "tf.maxShPerSe       = g.max_sh_per_se;"));
++	CHECK(has(body, "tf.maxCuPerSh       = g.max_cu_per_sh;"));
++	CHECK(has(body, "tf.globalRbBitmap   = g.global_active_rb_bitmap;"));
++	CHECK_MSG(has(body, "tf.cuBitmap[i][j] = g.active_cu_bitmap[i][j];"),
++	          "the harvest map is read, not skipped");
++	CHECK(has(body, "tv != n48::TtlGcTopo::Answer"));
++	CHECK_MSG(has(body, "return kTtlUnsupported;"),
++	          "a refusal declines the slot instead of answering kTtlOk");
++	CHECK_MSG(count_of(body, "return kTtlOk;") == 1,
++	          "exactly one success exit");
++
++	// The published facts, and the guard that keeps an unbound TTL from writing.
++	CHECK(has(body, "mOwner->setProperty(\"Navi48,TtlGcTopo\", twhy)"));
++	CHECK(has(body, "if (mOwner) mOwner->setProperty(\"Navi48,TtlGcTopo\", twhy);"));
++	CHECK(has(body, "\"Navi48,TtlGcSe\""));
++	CHECK(has(body, "\"Navi48,TtlGcShPerSe\""));
++	CHECK(has(body, "\"Navi48,TtlGcWgpPerSh\""));
++	CHECK(has(body, "\"Navi48,TtlGcCus\""));
++
++	// What must NOT come back.
++	CHECK_MSG(!has(body, "g.max_shader_engines ? g.max_shader_engines : 4"),
++	          "the Navi 48 SE fallback is gone");
++	CHECK_MSG(!has(body, "g.max_sh_per_se      ? g.max_sh_per_se      : 2"),
++	          "the Navi 48 SA fallback is gone");
++	CHECK_MSG(!has(body, "g.max_cu_per_sh : 8) / 2"), "the Navi 48 CU fallback is gone");
++	CHECK_MSG(!has(body, "if (se > 4) se = 4;"), "silent truncation is gone");
++	CHECK_MSG(!has(body, "these are fallback constants"),
++	          "warn-and-answer is gone");
++
++	// The struct contract the gate encodes.
++	CHECK(has(s, "static_assert(sizeof(GcHardwareInfoLayout) == 0x40"));
++	CHECK(has(s, "uint32_t wgpBitmap[4][2];"));
++	CHECK_MSG(has(body, "o->wgpBitmap[i][j] = an.wgpBitmap[i][j];"),
++	          "the answer's rows are copied verbatim, padding and all");
++	CHECK_MSG(count_of(s, "queryGcHardwareInfo") >= 2, "the slot is still named for the log");
++}
++
++// ---------------------------------------------------------------- E: header hygiene
++void sectionE(const std::string &root) {
++	printf("== E: the gate is a pure header ==\n");
++	std::string h = slurp(root + "/src/apple/ttl_gc_topo.h");
++	CHECK_MSG(!h.empty(), "read the header");
++	std::string code;
++	for (auto &line : [&]() {
++		std::vector<std::string> out; std::istringstream in(h); std::string l;
++		while (std::getline(in, l)) out.push_back(l);
++		return out;
++	}()) {
++		const size_t c = line.find("//");
++		if (c != std::string::npos) line = line.substr(0, c);
++		code += line;
++		code += "\n";
++	}
++	CHECK_MSG(!has(code, "#include <IOKit"), "no IOKit");
++	CHECK(!has(code, "PE_parse_boot_argn"));
++	CHECK(!has(code, "setProperty"));
++	CHECK(!has(code, "amdgpu::"));
++	CHECK_MSG(count_of(h, "\n#include <cstdint>") == 1, "one std include");
++	CHECK_MSG(!has(code, ": 4;") && !has(code, ": 2;") && !has(code, ": 8) / 2"),
++	          "no Navi 48 literals anywhere in the code");
++	CHECK(has(h, "0018"));
++	CHECK(has(h, "Navi 48's numbers"));
++	CHECK(has(h, "12.0.0"));
++}
++
++}  // namespace
++
++int main(int argc, char **argv) {
++	const std::string root = (argc > 1) ? argv[1] : ".";
++	sectionA();
++	sectionB();
++	sectionC();
++	sectionD(root);
++	sectionE(root);
++	printf("\n%d checks, %d failures\n", gChecks, gFailures);
++	return gFailures == 0 ? 0 : 1;
++}
+-- 
+2.52.0.windows.1
+

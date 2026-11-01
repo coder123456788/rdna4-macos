@@ -1,0 +1,78 @@
+From 3a0cb62e9da3f795cb6378715375deb56eeaff2a Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Sat, 31 Oct 2026 10:42:28 -0700
+Subject: [PATCH] 0026: pin the unarmed announce in the takeover suite
+
+---
+ .../tests/accel_takeover_report_plant.sh           |  8 +++++++-
+ .../tests/accel_takeover_report_test.cpp           | 14 ++++++++++++--
+ 2 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/src/navi48-bringup/tests/accel_takeover_report_plant.sh b/src/navi48-bringup/tests/accel_takeover_report_plant.sh
+index 1d6f5a4..07bc3ab 100644
+--- a/src/navi48-bringup/tests/accel_takeover_report_plant.sh
++++ b/src/navi48-bringup/tests/accel_takeover_report_plant.sh
+@@ -132,7 +132,7 @@ run_plant "rt: the verdict ignores the signal"       "$R" 'n48::accel_takeover_v
+ run_plant "rt: the started flag is never set"        "$R" '__atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE);' '__atomic_store_n(&gStarted, 0u, __ATOMIC_RELEASE);'
+ run_plant "rt: the mark sleeps on Apple's thread"    "$R" '__atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE);' '__atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE); IOSleep(500);'
+ run_plant "rt: the arming never takes"               "$R" '__atomic_store_n(&gArmed, 1u, __ATOMIC_RELEASE);' '__atomic_store_n(&gArmed, 0u, __ATOMIC_RELEASE);'
+-run_plant "rt: the mark ignores arming"              "$R" 'if (!__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE)) return;' 'if (false) return;'
++run_plant "rt: the mark ignores arming"              "$R" 'if (__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE)) {' 'if (false) {'
+ run_plant "rt: the block is never printed"           "$R" 'print_block(v, waited, facts);' ';'
+ run_plant "rt: the block runs one second long"       "$R" 'if (t >= n48::kTakeoverHold) break;' 'if (t > n48::kTakeoverHold) break;'
+ run_plant "rt: two blocks can print"                 "$R" '__atomic_compare_exchange_n(&gBlockPrinted' '__atomic_compare_exchange_n(&gBlockPrintedX'
+@@ -145,6 +145,12 @@ run_plant "rt: the hook binding is not reported"     "$R" 'gNavi48Ttl.bound() ?
+ run_plant "rt: the slot scan is dropped"             "$R" 'for (int s = 0; s < 43; s++) if (gNavi48Ttl.callCount(s) != 0) touched++;' 'for (int s = 0; s < 43; s++) if (gNavi48Ttl.callCount(s) != 0) { }'
+ run_plant "rt: the census line loses the first slot" "$R" 'ttl: bound=%u calls=%u slots=%u/43 first unsupported=%d' 'ttl: bound=%u calls=%u slots=%u/43'
+ 
++echo "== plants: the unarmed announce (0025 - proof by itself) =="
++run_plant "rt: the unarmed announce is silent"       "$R" 'TAKELOG("========== NAVI 44 TAKEOVER REPORT (no watcher armed) ==========");' ';'
++run_plant "rt: the unarmed announce skips the census" "$R" 'print_ttl_census();' ';' 2
++run_plant "rt: the unarmed announce misreads the verdict" "$R" 'n48::accel_takeover_headline(n48::TakeoverVerdict::Started)' 'n48::accel_takeover_headline(n48::TakeoverVerdict::TimedOut)'
++run_plant "rt: the announce can still return unarmed" "$R" '__atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE);' 'if (!__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE)) return; __atomic_store_n(&gStarted, 1u, __ATOMIC_ACQUIRE);'
++
+ echo "== plants: the xsrc wiring (armed only after a real publish) =="
+ run_plant "xsrc: header not included"                "$C" '#include "accel_takeover_report.h"' '#include "accel_takeover_report_gone.h"'
+ run_plant "xsrc: armed on any requested boot"        "$C" 'n48::accel_takeover_armed(ff.argRequested, fireCalled && fireKr == 0)' 'n48::accel_takeover_armed(ff.argRequested, true)'
+diff --git a/src/navi48-bringup/tests/accel_takeover_report_test.cpp b/src/navi48-bringup/tests/accel_takeover_report_test.cpp
+index 188d418..8a39cc0 100644
+--- a/src/navi48-bringup/tests/accel_takeover_report_test.cpp
++++ b/src/navi48-bringup/tests/accel_takeover_report_test.cpp
+@@ -175,7 +175,13 @@ int main(int argc, char **argv) {
+ 	CHECK(count_of(rt, "IOSleep(1000);") == 2);   // one in print_block, one in the wait loop
+ 	CHECK(has(rt, "__atomic_store_n(&gArmed, 1u, __ATOMIC_RELEASE);"));
+ 	CHECK(has(rt, "__atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE);"));
+-	CHECK(has(rt, "if (!__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE)) return;"));
++	// 0025: the announce is proof by itself. The flag is stored before anything can return, so
++	// an unarmed boot still reports it; the armed check only selects which block is printed.
++	const size_t storeAt = rt.find("__atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE);");
++	const size_t armedAt = rt.find("if (__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE)) {");
++	CHECK(storeAt != std::string::npos && armedAt != std::string::npos && storeAt < armedAt);
++	CHECK(has(rt, "========== NAVI 44 TAKEOVER REPORT (no watcher armed) =========="));
++	CHECK(has(rt, "n48::accel_takeover_headline(n48::TakeoverVerdict::Started)"));
+ 	CHECK(has(rt, "n48::accel_takeover_verdict(__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE) != 0,"));
+ 	CHECK(has(rt, "print_block(v, waited, facts);"));
+ 	CHECK(has(rt, "n48::TakeoverFacts gather_facts()"));
+@@ -204,7 +210,7 @@ int main(int argc, char **argv) {
+ 	const size_t censusCall = rt.find("print_ttl_census();");
+ 	const size_t censusDef = rt.find("void print_ttl_census() {");
+ 	CHECK(censusDef != std::string::npos && censusCall != std::string::npos && censusDef < censusCall);
+-	CHECK(count_of(rt, "print_ttl_census();") == 1);
++	CHECK(count_of(rt, "print_ttl_census();") == 2);   // print_block + the unarmed announce (0025)
+ 	CHECK(censusCall > startedBranch);   // both verdicts carry it, not just the timeout
+ 	CHECK(censusCall < rt.find("no terminal needed: photograph this screen"));
+ 	CHECK(has(rt, "if (t >= n48::kTakeoverHold) break;"));
+@@ -213,6 +219,10 @@ int main(int argc, char **argv) {
+ 	const size_t nextDef = rt.find("void takeover_start_poller(");
+ 	CHECK(markDef != std::string::npos && markDef < nextDef);
+ 	CHECK(!has(rt.substr(markDef, nextDef - markDef), "IOSleep"));
++	// ...and the unarmed block carries the census too, so a no-watcher boot still names where
++	// Apple's driver went (0025).
++	const size_t censusSecond = rt.find("print_ttl_census();", censusCall + 1);
++	CHECK(censusSecond != std::string::npos && markDef < censusSecond && censusSecond < nextDef);
+ 	// One block per boot, whichever signal wins the race.
+ 	CHECK(has(rt, "__atomic_compare_exchange_n(&gBlockPrinted, &expected, 1u, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)"));
+ 
+-- 
+2.52.0.windows.1
+

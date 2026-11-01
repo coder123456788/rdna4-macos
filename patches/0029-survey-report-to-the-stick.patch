@@ -1,0 +1,901 @@
+0029: the survey writes itself to the boot stick
+
+The -v console was the survey's only channel and it is gone before the boot finishes, so a
+survey could not be carried back. With navi48-survey-report=1 the kext formats the facts the
+survey already read (identity, BAR5, VRAM, IP discovery, firmware choice, IP versions and
+segment bases, DCN allowlist verdict, geometry, PSP state, requested stage) into the fixed
+1536-byte record in NAVI48.TXT, through the same mounted-volume / raw-FAT channels patch
+0027/0028 built for the verdict. The mounted volume is tried first for 30 s before the block
+device, so diskarbitrationd's mount wins whenever it is coming. The report adds no hardware
+access: it is a record of reads the boot already performed. Host suite covers the formatter,
+the cap contract and the realistic worst case (ten IP rows, fifteen segments each) staying
+inside 1536 bytes.
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -140,6 +140,7 @@
+ 	if (!rmmioMap) { N48LOG("mmio: failed to map BAR5"); return false; }
+ 	rmmio     = reinterpret_cast<volatile uint32_t *>(rmmioMap->getVirtualAddress());
+ 	rmmioSize = rmmioMap->getLength();
++	surveyFacts.bar5Bytes = rmmioSize;   // 0029: the survey report's first fact
+ 	N48LOG("mmio: BAR5 mapped, %zu KiB", rmmioSize / 1024);
+ 	return rmmio != nullptr;
+ }
+@@ -514,6 +515,9 @@
+ 	N48LOG("discovery: on-die binary valid, %u IPs", ipDiscovery.ipCount());
+ 	setProperty("Discovery,Source", "on-die TMR");
+ 	setProperty("Discovery,IPCount", static_cast<uint64_t>(ipDiscovery.ipCount()), 16);
++	surveyFacts.discoveryValid = true;   // 0029
++	surveyFacts.discoveryIps = ipDiscovery.ipCount();
++	surveyFacts.discoveryOffset = static_cast<uint32_t>(ipDiscovery.binaryOffset());
+ 	return true;
+ }
+ 
+@@ -553,6 +557,9 @@
+ 		       mp1.major, mp1.minor, mp1.rev, amdgpu::fw_set_name());
+ 		setProperty("FW,SetSource", "PCI id, not confirmed by discovery");
+ 		fwSetConfirmed = false;   // 0012: the writing-stage gate reads this
++		surveyFacts.fwSet = amdgpu::fw_set_name();          // 0029
++		surveyFacts.fwSource = "PCI id (unconfirmed)";
++		surveyFacts.fwConfirmed = false;
+ 		return;
+ 	}
+ 	N48LOG("fw-select: firmware set '%s'%s from GC %u.%u.%u / MP0 %u.%u.%u / MP1 %u.%u.%u%s",
+@@ -562,6 +569,9 @@
+ 	setProperty("FW,Set", amdgpu::fw_set_name());
+ 	setProperty("FW,SetSource", "IP discovery");
+ 	fwSetConfirmed = true;   // 0012: the die named itself; the blobs we hand out are its own
++	surveyFacts.fwSet = amdgpu::fw_set_name();          // 0029
++	surveyFacts.fwSource = "IP discovery";
++	surveyFacts.fwConfirmed = true;
+ }
+ 
+ void Navi48Bringup::surveyIPs() {
+@@ -574,6 +584,20 @@
+ 	for (auto &w : kWanted) {
+ 		IpDiscovery::IpEntry ip;
+ 		if (!ipDiscovery.findIp(w.id, 0, ip)) continue;
++		// 0029: the row the report carries. Three bases per row is enough to name the block;
++		// the DCN DMU line below carries all five display segments.
++		if (surveyFacts.ipCount < n48::kSurveyReportMaxIps) {
++			n48::SurveyReportIp &row = surveyFacts.ip[surveyFacts.ipCount++];
++			row.name = w.name;
++			row.hwId = w.id;
++			row.major = ip.major;
++			row.minor = ip.minor;
++			row.rev = ip.revision;
++			row.numBases = ip.numBases;
++			row.shownBases = ip.numBases < n48::kSurveyReportMaxIpBases
++			               ? ip.numBases : (uint8_t)n48::kSurveyReportMaxIpBases;
++			for (uint8_t s = 0; s < row.shownBases; s++) row.bases[s] = ip.bases[s];
++		}
+ 		N48LOG("ip: %-5s v%u.%u.%u  (%u segment base%s)", w.name, ip.major, ip.minor, ip.revision,
+ 		       ip.numBases, ip.numBases == 1 ? "" : "s");
+ 		char key[32], ver[16];
+@@ -649,10 +673,16 @@
+ 	}
+ 	setProperty("DMU,SegCount", static_cast<uint64_t>(e.numBases), 8);
+ 	setProperty("DMU,Segs", segs);
++	// 0029: the same numbers for the report.
++	surveyFacts.dmuPresent = true;
++	surveyFacts.dmuSegCount = e.numBases;
++	for (uint8_t s = 0; s < shown; s++) surveyFacts.dmuSegs[s] = e.bases[s];
+ 	if (e.numBases < DCN41_NUM_SEGS) {
+ 		N48LOG("dcn-survey: DMU reports %u segments; the display layer needs %u — allowlist cannot arm",
+ 		       e.numBases, DCN41_NUM_SEGS);
+ 		setProperty("DMU,AllowlistArms", false);
++		surveyFacts.dcnAllowArms = false;                 // 0029
++		surveyFacts.dcnReason = "fewer than 5 DMU segments";
+ 		return;
+ 	}
+ 	dcn41_allow_state st {};
+@@ -664,8 +694,11 @@
+ 	       st.rebased, st.rebase_index, st.rebase_overlap);
+ 	setProperty("DMU,AllowlistArms", rc == DCN41_ALLOW_OK);
+ 	setProperty("DMU,AllowlistReason", dcn41_allow_reason_name(rc));
++	surveyFacts.dcnAllowArms = rc == DCN41_ALLOW_OK;      // 0029
++	surveyFacts.dcnReason = dcn41_allow_reason_name(rc);
+ 	// 0013: arming no longer requires these to be Navi 48's bases, so say whether they were moved.
+ 	setProperty("DMU,AllowlistRebased", rc == DCN41_ALLOW_OK && st.rebased != 0u);
++	surveyFacts.dcnRebased = rc == DCN41_ALLOW_OK && st.rebased != 0u;
+ 	if (rc == DCN41_ALLOW_REBASE) {
+ 		setProperty("DMU,AllowlistRange", static_cast<uint64_t>(st.rebase_index < 0 ? 0 : st.rebase_index), 8);
+ 		setProperty("DMU,AllowlistDenial", static_cast<uint64_t>(st.rebase_overlap < 0 ? 0 : st.rebase_overlap), 8);
+@@ -719,6 +752,13 @@
+ 				setProperty("GB_ADDR,ExpectedRBPerSE", static_cast<uint64_t>(expRB), 32);
+ 				setProperty("GB_ADDR,SE_Match", cfg.num_shader_engines == expSE);
+ 				setProperty("GB_ADDR,RB_Match", cfg.num_rb_per_se == expRB);
++				// 0029: geometry for the report.
++				surveyFacts.geometryValid = true;
++				surveyFacts.gbAddrConfig = cfg.gb_addr_config_raw;
++				surveyFacts.numSE = cfg.num_shader_engines;
++				surveyFacts.numRbPerSe = cfg.num_rb_per_se;
++				surveyFacts.expSE = expSE;
++				surveyFacts.expRB = expRB;
+ 			}
+ 		}
+ 	}
+@@ -737,12 +777,21 @@
+ 	setProperty("MMHUB,FBLocationTop", static_cast<uint64_t>(fbTop), 32);
+ 	setProperty("MMHUB,McBase", mcBase, 64);
+ 	setProperty("MMHUB,McTop", mcTop, 64);
++	surveyFacts.fbLocationValid = true;   // 0029
++	surveyFacts.fbLocationBase = fbBase;
++	surveyFacts.fbLocationTop = fbTop;
++	surveyFacts.mcBase = mcBase;
++	surveyFacts.mcTop = mcTop;
+ }
+ 
+ void Navi48Bringup::surveyPSP() {
+ 	uint32_t boot = regReadIp(IpDiscovery::HwMp0, 0, 0, n48::kPspC2PMsg35);
+ 	uint32_t sol  = regReadIp(IpDiscovery::HwMp0, 0, 0, n48::kPspC2PMsg81);
+ 	uint32_t ring = regReadIp(IpDiscovery::HwMp0, 0, 0, n48::kPspC2PMsg64);
++	surveyFacts.pspValuesValid = true;   // 0029: raw values, log and report agree
++	surveyFacts.pspBoot = boot;
++	surveyFacts.pspSos = sol;
++	surveyFacts.pspRing64 = ring;
+ 	N48LOG("psp: boot=0x%08x sos=0x%08x ring64=0x%08x  [bootloader %s, sOS %s, C2PMSG_64 resp-flag %s]",
+ 	       boot, sol, ring, (boot & n48::kPspBootReadyBit) ? "READY" : "not-ready",
+ 	       sol ? "ALIVE" : "down", (ring & n48::kPspRespFlagBit) ? "set" : "clear");
+@@ -783,6 +832,39 @@
+ }
+ 
+ // ---------------------------------------------------------------------------
++// 0029 — navi48-survey-report=1: the survey writes itself to the boot stick.
++//
++// The -v console was the survey's only channel, and it is gone before the boot finishes, so the
++// numbers never came back. The verdict reporter (0027/0028) already proved this file channel on
++// this stick; the survey reuses it unchanged. Everything here is a record of reads the boot has
++// already performed - the reporter adds no hardware access of its own.
++// ---------------------------------------------------------------------------
++void Navi48Bringup::startSurveyReportIfRequested() {
++	uint32_t on = 0;
++	if (!PE_parse_boot_argn("navi48-survey-report", &on, sizeof(on)) || on == 0) return;
++	if (surveyReportStarted) return;
++	surveyReportStarted = true;
++
++	surveyFacts.requestedStage = targetStage;
++	uint32_t irq = 1;
++	PE_parse_boot_argn("navi48-interrupts", &irq, sizeof(irq));
++	surveyFacts.interruptsRequested = irq;
++	surveyFacts.interruptsArmed = intArmed;
++	uint32_t exp = 0, fire = 0;
++	surveyFacts.accelExperimentArmed =
++	    PE_parse_boot_argn("navi48-accel-experiment", &exp, sizeof(exp)) && exp != 0;
++	surveyFacts.accelFireAtBoot =
++	    PE_parse_boot_argn("navi48-accel-fire-at-boot", &fire, sizeof(fire)) && fire != 0;
++
++	char text[n48::kSurveyReportCap];
++	const size_t n = n48::survey_report_text(text, sizeof(text), surveyFacts);
++	N48LOG("survey-report: requested — writing NAVI48.TXT on the boot stick (%zu bytes); "
++	       "the screen says the same and scrolls away", n < sizeof(text) ? n : sizeof(text) - 1);
++	setProperty("Navi48,SurveyReport", "writing NAVI48.TXT on the boot stick");
++	n48::survey_report_start_writer(this, text, sizeof(text));
++}
++
++// ---------------------------------------------------------------------------
+ // navi48-psp=1 — FIRST WRITING STAGE: PSP bootloader chain -> SOS alive
+ // ---------------------------------------------------------------------------
+ 
+@@ -7651,6 +7733,10 @@
+ 	    (device != 0x7550 && device != 0x7551 && device != 0x7590)) {
+ 		N48LOG("probe: 0x%08x not Navi 48 or Navi 44, ignoring", vendorDevice); return nullptr;
+ 	}
++	// 0029: the identity the survey report opens with.
++	surveyFacts.vendorId = static_cast<uint16_t>(vendorDevice & 0xffff);
++	surveyFacts.deviceId = device;
++	surveyFacts.navi44 = (device == 0x7590);
+ 	// Pick the firmware set before any stage can ask for a blob: Navi 44 and
+ 	// Navi 48 share the role names but ship different files (psp_14_0_2_* +
+ 	// gc_12_0_0_* vs psp_14_0_3_* + gc_12_0_1_*). Defaulting to the Navi 48
+@@ -7725,6 +7811,9 @@
+ 		stagePSP();        // no-op unless navi48-psp=1 or navi48-stage>=5
+ 		publishInterruptCounters();
+ 	}
++	// 0029: after the survey (and a stage, if one was asked for), the facts are final. The writer
++	// runs on its own thread and retries until the stick mounts or the block-device channel works.
++	startSurveyReportIfRequested();
+ 	// build 0.0.515: the read-only raster device the AGDC LINKCFG reply reads through
+ 	// (n48dcn::liveRaster), built here - after stagePSP built the device context, before the Phase 4 block below can install
+ 	// any hook that calls it. No register is read or written by attach; it arms nothing (bind() still does that, on verbs 74-77).
+--- a/src/navi48-bringup/src/Navi48Bringup.hpp
++++ b/src/navi48-bringup/src/Navi48Bringup.hpp
+@@ -31,6 +31,7 @@
+ 
+ #include "ipdiscovery.hpp"
+ #include "psp.hpp"
++#include "survey_report.h"    // 0029: the survey's own report, carried off the screen onto the stick
+ #include "amd/amdgpu_regs.h"
+ #include "amd/n48log.h"
+ #include "amd/rebar_pure.h"   // 0.0.663: Resizable BAR planning (pure)
+@@ -116,6 +117,9 @@
+ 	void surveyGeometry(); // GB_ADDR_CONFIG decode + MMHUB FB_LOCATION, both read-only
+ 	void surveyPSP();
+ 	void surveySMU();
++	// 0029: navi48-survey-report=1 - format what the survey just learned and start the stick
++	// writer. Called once, after the survey block, so the facts it carries are the boot's own.
++	void startSurveyReportIfRequested();
+ 	void stagePSP();       // navi48-psp=1 (== navi48-stage=5)
+ 	bool buildDeviceContext();   // fills `dev` for the ported amdgpu modules
+ 	bool mapDoorbells();         // BAR2 -> dev.bar2 (CP/MES/SDMA stages)
+@@ -189,6 +193,11 @@
+ 	bool               fwSetConfirmed { false };
+ 	bool               accelExperimentArmed { false };
+ 	bool               accelExperimentFired { false };
++	// 0029: what the survey saw, filled as each survey step reads it and written to the stick
++	// only when navi48-survey-report=1. Plain data (survey_report.h) so the formatter stays
++	// host-testable.
++	n48::SurveyReportFacts surveyFacts {};
++	bool               surveyReportStarted { false };
+ };
+ 
+ #endif /* Navi48Bringup_hpp */
+--- a/src/navi48-bringup/src/accel_takeover.cpp
++++ b/src/navi48-bringup/src/accel_takeover.cpp
+@@ -10,6 +10,7 @@
+ #include "accel_takeover_report.h"
+ #include "accel_report_file.h"
+ #include "accel_report_raw.h"
++#include "survey_report.h"     // 0029: the survey's own record, same file and channels
+ 
+ #include "amd/n48log.h"
+ #include "apple/Navi48Ttl.hpp"
+@@ -49,6 +50,11 @@
+ constexpr int kUIO_SYSSPACE = 2;
+ constexpr int kFWRITE = 0x0002;
+ constexpr int kEIO = 5;
++// 0029: the survey report starts at start(), long before diskarbitrationd has had a chance to
++// mount the stick. The block device is only touched after this grace, so the mounted-volume
++// channel (the file system's own, safe one) wins whenever a mount is coming; the raw channel
++// stays the fallback for the boots where no mount ever happens.
++constexpr uint32_t kSurveyVfsGraceSeconds = 30;
+ } // namespace
+ 
+ #define TAKELOG(fmt, ...) ::amdgpu::n48_logf("takeover: " fmt "\n", ##__VA_ARGS__)
+@@ -252,6 +258,43 @@
+         TAKELOG("report file never written: %s never became writable", n48::kReportFilePath);
+ }
+ 
++// 0029: the survey report travels the same road as the verdict report: the fixed 1536-byte
++// record, /Volumes/OPENCORE/NAVI48.TXT first, the file's own data cluster through the block
++// device second. There is no verdict to wait for - the survey was complete when start() called
++// this - so it starts at once and retries only while neither channel works.
++volatile uint32_t gSurveyStarted;
++volatile uintptr_t gSurveyClient;
++char gSurveyText[n48::kSurveyReportCap];
++
++void survey_report_thread(void *, wait_result_t) {
++    IOService *client = (IOService *)__atomic_load_n(&gSurveyClient, __ATOMIC_ACQUIRE);
++    bool saidGrace = false;
++    for (uint32_t t = 0; t < n48::kReportFileRetrySeconds; t++) {
++        const int vfsErr = write_report_file(gSurveyText, sizeof gSurveyText);
++        int err = vfsErr;
++        const char *channel = "the mounted volume";
++        if (err != 0 && t >= kSurveyVfsGraceSeconds) {
++            err = n48::report_raw_write(client, gSurveyText, sizeof gSurveyText);
++            channel = "the block device (stick not mounted)";
++        }
++        if (err == 0) {
++            TAKELOG("survey report written to %s through %s (%llu bytes) - no photograph needed",
++                    n48::kReportFilePath, channel, (unsigned long long)sizeof gSurveyText);
++            return;
++        }
++        if (t == 0)
++            TAKELOG("survey report not writable yet: volume %d; retrying, block device after %u s",
++                    vfsErr, kSurveyVfsGraceSeconds);
++        if (t == kSurveyVfsGraceSeconds && !saidGrace) {
++            TAKELOG("survey report: volume still absent after %u s - trying the block device",
++                    kSurveyVfsGraceSeconds);
++            saidGrace = true;
++        }
++        IOSleep(1000);
++    }
++    TAKELOG("survey report never written: %s never became writable", n48::kReportFilePath);
++}
++
+ void print_block(n48::TakeoverVerdict v, uint32_t waited, const n48::TakeoverFacts &f) {
+     for (uint32_t t = 0; t <= n48::kTakeoverHold; t++) {
+         TAKELOG("========== NAVI 44 TAKEOVER REPORT %u/%u ==========", t, n48::kTakeoverHold);
+@@ -358,4 +401,35 @@
+             kReportFilePath);
+ }
+ 
++// 0029: the survey's own record on the same file. Called once from start() when
++// navi48-survey-report=1; the text was formatted from facts the survey had already read, so all
++// this does is copy, pad to the fixed length, and hand it to the same two channels.
++void survey_report_start_writer(::IOService *client, const char *text, size_t len) {
++    if (!text || len == 0 || len > kSurveyReportCap) return;
++    uint32_t expected = 0;
++    if (!__atomic_compare_exchange_n(&gSurveyStarted, &expected, 1u, false, __ATOMIC_ACQ_REL,
++                                     __ATOMIC_ACQUIRE)) return;
++    // One file, one writer: if the verdict reporter already owns this boot's NAVI48.TXT, its
++    // record is the one that must survive.
++    if (__atomic_load_n(&gWriterStarted, __ATOMIC_ACQUIRE)) {
++        TAKELOG("survey report skipped: the verdict reporter already owns %s this boot",
++                kReportFilePath);
++        return;
++    }
++    size_t n = len < kSurveyReportCap ? len : kSurveyReportCap - 1;
++    for (size_t i = 0; i < n; i++) gSurveyText[i] = text[i];
++    // A fixed-length write, like the verdict report: the survey plus spaces, so an earlier boot's
++    // longer record can never leave a tail under this boot's shorter one.
++    for (size_t i = n; i < sizeof gSurveyText; i++) gSurveyText[i] = ' ';
++    __atomic_store_n(&gSurveyClient, (uintptr_t)client, __ATOMIC_RELEASE);
++    thread_t th = nullptr;
++    const kern_return_t kr = kernel_thread_start(&survey_report_thread, nullptr, &th);
++    if (kr != KERN_SUCCESS) {
++        TAKELOG("kernel_thread_start failed (0x%x) - no survey report on this boot", kr);
++        return;
++    }
++    thread_deallocate(th);
++    TAKELOG("survey report thread started; it writes %s", kReportFilePath);
++}
++
+ } // namespace n48
+--- /dev/null
++++ b/src/navi48-bringup/src/survey_report.h
+@@ -0,0 +1,274 @@
++//  survey_report.h — patch 0029: the survey leaves the screen and lands on the stick.
++//
++//  0027/0028 taught the verdict to write itself to E:\NAVI48.TXT. The survey never learned it:
++//  every fact it produces goes to the -v console, and on this machine the console scrolls away
++//  before the owner can read it - the boot finishes, the screen is cleared, and the numbers are
++//  gone. A survey whose output cannot be carried back is not a measurement.
++//
++//  This is the same channel as the verdict report and the same file, so nothing new has to be
++//  mounted, named, or typed: the boot stick's NAVI48.TXT, first 1536 bytes, rewritten on every
++//  boot that carries navi48-survey-report=1. The mounted volume is tried first, the block device
++//  second (accel_report_raw.h), exactly as in accel_report_file.h / accel_takeover.cpp.
++//
++//  Read-only in the only sense that matters here: the formatter touches no hardware and no IOKit,
++//  so the host suite checks every line on a machine with no Mac and no GPU. The caller fills the
++//  facts from registers the survey has already read.
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++
++class IOService;
++
++namespace n48 {
++
++// The fixed record length the raw writer accepts (accel_report_file.h: kReportFileWriteCap).
++constexpr uint32_t kSurveyReportCap = 1536;
++constexpr uint32_t kSurveyReportMaxIps = 10;
++constexpr uint32_t kSurveyReportMaxIpBases = 3;   // per IP row; DCN has its own five-segment line
++constexpr uint32_t kSurveyReportMaxDmuSegs = 5;
++
++struct SurveyReportIp {
++    const char *name;      // static string owned by the survey, never null when a row is filled
++    uint16_t hwId;
++    uint8_t major, minor, rev;
++    uint8_t numBases;      // segments the die reports
++    uint8_t shownBases;    // first N of them, N <= kSurveyReportMaxIpBases
++    uint32_t bases[kSurveyReportMaxIpBases];
++};
++
++struct SurveyReportFacts {
++    uint16_t vendorId;
++    uint16_t deviceId;
++    bool navi44;
++    uint64_t bar5Bytes;
++    uint32_t vramMB;
++    bool discoveryValid;
++    uint32_t discoveryIps;
++    uint32_t discoveryOffset;   // where the binary sits inside the TMR
++    const char *fwSet;          // static, e.g. "navi44"; null = not selected
++    const char *fwSource;       // static, "IP discovery" / "PCI id"; null = not selected
++    bool fwConfirmed;
++
++    uint32_t ipCount;
++    SurveyReportIp ip[kSurveyReportMaxIps];
++
++    bool dmuPresent;
++    uint8_t dmuSegCount;
++    uint32_t dmuSegs[kSurveyReportMaxDmuSegs];
++    bool dcnAllowArms;
++    bool dcnRebased;
++    const char *dcnReason;      // static, dcn41_allow_reason_name(); null = not asked
++
++    bool geometryValid;
++    uint32_t gbAddrConfig;
++    uint32_t numSE, numRbPerSe, expSE, expRB;
++
++    bool fbLocationValid;
++    uint32_t fbLocationBase, fbLocationTop;
++    uint64_t mcBase, mcTop;
++
++    bool pspValuesValid;
++    uint32_t pspBoot, pspSos, pspRing64;
++
++    uint32_t requestedStage;
++    uint32_t interruptsRequested;
++    bool interruptsArmed;
++    bool accelExperimentArmed;
++    bool accelFireAtBoot;
++};
++
++// Pure; snprintf semantics: returns the length the full text needs, always NUL-terminates when
++// cap > 0, counts without writing when out is null. One fact per line, so a truncated file still
++// reads from the top down.
++inline size_t survey_report_text(char *out, size_t cap, const SurveyReportFacts &f) {
++    struct W {
++        char *out;
++        size_t cap, len;
++        void ch(char c) { if (out && len + 1 < cap) out[len] = c; len++; }
++        void str(const char *s) { while (s && *s) ch(*s++); }
++        void dec(uint64_t v) {
++            char b[20];
++            int i = 0;
++            if (!v) { ch('0'); return; }
++            while (v) { b[i++] = (char)('0' + (v % 10)); v /= 10; }
++            while (i) ch(b[--i]);
++        }
++        void hex4(uint16_t v) {
++            static const char h[] = "0123456789abcdef";
++            for (int s = 12; s >= 0; s -= 4) ch(h[(v >> s) & 15]);
++        }
++        void hex8(uint32_t v) {
++            static const char h[] = "0123456789abcdef";
++            for (int s = 28; s >= 0; s -= 4) ch(h[(v >> s) & 15]);
++        }
++        void hex16(uint64_t v) {
++            static const char h[] = "0123456789abcdef";
++            for (int s = 60; s >= 0; s -= 4) ch(h[(v >> s) & 15]);
++        }
++        void finish() { if (out && cap) out[len < cap ? len : cap - 1] = 0; }
++    } w = { out, cap, 0 };
++
++    w.str("navi48 survey report - patch 0029; written by the kext, no photograph needed\n");
++    w.str("card: vendor 0x");
++    w.hex4(f.vendorId);
++    w.str(" device 0x");
++    w.hex4(f.deviceId);
++    w.str(" navi44=");
++    w.dec(f.navi44 ? 1u : 0u);
++    w.ch('\n');
++
++    w.str("bar5: ");
++    w.dec(f.bar5Bytes);
++    w.str(f.bar5Bytes ? " bytes\n" : " bytes (not mapped)\n");
++    w.str("vram: ");
++    w.dec(f.vramMB);
++    w.str(f.vramMB ? " MiB\n" : " MiB (not read)\n");
++
++    w.str("discovery: valid=");
++    w.dec(f.discoveryValid ? 1u : 0u);
++    w.str(" ips=");
++    w.dec(f.discoveryIps);
++    w.str(" offset=0x");
++    w.hex8(f.discoveryOffset);
++    w.ch('\n');
++
++    w.str("firmware: ");
++    if (f.fwSet) {
++        w.str(f.fwSet);
++        w.str(" via ");
++        w.str(f.fwSource ? f.fwSource : "(unknown source)");
++        w.str(", confirmed=");
++        w.dec(f.fwConfirmed ? 1u : 0u);
++    } else {
++        w.str("(not selected)");
++    }
++    w.ch('\n');
++
++    for (uint32_t i = 0; i < f.ipCount && i < kSurveyReportMaxIps; i++) {
++        const SurveyReportIp &r = f.ip[i];
++        w.str("ip: ");
++        w.str(r.name ? r.name : "?");
++        w.str(" v");
++        w.dec(r.major);
++        w.ch('.');
++        w.dec(r.minor);
++        w.ch('.');
++        w.dec(r.rev);
++        w.str(" bases=");
++        w.dec(r.numBases);
++        w.ch(':');
++        const uint8_t shown = r.shownBases < kSurveyReportMaxIpBases
++                            ? r.shownBases : (uint8_t)kSurveyReportMaxIpBases;
++        for (uint8_t s = 0; s < shown; s++) {
++            w.ch(' ');
++            w.hex8(r.bases[s]);
++        }
++        if (r.numBases > shown) {
++            w.str(" +");
++            w.dec((uint32_t)(r.numBases - shown));
++        }
++        w.ch('\n');
++    }
++
++    if (!f.dmuPresent) {
++        w.str("dcn: no DMU entry in discovery\n");
++    } else {
++        w.str("dcn: dmu segs=");
++        w.dec(f.dmuSegCount);
++        w.ch(':');
++        const uint8_t shown = f.dmuSegCount < kSurveyReportMaxDmuSegs
++                            ? f.dmuSegCount : (uint8_t)kSurveyReportMaxDmuSegs;
++        for (uint8_t s = 0; s < shown; s++) {
++            w.ch(' ');
++            w.hex8(f.dmuSegs[s]);
++        }
++        w.str(" allowlist=");
++        w.str(f.dcnAllowArms ? "ARM" : "REFUSE");
++        w.str(" rebased=");
++        w.dec(f.dcnRebased ? 1u : 0u);
++        w.str(" reason=");
++        w.str(f.dcnReason ? f.dcnReason : "(not asked)");
++        w.ch('\n');
++    }
++
++    if (!f.geometryValid) {
++        w.str("geometry: GB_ADDR_CONFIG not decoded\n");
++    } else {
++        w.str("geometry: GB_ADDR_CONFIG=0x");
++        w.hex8(f.gbAddrConfig);
++        w.str(" SE=");
++        w.dec(f.numSE);
++        w.str(" RB/SE=");
++        w.dec(f.numRbPerSe);
++        w.str(" (die caps ");
++        w.dec(f.expSE);
++        w.ch('/');
++        w.dec(f.expRB);
++        w.str(")\n");
++    }
++
++    if (!f.fbLocationValid) {
++        w.str("fb_location: unreadable\n");
++    } else {
++        w.str("fb_location: base=0x");
++        w.hex8(f.fbLocationBase);
++        w.str(" top=0x");
++        w.hex8(f.fbLocationTop);
++        w.str(" mc=0x");
++        w.hex16(f.mcBase);
++        w.str(" top=0x");
++        w.hex16(f.mcTop);
++        w.ch('\n');
++    }
++
++    if (!f.pspValuesValid) {
++        w.str("psp: not read\n");
++    } else {
++        w.str("psp: C2PMSG_35=0x");
++        w.hex8(f.pspBoot);
++        w.str(" C2PMSG_81=0x");
++        w.hex8(f.pspSos);
++        w.str(" C2PMSG_64=0x");
++        w.hex8(f.pspRing64);
++        w.ch('\n');
++    }
++
++    w.str("mode: ");
++    if (f.requestedStage == 0) {
++        w.str("survey only");
++    } else {
++        w.str("stage=");
++        w.dec(f.requestedStage);
++        w.str(" requested");
++    }
++    w.str("; interrupts=");
++    w.dec(f.interruptsRequested);
++    w.str(" (armed=");
++    w.dec(f.interruptsArmed ? 1u : 0u);
++    w.ch(')');
++    w.str("; accel-experiment=");
++    w.dec(f.accelExperimentArmed ? 1u : 0u);
++    w.str(" fire-at-boot=");
++    w.dec(f.accelFireAtBoot ? 1u : 0u);
++    w.ch('\n');
++
++    w.str("writes: ");
++    if (f.requestedStage == 0 && !f.accelExperimentArmed && !f.accelFireAtBoot) {
++        w.str("none requested beyond the IP-discovery read (no stage, no PSP mailbox, no accel fire)\n");
++    } else {
++        w.str("a writing stage or the accel experiment was requested - see the screen log\n");
++    }
++    w.str("end of survey report - fixed 1536-byte record, rewritten every boot\n");
++
++    w.finish();
++    return w.len;
++}
++
++// ---- runtime, defined in accel_takeover.cpp ----
++// Copies/pads `text` to the fixed record and writes NAVI48.TXT through the mounted volume, then
++// the block device, retrying for kReportFileRetrySeconds. client is the IOService the raw channel
++// opens the stick as. Safe to call once per boot; later calls are ignored.
++void survey_report_start_writer(::IOService *client, const char *text, size_t len);
++
++} // namespace n48
+--- /dev/null
++++ b/src/navi48-bringup/tests/survey_report_test.cpp
+@@ -0,0 +1,288 @@
++//  survey_report_test.cpp — host suite for patch 0029, the survey that writes itself to the stick.
++//
++//  Build (any machine, no Mac, no GPU):
++//    zig c++ -std=c++17 -Wall -Wextra -O1 -I src tests/survey_report_test.cpp -o /tmp/survey_report_test.exe
++//    /tmp/survey_report_test.exe .
++//
++//  argv[1] is the navi48-bringup root, used by the source-pin sections.
++//
++//  Why a suite for a formatter: the survey's report is the only thing this machine can carry back
++//  from a boot - the -v console is gone before the boot ends. If a line stops being emitted, or
++//  the record grows past the 1536 bytes the raw writer accepts, the next patch is aimed at a
++//  boot that never reported. The worst-case section is the guard against exactly that.
++
++#include "survey_report.h"
++
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <sstream>
++#include <string>
++
++static int gChecks = 0, gFailures = 0;
++static void report(const char *file, int line, const char *what, bool ok) {
++	gChecks++;
++	if (ok) return;
++	gFailures++;
++	printf("FAIL %s:%d: %s\n", file, line, what);
++}
++#define CHECK(cond) report(__FILE__, __LINE__, #cond, (cond))
++
++namespace {
++
++std::string slurp(const std::string &path) {
++	std::ifstream in(path, std::ios::binary);
++	if (!in) return "";
++	std::ostringstream ss;
++	ss << in.rdbuf();
++	std::string s = ss.str();
++	for (auto &c : s) if (c == '\r') c = '\n';
++	while (!s.empty() && s.back() == '\n') s.pop_back();
++	return s;
++}
++
++bool has(const std::string &hay, const std::string &needle) {
++	return hay.find(needle) != std::string::npos;
++}
++
++// The full picture a working Navi 44 survey produces, with realistic segment counts.
++n48::SurveyReportFacts full_facts() {
++	n48::SurveyReportFacts f = {};
++	f.vendorId = 0x1002;
++	f.deviceId = 0x7590;
++	f.navi44 = true;
++	f.bar5Bytes = 16u * 1024u * 1024u;
++	f.vramMB = 16368;
++	f.discoveryValid = true;
++	f.discoveryIps = 46;
++	f.discoveryOffset = 0x34900;
++	f.fwSet = "navi44";
++	f.fwSource = "IP discovery";
++	f.fwConfirmed = true;
++
++	struct Row { const char *name; uint16_t id; uint8_t maj, min, rev, nb; uint32_t base; };
++	const Row rows[] = {
++		{ "GC",    11, 12, 0, 0,  2, 0x00001260 },
++		{ "MMHUB", 34,  1, 0, 0,  4, 0x00000000 },
++		{ "PSP",  255, 14, 0, 2, 15, 0x00000000 },
++		{ "SMU",    1, 14, 0, 2,  1, 0x00016000 },
++		{ "SDMA",  42,  7, 0, 0,  2, 0x0001a000 },
++		{ "IH",    40,  7, 0, 0,  2, 0x0001c000 },
++		{ "NBIF", 108,  6, 3, 1,  1, 0x00000000 },
++		{ "DCN",  271,  4, 1, 0,  5, 0x00000012 },
++		{ "HDP",   41,  7, 0, 0,  1, 0x0000d000 },
++		{ "UMC",  150,  8, 0, 0,  2, 0x00014000 },
++	};
++	f.ipCount = sizeof(rows) / sizeof(rows[0]);
++	for (uint32_t i = 0; i < f.ipCount; i++) {
++		n48::SurveyReportIp &r = f.ip[i];
++		r.name = rows[i].name;
++		r.hwId = rows[i].id;
++		r.major = rows[i].maj;
++		r.minor = rows[i].min;
++		r.rev = rows[i].rev;
++		r.numBases = rows[i].nb;
++		r.shownBases = r.numBases < n48::kSurveyReportMaxIpBases
++		             ? r.numBases : (uint8_t)n48::kSurveyReportMaxIpBases;
++		for (uint8_t s = 0; s < r.shownBases; s++) r.bases[s] = rows[i].base + s;
++	}
++
++	f.dmuPresent = true;
++	f.dmuSegCount = 5;
++	f.dmuSegs[0] = 0x00000012;
++	f.dmuSegs[1] = 0x000000c0;
++	f.dmuSegs[2] = 0x000034c0;
++	f.dmuSegs[3] = 0x00009000;
++	f.dmuSegs[4] = 0x02403c00;
++	f.dcnAllowArms = true;
++	f.dcnRebased = false;
++	f.dcnReason = "ok";
++
++	f.geometryValid = true;
++	f.gbAddrConfig = 0x0000a008;
++	f.numSE = 4;
++	f.numRbPerSe = 2;
++	f.expSE = 2;
++	f.expRB = 2;
++
++	f.fbLocationValid = true;
++	f.fbLocationBase = 0x00000001;
++	f.fbLocationTop = 0x00000111;
++	f.mcBase = 0x0000000001000000ull;
++	f.mcTop = 0x0000000111000000ull;
++
++	f.pspValuesValid = true;
++	f.pspBoot = 0x00000000;
++	f.pspSos = 0x00000000;
++	f.pspRing64 = 0x00000000;
++
++	f.requestedStage = 0;
++	f.interruptsRequested = 0;
++	f.interruptsArmed = false;
++	f.accelExperimentArmed = false;
++	f.accelFireAtBoot = false;
++	return f;
++}
++
++std::string format(const n48::SurveyReportFacts &f) {
++	char buf[n48::kSurveyReportCap];
++	const size_t n = n48::survey_report_text(buf, sizeof buf, f);
++	return std::string(buf, n < sizeof buf ? n : sizeof buf - 1);
++}
++
++} // namespace
++
++int main(int argc, char **argv) {
++	const std::string root = argc > 1 ? argv[1] : ".";
++
++	// ---------------------------------------------------------------- A: the whole picture
++	const n48::SurveyReportFacts full = full_facts();
++	const std::string t = format(full);
++	CHECK(!t.empty());
++	CHECK(has(t, "navi48 survey report - patch 0029"));
++	CHECK(has(t, "card: vendor 0x1002 device 0x7590 navi44=1"));
++	CHECK(has(t, "bar5: 16777216 bytes"));
++	CHECK(has(t, "vram: 16368 MiB"));
++	CHECK(has(t, "discovery: valid=1 ips=46 offset=0x00034900"));
++	CHECK(has(t, "firmware: navi44 via IP discovery, confirmed=1"));
++	CHECK(has(t, "ip: GC v12.0.0 bases=2: 00001260 00001261"));
++	// A 15-segment block keeps its first three and says how many were left out.
++	CHECK(has(t, "ip: PSP v14.0.2 bases=15: 00000000 00000001 00000002 +12"));
++	CHECK(has(t, "ip: DCN v4.1.0 bases=5: 00000012 00000013 00000014 +2"));
++	CHECK(has(t, "dcn: dmu segs=5: 00000012 000000c0 000034c0 00009000 02403c00 allowlist=ARM rebased=0 reason=ok"));
++	CHECK(has(t, "geometry: GB_ADDR_CONFIG=0x0000a008 SE=4 RB/SE=2 (die caps 2/2)"));
++	CHECK(has(t, "fb_location: base=0x00000001 top=0x00000111 mc=0x0000000001000000 top=0x0000000111000000"));
++	CHECK(has(t, "psp: C2PMSG_35=0x00000000 C2PMSG_81=0x00000000 C2PMSG_64=0x00000000"));
++	CHECK(has(t, "mode: survey only; interrupts=0 (armed=0); accel-experiment=0 fire-at-boot=0"));
++	CHECK(has(t, "writes: none requested beyond the IP-discovery read"));
++	CHECK(has(t, "end of survey report"));
++	CHECK(t.back() == '\n');
++	CHECK(t.size() < n48::kSurveyReportCap);
++
++	// ---------------------------------------------------------------- B: a denied allowlist
++	n48::SurveyReportFacts denied = full_facts();
++	denied.dcnAllowArms = false;
++	denied.dcnReason = "outside every display range - the DEFAULT";
++	const std::string td = format(denied);
++	CHECK(has(td, "allowlist=REFUSE"));
++	CHECK(has(td, "reason=outside every display range - the DEFAULT"));
++	CHECK(!has(td, "allowlist=ARM"));
++
++	// ---------------------------------------------------------------- C: a partial / empty survey
++	n48::SurveyReportFacts empty = {};
++	const std::string te = format(empty);
++	CHECK(has(te, "card: vendor 0x0000 device 0x0000 navi44=0"));
++	CHECK(has(te, "bar5: 0 bytes (not mapped)"));
++	CHECK(has(te, "vram: 0 MiB (not read)"));
++	CHECK(has(te, "discovery: valid=0 ips=0 offset=0x00000000"));
++	CHECK(has(te, "firmware: (not selected)"));
++	CHECK(!has(te, "ip: "));                 // no rows invented
++	CHECK(has(te, "dcn: no DMU entry in discovery"));
++	CHECK(has(te, "geometry: GB_ADDR_CONFIG not decoded"));
++	CHECK(has(te, "fb_location: unreadable"));
++	CHECK(has(te, "psp: not read"));
++	CHECK(has(te, "mode: survey only"));
++	CHECK(has(te, "writes: none requested"));
++	CHECK(te.size() < 768);
++
++	// A boot that asked for a writing stage must not claim it wrote nothing.
++	n48::SurveyReportFacts staged = full_facts();
++	staged.requestedStage = 17;
++	staged.accelExperimentArmed = true;
++	staged.accelFireAtBoot = true;
++	staged.interruptsRequested = 1;
++	staged.interruptsArmed = true;
++	const std::string ts = format(staged);
++	CHECK(has(ts, "mode: stage=17 requested; interrupts=1 (armed=1); accel-experiment=1 fire-at-boot=1"));
++	CHECK(has(ts, "writes: a writing stage or the accel experiment was requested"));
++	CHECK(!has(ts, "writes: none requested"));
++
++	// ---------------------------------------------------------------- D: the cap contract
++	{
++		char canary[64];
++		std::memset(canary, 0xAA, sizeof canary);
++		const size_t need = n48::survey_report_text(canary, 10, full);
++		CHECK(need > 10);
++		CHECK(canary[9] == 0);                       // NUL inside the cap
++		for (size_t i = 10; i < sizeof canary; i++) CHECK((unsigned char)canary[i] == 0xAA);
++
++		std::memset(canary, 0xAA, sizeof canary);
++		const size_t one = n48::survey_report_text(canary, 1, full);
++		CHECK(one == need);
++		CHECK(canary[0] == 0);
++		for (size_t i = 1; i < sizeof canary; i++) CHECK((unsigned char)canary[i] == 0xAA);
++
++		std::memset(canary, 0xAA, sizeof canary);
++		const size_t zero = n48::survey_report_text(canary, 0, full);
++		CHECK(zero == need);
++		for (size_t i = 0; i < sizeof canary; i++) CHECK((unsigned char)canary[i] == 0xAA);
++
++		// Counting without writing must agree with the real run.
++		CHECK(n48::survey_report_text(nullptr, 0, full) == need);
++		char whole[n48::kSurveyReportCap];
++		const size_t n = n48::survey_report_text(whole, sizeof whole, full);
++		CHECK(n == need);
++		CHECK(n < sizeof whole);
++		CHECK(whole[n] == 0);
++	}
++
++	// ---------------------------------------------------------------- E: the worst case
++	// Ten rows that each report fifteen segments: the largest record the survey can hand over.
++	// If this ever outgrows the raw writer's 1536-byte record, the tail (psp, mode, writes,
++	// footer) would be silently cut and the boot would look complete and be wrong.
++	n48::SurveyReportFacts worst = full_facts();
++	for (uint32_t i = 0; i < n48::kSurveyReportMaxIps; i++) {
++		n48::SurveyReportIp &r = worst.ip[i];
++		r.name = "MMHUB";
++		r.numBases = 15;
++		r.shownBases = (uint8_t)n48::kSurveyReportMaxIpBases;
++	}
++	const std::string tw = format(worst);
++	CHECK(tw.size() < n48::kSurveyReportCap);
++	CHECK(has(tw, "psp: C2PMSG_35="));
++	CHECK(has(tw, "mode: survey only"));
++	CHECK(has(tw, "writes: none requested"));
++	CHECK(has(tw, "end of survey report"));
++
++	// ---------------------------------------------------------------- F: the wiring
++	const std::string src = slurp(root + "/src/Navi48Bringup.cpp");
++	const std::string hpp = slurp(root + "/src/Navi48Bringup.hpp");
++	const std::string take = slurp(root + "/src/accel_takeover.cpp");
++	const std::string hdr = slurp(root + "/src/survey_report.h");
++	CHECK(!src.empty() && !hpp.empty() && !take.empty() && !hdr.empty());
++
++	CHECK(has(src, "PE_parse_boot_argn(\"navi48-survey-report\", &on, sizeof(on))"));
++	CHECK(has(src, "n48::survey_report_text(text, sizeof(text), surveyFacts)"));
++	CHECK(has(src, "n48::survey_report_start_writer(this, text, sizeof(text))"));
++	CHECK(has(src, "setProperty(\"Navi48,SurveyReport\""));
++	// The report is started after the survey (and any stage) and before the display attaches.
++	CHECK(src.find("surveyPSP();") < src.find("startSurveyReportIfRequested();"));
++	CHECK(src.find("startSurveyReportIfRequested();") < src.find("n48dcn::attach(this);"));
++	// A report must never pretend a writing stage ran when none was requested.
++	CHECK(has(src, "f.requestedStage == 0 && !f.accelExperimentArmed && !f.accelFireAtBoot") ||
++	      has(hdr, "f.requestedStage == 0 && !f.accelExperimentArmed && !f.accelFireAtBoot"));
++
++	CHECK(has(hpp, "#include \"survey_report.h\""));
++	CHECK(has(hpp, "void startSurveyReportIfRequested();"));
++	CHECK(has(hpp, "n48::SurveyReportFacts surveyFacts"));
++	CHECK(has(hpp, "bool               surveyReportStarted"));
++
++	CHECK(has(take, "void survey_report_start_writer(::IOService *client, const char *text, size_t len)"));
++	CHECK(has(take, "write_report_file(gSurveyText, sizeof gSurveyText)"));
++	CHECK(has(take, "n48::report_raw_write(client, gSurveyText, sizeof gSurveyText)"));
++	CHECK(has(take, "kernel_thread_start(&survey_report_thread"));
++	CHECK(has(take, "if (__atomic_load_n(&gWriterStarted, __ATOMIC_ACQUIRE))"));
++
++	CHECK(has(hdr, "kSurveyReportCap = 1536"));
++	CHECK(has(hdr, "survey_report_text"));
++	CHECK(!has(hdr, "#include <IOKit"));
++	CHECK(!has(hdr, "setProperty"));
++	CHECK(!has(hdr, "IOLog("));
++	CHECK(!has(hdr, "pe_parse_boot_argn"));
++	// The runtime declaration is here; the implementation belongs to the writer, not the formatter.
++	CHECK(has(hdr, "void survey_report_start_writer(::IOService *client, const char *text, size_t len);"));
++
++	if (gFailures == 0) printf("OK: %d checks, 0 failures\n", gChecks);
++	else                printf("%d checks, %d failures\n", gChecks, gFailures);
++	return gFailures == 0 ? 0 : 1;
++}

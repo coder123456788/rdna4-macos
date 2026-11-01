@@ -1,0 +1,65 @@
+diff --git a/src/navi48-bringup/Info.plist b/src/navi48-bringup/Info.plist
+index 387e577..2a593ab 100644
+--- a/src/navi48-bringup/Info.plist
++++ b/src/navi48-bringup/Info.plist
+@@ -29,7 +29,7 @@
+ 			<key>IOMatchCategory</key>
+ 			<string>ATIFramebuffer</string>
+ 			<key>IOPCIPrimaryMatch</key>
+-			<string>0x75501002 0x75511002</string>
++			<string>0x75501002 0x75511002 0x75901002</string>
+ 			<key>IOProbeScore</key>
+ 			<integer>5000</integer>
+ 			<key>IOProviderClass</key>
+@@ -44,7 +44,7 @@
+ 			<key>IOMatchCategory</key>
+ 			<string>IOAccelerator</string>
+ 			<key>IOPCIPrimaryMatch</key>
+-			<string>0x75501002 0x75511002</string>
++			<string>0x75501002 0x75511002 0x75901002</string>
+ 			<key>IOPersonalityPublisher</key>
+ 			<string>com.navi48.bringup</string>
+ 			<key>IOProbeScore</key>
+@@ -66,7 +66,7 @@
+ 			<key>IOMatchCategory</key>
+ 			<string>AMDRadeonX6000HWServices</string>
+ 			<key>IOPCIPrimaryMatch</key>
+-			<string>0x75501002 0x75511002</string>
++			<string>0x75501002 0x75511002 0x75901002</string>
+ 			<key>IOPersonalityPublisher</key>
+ 			<string>com.navi48.bringup</string>
+ 			<key>IOProbeScore</key>
+@@ -83,7 +83,7 @@
+ 			<key>IOMatchCategory</key>
+ 			<string>Navi48Bringup</string>
+ 			<key>IOPCIPrimaryMatch</key>
+-			<string>0x75501002 0x75511002</string>
++			<string>0x75501002 0x75511002 0x75901002</string>
+ 			<key>IOProbeScore</key>
+ 			<integer>10000</integer>
+ 			<key>IOProviderClass</key>
+diff --git a/src/navi48-bringup/src/Navi48Bringup.cpp b/src/navi48-bringup/src/Navi48Bringup.cpp
+index 6d46338..59d08bc 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -7332,8 +7332,18 @@ IOService *Navi48Bringup::probe(IOService *provider, SInt32 *score) {
+ 	if (!pci) return nullptr;
+ 	uint32_t vendorDevice = pci->configRead32(kIOPCIConfigVendorID);
+ 	uint16_t device = static_cast<uint16_t>(vendorDevice >> 16);
+-	if ((vendorDevice & 0xffff) != 0x1002 || (device != 0x7550 && device != 0x7551)) {
+-		N48LOG("probe: 0x%08x not Navi 48, ignoring", vendorDevice); return nullptr;
++	if ((vendorDevice & 0xffff) != 0x1002 ||
++	    (device != 0x7550 && device != 0x7551 && device != 0x7590)) {
++		N48LOG("probe: 0x%08x not Navi 48 or Navi 44, ignoring", vendorDevice); return nullptr;
++	}
++	if (device == 0x7590) {
++		// Navi 44 (RX 9050 / 9060 XT): DCN 4.1.0 display, GC 12.0.0, a smaller die.
++		// This match arms NOTHING: every writing stage keeps its own boot-arg
++		// (targetStage stays 0, stagePSP() returns at its first line), so the boot
++		// runs the read-only survey and publishes the die's real IP versions and
++		// DMU segment bases. That survey is the entire purpose of matching here.
++		N48LOG("probe: Navi 44 RX 9050/9060 XT (0x7590) — SURVEY ONLY, no writing stage armed");
++		return this;
+ 	}
+ 	N48LOG("probe: Navi 48 %s (0x%04x) — bring-up enabled", device == 0x7550 ? "RX 9070/XT" : "R9700", device);
+ 	return this;

@@ -1,0 +1,535 @@
+From 7bda5531aaf97b9b626f9c5cd0e806f2ae5224ea Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Fri, 30 Oct 2026 14:35:22 -0700
+Subject: [PATCH] 0019: put the acceleration verdict on the boot screen
+
+Every acceleration answer this port produces landed in ioreg, in the collector's
+acceleration.txt, or behind a userspace verb - a mount, a terminal or a keystroke,
+and this machine has none of them inside macOS: its keyboard still does not work
+after boot. N48LOG writes through IOLog, which -v prints during start(), so the
+screen is the one channel left.
+
+src/accel_boot_report.h owns whether to print (only when the fire arg was passed,
+since a report on a boot that asked for nothing reads like a verdict), and the one
+sentence an owner photographs, derived from the gate's verdict plus what
+accelExperiment() actually returned - an errored fire says the hook was NOT
+installed, a fire that never ran says so, gate 2 differs from gate 1. The block
+prints after the call; navi48-report-hold=N repeats it once a second, capped at
+20, and the answer publishes as Navi48,AccelReport / ,AccelReportHold.
+
+accel_boot_report_test: 197 checks. accel_boot_report_plant.sh: 42 plants, all
+caught, 0 escaped, pristine checksum unchanged.
+---
+ CHANGES.md                                    |  29 ++-
+ src/navi48-bringup/src/Navi48Bringup.cpp      |  33 ++++
+ src/navi48-bringup/src/accel_boot_report.h    |  68 +++++++
+ .../tests/accel_boot_report_plant.sh          | 166 ++++++++++++++++
+ .../tests/accel_boot_report_test.cpp          | 187 ++++++++++++++++++
+ 4 files changed, 454 insertions(+), 1 deletion(-)
+ create mode 100644 src/navi48-bringup/src/accel_boot_report.h
+ create mode 100644 src/navi48-bringup/tests/accel_boot_report_plant.sh
+ create mode 100644 src/navi48-bringup/tests/accel_boot_report_test.cpp
+
+diff --git a/src/navi48-bringup/src/Navi48Bringup.cpp b/src/navi48-bringup/src/Navi48Bringup.cpp
+index 9bef77c..e34636f 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -45,6 +45,7 @@
+ #include "fw/fw_table.h"            // 0.0.664 (Navi 44 part 2): per-die firmware set, selected in probe()
+ 
+ #include "accel_fire_at_boot.h"     // 0017: may this boot run the fire path with no userspace verb?
++#include "accel_boot_report.h"      // 0019: the boot screen is the report - no keyboard here
+ 
+ // 0016 — the stage-17 compute shader, so the Navi 44 gate can report what it is about to
+ // let a writing stage upload. Same declaration as src/amd/compute_test.cpp's: C linkage
+@@ -7782,6 +7783,9 @@ bool Navi48Bringup::start(IOService *provider) {
+ 			const char *fwhy = "";
+ 			const n48::AccelFireAtBoot fv = n48::accel_fire_at_boot_gate(ff, &fwhy);
+ 			if (ff.argRequested) setProperty("Navi48,AccelFireAtBoot", fwhy);
++			int32_t fireKr = 0;
++			bool fireCalled = false;
++			uint64_t fireInstalled = 0;
+ 			if (fv == n48::AccelFireAtBoot::Call) {
+ 				uint64_t installed = 0, calls = 0, firstUnsup = 0;
+ 				const IOReturn fkr = accelExperiment(1 /*fire*/, &installed, &calls, &firstUnsup,
+@@ -7790,9 +7794,38 @@ bool Navi48Bringup::start(IOService *provider) {
+ 				       "TTL calls %llu (reason: %s)", (unsigned)fkr,
+ 				       (unsigned long long)installed, (unsigned long long)calls, fwhy);
+ 				setProperty("Navi48,AccelFireAtBootKr", static_cast<uint64_t>(fkr), 32);
++				fireKr = (int32_t)fkr;
++				fireCalled = true;
++				fireInstalled = installed;
+ 			} else if (ff.argRequested) {
+ 				N48LOG("accel-fire-at-boot: %s — the verb path is untouched", fwhy);
+ 			}
++
++			// 0019: the screen is the report. There is no working keyboard inside macOS here,
++			// so ioreg and the collector both need a channel this machine does not have -
++			// IOLog with -v does not. Print the decision, and with navi48-report-hold=N repeat it
++			// once a second for N seconds (cap 20) so a photograph can carry it back.
++			uint32_t holdRequested = 0;
++			PE_parse_boot_argn("navi48-report-hold", &holdRequested, sizeof(holdRequested));
++			const n48::AccelBootReport rmode =
++				n48::accel_report_mode(ff.argRequested, holdRequested);
++			if (rmode != n48::AccelBootReport::Off) {
++				const char *head = n48::accel_report_headline(fv, fireCalled, fireKr, ff.gateMode);
++				const uint32_t secs = (rmode == n48::AccelBootReport::PrintAndHold)
++				                    ? n48::accel_report_hold_seconds(holdRequested) : 0;
++				setProperty("Navi48,AccelReport", head);
++				setProperty("Navi48,AccelReportHold", static_cast<uint64_t>(secs), 32);
++				for (uint32_t t = 0; ; t++) {
++					N48LOG("========== NAVI 44 ACCELERATION REPORT %u/%u ==========", t, secs);
++					N48LOG("%s", head);
++					N48LOG("gate %u, fired %d, kr %#x, ttl installed %llu; gate reason: %s",
++					       ff.gateMode, fireCalled ? 1 : 0, fireKr,
++					       (unsigned long long)fireInstalled, fwhy);
++					N48LOG("no terminal needed: photograph this screen");
++					if (t >= secs) break;
++					IOSleep(1000);
++				}
++			}
+ 		}
+ 		// MILESTONE 3 step 1 (0.0.235): the IH -> Apple completion bridge can be
+ 		// armed at boot instead of by a verb, which is what makes it part of a
+diff --git a/src/navi48-bringup/src/accel_boot_report.h b/src/navi48-bringup/src/accel_boot_report.h
+new file mode 100644
+index 0000000..2865a2a
+--- /dev/null
++++ b/src/navi48-bringup/src/accel_boot_report.h
+@@ -0,0 +1,68 @@
++//  accel_boot_report.h — the boot screen as the report.
++//
++//  This machine has no working keyboard inside macOS, so a survey that lives only in ioreg or
++//  in /var/log is a survey nobody can read: the volume does not always mount, and a terminal
++//  needs typing. N48LOG goes through IOLog, which with -v is printed to the console during
++//  boot - so the one channel that needs neither a mounted disk nor a keypress is the screen.
++//
++//  This header owns the two decisions that make such a screen-readable block honest:
++//    * whether to print at all (only when someone asked the boot to fire), and
++//    * the single sentence that a photograph can carry, derived from the gate's verdict and
++//      what the fire path actually returned - not from a second copy of the rules, because a
++//      headline that disagrees with the verdict is worse than no headline.
++//
++//  The hold is capped: start() is a driver's start method, and the point of the cap is that a
++//  mistyped boot-arg cannot stall every boot of the machine for minutes.
++#ifndef N48_ACCEL_BOOT_REPORT_H
++#define N48_ACCEL_BOOT_REPORT_H
++
++#include <cstdint>
++
++#include "accel_fire_at_boot.h"
++
++namespace n48 {
++
++constexpr uint32_t kAccelReportHoldCap = 20;
++
++enum class AccelBootReport {
++	Off,            // nobody asked for a fire, so there is nothing to report
++	Print,          // one block, then boot continues
++	PrintAndHold,   // the same block once a second, so a phone can photograph it
++};
++
++inline uint32_t accel_report_hold_seconds(uint32_t requested) {
++	return requested > kAccelReportHoldCap ? kAccelReportHoldCap : requested;
++}
++
++inline AccelBootReport accel_report_mode(bool argRequested, uint32_t holdRequested) {
++	if (!argRequested) return AccelBootReport::Off;
++	return holdRequested ? AccelBootReport::PrintAndHold : AccelBootReport::Print;
++}
++
++// The one line an owner photographs. Every branch names the state in plain words and, where
++// the boot can still be changed by an arg, says which arg.
++inline const char *accel_report_headline(AccelFireAtBoot v, bool fired, int32_t fireKr, uint32_t gateMode) {
++	switch (v) {
++		case AccelFireAtBoot::SkipNotRequested:
++			return "nothing was asked for: add navi48-accel-fire-at-boot=1 to boot-args";
++		case AccelFireAtBoot::SkipNotArmed:
++			return "not fired: navi48-accel-experiment=1 is absent, so the experiment was never armed";
++		case AccelFireAtBoot::Refuse:
++			if (gateMode == 0)
++				return "REFUSED: navi48-accel-gate=0 forbids publishing - the card stays on the software path";
++			return "REFUSED: the card was not handed to Apple this boot - the reason line below says why";
++		case AccelFireAtBoot::Call:
++			break;
++	}
++	if (!fired)
++		return "the gate said Call but the fire path did not run - nothing is hooked, investigate";
++	if (fireKr != 0)
++		return "the fire path returned an error - the TTL hook was NOT installed";
++	if (gateMode == 2)
++		return "LoadAccelerator PUBLISHED (gate forced open by navi48-accel-gate=2)";
++	return "LoadAccelerator PUBLISHED - Apple's accelerator may now match this card";
++}
++
++} // namespace n48
++
++#endif // N48_ACCEL_BOOT_REPORT_H
+diff --git a/src/navi48-bringup/tests/accel_boot_report_plant.sh b/src/navi48-bringup/tests/accel_boot_report_plant.sh
+new file mode 100644
+index 0000000..4a3b163
+--- /dev/null
++++ b/src/navi48-bringup/tests/accel_boot_report_plant.sh
+@@ -0,0 +1,166 @@
++#!/usr/bin/env bash
++#
++#  accel_boot_report_plant.sh — prove the 0019 suite can actually fail.
++#
++#  Usage (from anywhere):  ZIG=/path/to/zig.exe bash tests/accel_boot_report_plant.sh
++#
++#  One break at a time, planted into a COPY of the real sources, and the suite must catch
++#  it. This block is the whole report on a machine with no keyboard: a photograph of the
++#  verbose boot is the only evidence that comes back. So the plants are the ways that
++#  photograph can lie — a headline that disagrees with the gate, a hold that never holds,
++#  a report that prints when nobody asked, or a report derived from the verdict alone while
++#  the fire path actually errored.
++#
++#  Rules (same as the other *_plant.sh here):
++#    * needles are SINGLE-LINE, because the checkout is CRLF and a multi-line needle
++#      never matches;
++#    * every needle must be found, or the run aborts - a drifted needle silently
++#      becomes "no plant applied", which reads exactly like a passing suite;
++#    * the pristine checksum is taken up front and re-checked at the end;
++#    * `control` runs the untouched copy first.
++#
++set -u
++
++ZIG="${ZIG:?set ZIG to the zig (or zig c++) driver to use}"
++HERE="$(cd "$(dirname "$0")" && pwd)"
++ROOT="$(cd "$HERE/.." && pwd)"
++SCR="$(mktemp -d)"
++mkdir -p "$SCR" || { echo "cannot make $SCR"; exit 2; }
++trap 'rm -rf "$SCR"' EXIT
++
++cp -R "$ROOT/src" "$SCR/src" || { echo "copy of src failed"; exit 2; }
++cp -R "$ROOT/tests/dalshim" "$SCR/dalshim" 2>/dev/null
++
++PRISTINE=$(find "$SCR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) \
++    | sort | xargs cat | cksum | awk '{print $1}')
++
++build_run() {
++	# "$ZIG" stays quoted: on this workstation the toolchain path contains spaces, and a
++	# word-split $ZIG fails with "D:\Work: No such file or directory" - which a plant run
++	# reports as a build failure, indistinguishable from a broken source tree.
++	"$ZIG" c++ -std=c++17 -O1 -I "$SCR/dalshim" -I "$SCR/src" \
++		"$HERE/accel_boot_report_test.cpp" -o "$SCR/t" >"$SCR/build.log" 2>&1 || {
++		echo "    BUILD FAILED"; sed -n '1,6p' "$SCR/build.log"; return 2; }
++	"$SCR/t" "$SCR" >"$SCR/run.log" 2>&1
++	return $?
++}
++
++count_matches() { # file needle -> echoes the number of occurrences
++	N="$2" perl -0777 -ne 'my $c = () = $_ =~ /\Q$ENV{N}\E/g; print $c' "$1"
++}
++
++plant() {
++	local file="$1" needle="$2" repl="$3" occ="${4:-1}"
++	local path="$SCR/$file"
++	cp "$ROOT/$file" "$path"                       # always plant from pristine
++	local found
++	found=$(count_matches "$path" "$needle")
++	if [ "${found:-0}" -lt "$occ" ]; then
++		echo "    NEEDLE MISSING (occ $occ of $found): $needle"
++		return 9
++	fi
++	N="$needle" R="$repl" O="$occ" perl -0777 -i -pe '
++		my $n = $ENV{N}; my $r = $ENV{R}; my $want = $ENV{O}; my $i = 0;
++		s/\Q$n\E/$i++; ($i == $want) ? $r : $n/ge;
++	' "$path"
++	local after afterRepl
++	after=$(count_matches "$path" "$needle")
++	afterRepl=$(count_matches "$path" "$repl")
++	if [ "$after" -ge "$occ" ] && [ "${afterRepl:-0}" -eq 0 ]; then
++		echo "    PLANT DID NOT LAND"
++		return 9
++	fi
++	return 0
++}
++
++restore_all() { rm -rf "$SCR/src"; cp -R "$ROOT/src" "$SCR/src"; }
++
++H=src/accel_boot_report.h
++C=src/Navi48Bringup.cpp
++
++declare -a PASS FAIL MISS
++PASSN=0 FAILN=0 MISSN=0
++run_plant() { # LABEL FILE NEEDLE REPL [OCC]
++	local label="$1"; shift
++	printf '  %-50s' "$label"
++	if ! plant "$@"; then echo "PLANT-ERROR"; MISS+=("$label"); MISSN=$((MISSN + 1)); restore_all; return; fi
++	build_run
++	local rc=$?
++	if [ "$rc" -eq 0 ]; then echo "ESCAPED (suite still passed)"; FAIL+=("$label"); FAILN=$((FAILN + 1));
++	else echo "caught (rc=$rc)"; PASS+=("$label"); PASSN=$((PASSN + 1)); fi
++	restore_all
++}
++
++echo "== control: the untouched copy =="
++if build_run; then echo "  control PASSED - plants below are meaningful"
++else echo "  control FAILED - the copy/build step is broken, stopping"; exit 1; fi
++
++echo "== plants: the hold cap (a mistyped arg must not stall every boot) =="
++run_plant "cap: 20 becomes 200"                "$H" 'constexpr uint32_t kAccelReportHoldCap = 20;' 'constexpr uint32_t kAccelReportHoldCap = 200;'
++run_plant "cap: 20 becomes 60"                 "$H" 'constexpr uint32_t kAccelReportHoldCap = 20;' 'constexpr uint32_t kAccelReportHoldCap = 60;'
++run_plant "cap: clamp ignored"                 "$H" 'return requested > kAccelReportHoldCap ? kAccelReportHoldCap : requested;' 'return requested;'
++run_plant "cap: an extra occurrence of the name" "$H" 'constexpr uint32_t kAccelReportHoldCap = 20;' 'constexpr uint32_t kAccelReportHoldCap = 20;
++constexpr uint32_t kAccelReportHoldAlias = kAccelReportHoldCap;'
++
++echo "== plants: when the report prints =="
++run_plant "mode: the fire-arg guard is dropped" "$H" 'if (!argRequested) return AccelBootReport::Off;' 'if (false) return AccelBootReport::Off;'
++run_plant "mode: always Off"                    "$H" 'if (!argRequested) return AccelBootReport::Off;' 'return AccelBootReport::Off;'
++run_plant "mode: a hold never holds"            "$H" 'return holdRequested ? AccelBootReport::PrintAndHold : AccelBootReport::Print;' 'return AccelBootReport::Print;'
++run_plant "mode: every print holds"             "$H" 'return holdRequested ? AccelBootReport::PrintAndHold : AccelBootReport::Print;' 'return AccelBootReport::PrintAndHold;'
++
++echo "== plants: the headline an owner photographs =="
++run_plant "headline: not-requested loses the arg"  "$H" 'return "nothing was asked for: add navi48-accel-fire-at-boot=1 to boot-args";' 'return "nothing was asked for";'
++run_plant "headline: not-armed loses the arg"      "$H" 'return "not fired: navi48-accel-experiment=1 is absent, so the experiment was never armed";' 'return "not fired";'
++run_plant "headline: gate-0 branch taken at gate 1" "$H" 'if (gateMode == 0)' 'if (gateMode == 1)'
++run_plant "headline: gate-0 sentence softened"     "$H" 'the card stays on the software path";' 'the card stays on the software mode";'
++run_plant "headline: refusal reads as the enum"    "$H" 'return "REFUSED: the card was not handed to Apple this boot - the reason line below says why";' 'return "Refuse";'
++run_plant "headline: did-not-run softened"         "$H" 'return "the gate said Call but the fire path did not run - nothing is hooked, investigate";' 'return "the fire path was skipped";'
++run_plant "headline: error loses NOT installed"    "$H" 'return "the fire path returned an error - the TTL hook was NOT installed";' 'return "the fire path returned an error";'
++run_plant "headline: gate-2 branch taken at gate 1" "$H" 'if (gateMode == 2)' 'if (gateMode == 1)'
++run_plant "headline: forced-open sentence dropped" "$H" 'return "LoadAccelerator PUBLISHED (gate forced open by navi48-accel-gate=2)";' 'return "LoadAccelerator PUBLISHED";'
++run_plant "headline: published sentence shortened" "$H" 'return "LoadAccelerator PUBLISHED - Apple'"'"'s accelerator may now match this card";' 'return "LoadAccelerator PUBLISHED";'
++run_plant "headline: an empty screen"              "$H" 'return "nothing was asked for: add navi48-accel-fire-at-boot=1 to boot-args";' 'return "";'
++run_plant "headline: Refuse case no longer handled" "$H" 'case AccelFireAtBoot::Refuse:' 'case AccelFireAtBoot::Refuse :'
++
++echo "== plants: header hygiene (the gate stays the gate's) =="
++run_plant "header: include pin drifts"          "$H" '#include "accel_fire_at_boot.h"' '#include "accel_fire_at_boot_gone.h"'
++run_plant "header: IOKit leaks in"              "$H" '//  needs typing.' '//  needs typing (IOKit and IOLog( are not available here).'
++run_plant "header: setProperty leaks in"        "$H" '//    * whether to print at all (only when someone asked the boot to fire), and' '//    * whether to print at all (only when someone asked the boot to fire), setProperty, and'
++run_plant "header: the gate's self-test copied" "$H" '// The one line an owner photographs.' '// selfTestPassed is the gate'"'"'s; the one line an owner photographs.'
++
++echo "== plants: the xsrc wiring (the block is actually printed, after the fire) =="
++run_plant "xsrc: header not included"           "$C" '#include "accel_boot_report.h"' '#include "accel_boot_report_gone.h"'
++run_plant "xsrc: the hold arg is renamed"       "$C" 'PE_parse_boot_argn("navi48-report-hold"' 'PE_parse_boot_argn("navi48-reporthold"'
++run_plant "xsrc: a hold invents a report"       "$C" 'n48::accel_report_mode(ff.argRequested, holdRequested)' 'n48::accel_report_mode(true, holdRequested)'
++run_plant "xsrc: print guard dropped"           "$C" 'if (rmode != n48::AccelBootReport::Off) {' 'if (true) {'
++run_plant "xsrc: fired hardcoded true"          "$C" 'n48::accel_report_headline(fv, fireCalled, fireKr, ff.gateMode)' 'n48::accel_report_headline(fv, true, fireKr, ff.gateMode)'
++run_plant "xsrc: the error code hardcoded 0"    "$C" 'n48::accel_report_headline(fv, fireCalled, fireKr, ff.gateMode)' 'n48::accel_report_headline(fv, fireCalled, 0, ff.gateMode)'
++run_plant "xsrc: fireKr never recorded"         "$C" 'fireKr = (int32_t)fkr;' 'fireKr = 0;'
++run_plant "xsrc: fireCalled never recorded"     "$C" 'fireCalled = true;' 'fireCalled = false;'
++run_plant "xsrc: the hold never sleeps"         "$C" 'IOSleep(1000);' 'IOSleep(0);'
++run_plant "xsrc: the hold bypasses the cap"     "$C" '? n48::accel_report_hold_seconds(holdRequested) : 0;' '? holdRequested : 0;'
++run_plant "xsrc: pattern repeats only once"     "$C" 'for (uint32_t t = 0; ; t++) {' 'for (uint32_t t = 0; t < 1; t++) {'
++run_plant "xsrc: the hold runs one second long" "$C" 'if (t >= secs) break;' 'if (t > secs) break;'
++run_plant "xsrc: the headline line is not head" "$C" 'N48LOG("%s", head);' 'N48LOG("%s", "published");'
++run_plant "xsrc: the report property renamed"   "$C" 'setProperty("Navi48,AccelReport", head);' 'setProperty("Navi48,AccelReportX", head);'
++run_plant "xsrc: the hold property renamed"     "$C" 'setProperty("Navi48,AccelReportHold"' 'setProperty("Navi48,AccelReportHoldX"'
++run_plant "xsrc: the banner renamed"            "$C" 'NAVI 44 ACCELERATION REPORT %u/%u' 'NAVI 44 ACCEL REPORT %u/%u'
++run_plant "xsrc: the photograph hint dropped"   "$C" 'photograph this screen' 'the screen'
++run_plant "xsrc: the reason line loses a field" "$C" 'ttl installed %llu; gate reason: %s' 'installed %llu; reason: %s'
++
++echo "== summary =="
++# Counts are plain integers: `${#ARR[@]}` on an empty array is an unbound-variable fatal
++# under `set -u` in bash 3.2, which would kill the run right where the tally prints.
++echo "caught:   $PASSN"
++echo "escaped:  $FAILN  ${FAIL[*]:-}"
++echo "plant-errors: $MISSN  ${MISS[*]:-}"
++
++AFTER=$(find "$SCR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) \
++    | sort | xargs cat | cksum | awk '{print $1}')
++if [ "$AFTER" != "$PRISTINE" ]; then
++	echo "PRISTINE CHECKSUM CHANGED - the copy is polluted; investigate before trusting any result"
++	exit 3
++fi
++echo "pristine tree unchanged after the run (checksum $PRISTINE)"
++
++[ "$FAILN" -eq 0 ] && [ "$MISSN" -eq 0 ]
+diff --git a/src/navi48-bringup/tests/accel_boot_report_test.cpp b/src/navi48-bringup/tests/accel_boot_report_test.cpp
+new file mode 100644
+index 0000000..cf6161f
+--- /dev/null
++++ b/src/navi48-bringup/tests/accel_boot_report_test.cpp
+@@ -0,0 +1,187 @@
++//  accel_boot_report_test.cpp — host suite for the on-screen report (patch 0019).
++//
++//  Build (any machine, no Mac, no GPU):
++//    zig c++ -std=c++17 -Wall -Wextra -O1 -I tests/dalshim -I src \
++//        tests/accel_boot_report_test.cpp -o /tmp/accel_boot_report_test.exe
++//    /tmp/accel_boot_report_test.exe .
++//
++//  argv[1] is the navi48-bringup root, used by the source-pin sections.
++//
++//  Why a suite for a log block: this is the only channel that survives a machine with no
++//  keyboard - no mount, no terminal, no userspace binary. If the block stops printing, or the
++//  headline stops agreeing with the verdict, the owner's photograph says the wrong thing and
++//  the next patch is aimed at the wrong failure. The headline is therefore derived from the
++//  gate's own verdict rather than from a second copy of the rules, and that is what section C
++//  pins.
++
++#include "accel_boot_report.h"
++
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <sstream>
++#include <string>
++
++using n48::AccelBootReport;
++using n48::AccelFireAtBoot;
++
++static int gChecks = 0, gFailures = 0;
++static void report(const char *file, int line, const char *what, bool ok) {
++	gChecks++;
++	if (ok) return;
++	gFailures++;
++	printf("FAIL %s:%d: %s\n", file, line, what);
++}
++#define CHECK(cond) report(__FILE__, __LINE__, #cond, (cond))
++
++namespace {
++
++std::string slurp(const std::string &path) {
++	std::ifstream in(path, std::ios::binary);
++	if (!in) return "";
++	std::ostringstream ss;
++	ss << in.rdbuf();
++	std::string s = ss.str();
++	for (auto &c : s) if (c == '\r') c = '\n';
++	while (!s.empty() && s.back() == '\n') s.pop_back();
++	return s;
++}
++
++bool has(const std::string &hay, const std::string &needle) {
++	return hay.find(needle) != std::string::npos;
++}
++
++size_t count_of(const std::string &hay, const std::string &needle) {
++	size_t n = 0, p = 0;
++	while ((p = hay.find(needle, p)) != std::string::npos) { n++; p += needle.size(); }
++	return n;
++}
++
++// The rules in prose, written out by hand — deliberately not the header's switch order, so a
++// reordered switch changes an expectation here.
++const char *expect_headline(AccelFireAtBoot v, bool fired, int32_t kr, uint32_t gate) {
++	switch (v) {
++		case AccelFireAtBoot::SkipNotRequested:
++			return "nothing was asked for: add navi48-accel-fire-at-boot=1 to boot-args";
++		case AccelFireAtBoot::SkipNotArmed:
++			return "not fired: navi48-accel-experiment=1 is absent, so the experiment was never armed";
++		case AccelFireAtBoot::Refuse:
++			return gate == 0
++				? "REFUSED: navi48-accel-gate=0 forbids publishing - the card stays on the software path"
++				: "REFUSED: the card was not handed to Apple this boot - the reason line below says why";
++		case AccelFireAtBoot::Call:
++			if (!fired) return "the gate said Call but the fire path did not run - nothing is hooked, investigate";
++			if (kr != 0) return "the fire path returned an error - the TTL hook was NOT installed";
++			if (gate == 2) return "LoadAccelerator PUBLISHED (gate forced open by navi48-accel-gate=2)";
++			return "LoadAccelerator PUBLISHED - Apple's accelerator may now match this card";
++	}
++	return "";
++}
++
++} // namespace
++
++int main(int argc, char **argv) {
++	const std::string root = argc > 1 ? argv[1] : ".";
++
++	// ---------------------------------------------------------------- A: the clamp
++	CHECK(n48::accel_report_hold_seconds(0) == 0);
++	CHECK(n48::accel_report_hold_seconds(1) == 1);
++	CHECK(n48::accel_report_hold_seconds(19) == 19);
++	CHECK(n48::accel_report_hold_seconds(20) == 20);
++	CHECK(n48::accel_report_hold_seconds(21) == 20);
++	CHECK(n48::accel_report_hold_seconds(600) == 20);
++	CHECK(n48::accel_report_hold_seconds(0xFFFFFFFFu) == 20);
++
++	// ---------------------------------------------------------------- B: when it prints
++	CHECK(n48::accel_report_mode(false, 0)  == AccelBootReport::Off);
++	CHECK(n48::accel_report_mode(false, 15) == AccelBootReport::Off);   // a hold cannot invent a fire
++	CHECK(n48::accel_report_mode(false, 0xFFFFFFFFu) == AccelBootReport::Off);
++	CHECK(n48::accel_report_mode(true, 0)   == AccelBootReport::Print);
++	CHECK(n48::accel_report_mode(true, 1)   == AccelBootReport::PrintAndHold);
++	CHECK(n48::accel_report_mode(true, 20)  == AccelBootReport::PrintAndHold);
++	CHECK(n48::accel_report_mode(true, 0xFFFFFFFFu) == AccelBootReport::PrintAndHold);
++
++	// ---------------------------------------------------------------- C: the headline
++	const AccelFireAtBoot allv[] = { AccelFireAtBoot::SkipNotRequested, AccelFireAtBoot::SkipNotArmed,
++	                                 AccelFireAtBoot::Refuse, AccelFireAtBoot::Call };
++	const uint32_t gates[] = { 0, 1, 2 };
++	const int32_t krs[] = { 0, -536870911 /*kIOReturnError*/, 1 };
++	int n = 0;
++	for (AccelFireAtBoot v : allv)
++		for (uint32_t g : gates)
++			for (int32_t kr : krs)
++				for (int firedI = 0; firedI < 2; firedI++) {
++					const bool fired = firedI != 0;
++					const char *got = n48::accel_report_headline(v, fired, kr, g);
++					const char *want = expect_headline(v, fired, kr, g);
++					if (std::strcmp(got, want) != 0) {
++						printf("FAIL headline v=%d g=%u kr=%d fired=%d\n  got  %s\n  want %s\n",
++						       (int)v, g, kr, firedI, got, want);
++					}
++					CHECK(std::strcmp(got, want) == 0);
++					CHECK(got && got[0]);          // never an empty screen
++					n++;
++				}
++	CHECK(n == 4 * 3 * 3 * 2);
++
++	// The published sentence must not be a re-print of the gate's internal wording: an owner
++	// photographing the screen reads English, not a verdict enum name.
++	CHECK(!has(n48::accel_report_headline(AccelFireAtBoot::Call, true, 0, 1), "AccelFireAtBoot"));
++	CHECK(!has(n48::accel_report_headline(AccelFireAtBoot::Refuse, false, 0, 1), "Refuse"));
++	CHECK(has(n48::accel_report_headline(AccelFireAtBoot::Call, true, 0, 1), "PUBLISHED"));
++	CHECK(has(n48::accel_report_headline(AccelFireAtBoot::Call, true, -536870911, 1), "NOT installed"));
++	CHECK(has(n48::accel_report_headline(AccelFireAtBoot::Call, false, 0, 1), "did not run"));
++	CHECK(has(n48::accel_report_headline(AccelFireAtBoot::Refuse, false, 0, 0), "navi48-accel-gate=0"));
++	CHECK(has(n48::accel_report_headline(AccelFireAtBoot::Refuse, false, 0, 1), "reason line"));
++	CHECK(has(n48::accel_report_headline(AccelFireAtBoot::SkipNotArmed, false, 0, 1), "navi48-accel-experiment=1"));
++	CHECK(has(n48::accel_report_headline(AccelFireAtBoot::Call, true, 0, 2), "forced open"));
++	CHECK(!has(n48::accel_report_headline(AccelFireAtBoot::Call, true, 0, 1), "forced open"));
++
++	// ---------------------------------------------------------------- D: xsrc wiring
++	const std::string src = slurp(root + "/src/Navi48Bringup.cpp");
++	CHECK(!src.empty());
++	CHECK(has(src, "#include \"accel_boot_report.h\""));
++	CHECK(has(src, "PE_parse_boot_argn(\"navi48-report-hold\", &holdRequested, sizeof(holdRequested));"));
++	CHECK(has(src, "n48::accel_report_mode(ff.argRequested, holdRequested)"));
++	CHECK(has(src, "n48::accel_report_headline(fv, fireCalled, fireKr, ff.gateMode)"));
++	CHECK(has(src, "if (rmode != n48::AccelBootReport::Off)"));
++	CHECK(has(src, "IOSleep(1000);"));
++	CHECK(has(src, "for (uint32_t t = 0; ; t++) {"));
++	CHECK(has(src, "N48LOG(\"%s\", head);"));
++	CHECK(has(src, "if (t >= secs) break;"));
++	CHECK(has(src, "setProperty(\"Navi48,AccelReport\", head);"));
++	CHECK(has(src, "setProperty(\"Navi48,AccelReportHold\", static_cast<uint64_t>(secs), 32);"));
++	CHECK(has(src, "NAVI 44 ACCELERATION REPORT %u/%u"));
++	CHECK(has(src, "photograph this screen"));
++	CHECK(has(src, "ttl installed %llu; gate reason: %s"));
++	CHECK(has(src, "n48::accel_report_hold_seconds(holdRequested)"));
++	// The report must be derived from what the fire call actually returned, not from the
++	// verdict alone: a Call that errored has to say so, and fireKr is only set on that path.
++	CHECK(has(src, "fireKr = (int32_t)fkr;"));
++	CHECK(has(src, "fireCalled = true;"));
++	// ...and it must print AFTER the call, or a hold would stall the screen before the answer
++	// it is holding up exists.
++	CHECK(src.find("const IOReturn fkr = accelExperiment(1 /*fire*/") <
++	      src.find("n48::accel_report_mode(ff.argRequested, holdRequested)"));
++
++	// ---------------------------------------------------------------- E: header hygiene
++	const std::string hdr = slurp(root + "/src/accel_boot_report.h");
++	CHECK(!hdr.empty());
++	CHECK(has(hdr, "kAccelReportHoldCap = 20"));
++	CHECK(has(hdr, "#include \"accel_fire_at_boot.h\""));
++	CHECK(!has(hdr, "IOKit"));
++	CHECK(!has(hdr, "setProperty"));
++	CHECK(!has(hdr, "IOLog("));
++	CHECK(has(hdr, "case AccelFireAtBoot::Refuse:"));
++	// The headline must not grow a hardcoded verdict for the self-test case: the gate owns that
++	// decision, and a second copy of it here is exactly how the two drift apart.
++	CHECK(!has(hdr, "selfTestPassed"));
++
++	// The cap must be the one the suite tested: a header that says 20 while start() sleeps for
++	// a different number is the kind of quiet mismatch this pins.
++	CHECK(count_of(hdr, "kAccelReportHoldCap") == 3);   // declaration + the comparison twice
++
++	if (gFailures == 0) printf("OK: %d checks, 0 failures\n", gChecks);
++	else                printf("%d checks, %d failures\n", gChecks, gFailures);
++	return gFailures == 0 ? 0 : 1;
++}
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,956 @@
+diff --git a/src/navi48-bringup/Info.plist b/src/navi48-bringup/Info.plist
+index 2a593ab..efae19d 100644
+--- a/src/navi48-bringup/Info.plist
++++ b/src/navi48-bringup/Info.plist
+@@ -15,9 +15,9 @@
+ 	<key>CFBundlePackageType</key>
+ 	<string>KEXT</string>
+ 	<key>CFBundleShortVersionString</key>
+-	<string>0.0.664</string>
++	<string>0.0.665</string>
+ 	<key>CFBundleVersion</key>
+-	<string>0.0.664</string>
++	<string>0.0.665</string>
+ 	<key>IOKitPersonalities</key>
+ 	<dict>
+ 		<key>Navi48AccelPeer</key>
+diff --git a/src/navi48-bringup/src/Navi48DisplayNub.cpp b/src/navi48-bringup/src/Navi48DisplayNub.cpp
+index d161dca..8e0bb6a 100644
+--- a/src/navi48-bringup/src/Navi48DisplayNub.cpp
++++ b/src/navi48-bringup/src/Navi48DisplayNub.cpp
+@@ -78,7 +78,7 @@ void op_trace(uint32_t ev, uint64_t a, uint64_t b) {
+ 	FBLOG("framebuffer trace: event %u a %#llx b %#llx", ev, (unsigned long long)a, (unsigned long long)b);
+ }
+ const N48DispOps gDispOps = {
+-	N48_DISP_OPS_MAGIC, N48_DISP_ABI, (uint32_t)sizeof(N48DispOps), 664u, 0u, 0u,
++	N48_DISP_OPS_MAGIC, N48_DISP_ABI, (uint32_t)sizeof(N48DispOps), 665u, 0u, 0u,
+ 	op_snapshot, op_power, op_trace,
+ 	nullptr, nullptr, nullptr,
+ };
+diff --git a/src/navi48-bringup/src/Navi48MetalNub.cpp b/src/navi48-bringup/src/Navi48MetalNub.cpp
+index b5309b1..34dab3e 100644
+--- a/src/navi48-bringup/src/Navi48MetalNub.cpp
++++ b/src/navi48-bringup/src/Navi48MetalNub.cpp
+@@ -177,7 +177,7 @@ void *op_pci_device(void *ctx) { return n48disp_pci_device(ctx); }
+ // TWO tables, the one published chosen by the latch (n48disp::ops_shape): with the display flag ONLY with boot-arg navi48-metal-disp=1 (gOps); otherwise gOpsOff, whose display members are zero (the aux kext then takes every
+ // 0.0.2 display default). Both are ABI 3 / 152 bytes since 0.0.656 (G6): native_open is the last member and carries its own capability bit.
+ const N48MetalOps gOps = {
+-	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u, n48metal::kOpsFlags, 0u,
++	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 665u, n48metal::kOpsFlags, 0u,
+ 	op_device_open, op_device_close, op_populate_config, op_stamp_memory, op_stamp_va, op_task_window,
+ 	op_factory_mask, op_mm_hook, op_trace,
+ 	op_vhook, n48metal::kOpsCaps, 0,
+@@ -186,7 +186,7 @@ const N48MetalOps gOps = {
+ };
+ // 0.0.656: the OFF table is ABI 3 too (native_open must exist with the display OFF, the normal case): the display members are zero (flags 0, no hook, no PCI getter), which is "display off" to every aux kext.
+ const N48MetalOps gOpsOff = {
+-	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u, n48metal::kOpsFlags, 0u,
++	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 665u, n48metal::kOpsFlags, 0u,
+ 	op_device_open, op_device_close, op_populate_config, op_stamp_memory, op_stamp_va, op_task_window,
+ 	op_factory_mask, op_mm_hook, op_trace,
+ 	op_vhook, n48metal::kOpsCaps, 0,
+diff --git a/src/navi48-bringup/src/Navi48NativeABI.h b/src/navi48-bringup/src/Navi48NativeABI.h
+index 6b83538..92a70c6 100644
+--- a/src/navi48-bringup/src/Navi48NativeABI.h
++++ b/src/navi48-bringup/src/Navi48NativeABI.h
+@@ -26,7 +26,7 @@
+ 
+ #define N48N_UC_TYPE       0x4E34384Eu      /* 'N48N' */
+ #define N48N_ABI_VERSION   1u            /* the MAJOR: unchanged, so every v1.0 client (Mesa, n48native, s1d-replay) still handshakes */
+-#define N48N_ABI_MINOR     12u           /* 1.12 (kext 0.0.662, M6 Stage 2): selectors 22..26 also accept INSTANCE 1 (the monitor A: HUBP1 / OTG1; slot ids tagged 0x10 | k) behind the boot-arg navi48-m6flip1=1 (with navi48-m6=1 and navi48-m6flip=1; with it OFF instance 1 is answered kIOReturnBadArgument exactly as 1.11 did); SCANX_ACQUIRE returns the instance's geometry in a fifth output word (a call with four output words still works: the fifth is not written); N48N_SCANQ_M6FLIP1 in scan_query.flags says all three latches are on; no struct changes. 1.11 (kext 0.0.661, M6 Stage 1b): selectors 22..26 N48N_SEL_SCANX_* - the scanout of INSTANCE 2 (the monitor B: HUBP2 / OTG2), poll-only, behind the boot-args navi48-m6=1 AND navi48-m6flip=1 (a latch OFF answers every one with Unsupported and touches nothing); N48N_SCANQ_M6FLIP in scan_query.flags says both are on; no struct changes. 1.10 (kext 0.0.640, GPU-apps G4): n48n_info.reserved[3..7] report the session's VRAM budget (N48N_INFO_R_* / N48N_BUDGET_* below), so a user-space allocator (Mesa/RADV) can size its VRAM heap; no selector, no struct size changes. A third client role (APP, a non-root uid >= 501 process on the kernel allow-list) exists behind the boot-args navi48-apps=1 + navi48-multisession=1: it reaches selectors 0, 1, 3..8 and 21 only (never ReadRegs 2, never scanout 9..14, never 15..20); a refused selector is kIOReturnNotPrivileged. 1.9 (kext 0.0.612): selector 21 N48N_SEL_BO_IMPORT_HOST (milestone #11 step 11c: import a page-aligned range of the CALLER's address space as a SYSTEM-memory BO; limits 64 MiB per BO, 256 MiB per client), the class of the N48N user client is renamed IOAccelNavi48NativeClient (WindowServer's sandbox admits iokit-open only for IOAccel* classes; the service name and type 'N48N' are unchanged), and a uid-88 caller is admitted behind the boot-arg navi48-metal-ws=1; 1.8 (kext 0.0.610): selectors 19 N48N_SEL_METAL_NUB_PUBLISH and 20 N48N_SEL_METAL_NUB_WITHDRAW (milestone #9 route A: the software Navi48MetalNub the aux accelerator kext matches; published only on demand, only with the boot-arg navi48-metal=1); 1.7 (kext 0.0.609): HELD mode for row 120: selector 17 N48N_SEL_MODE_HOLD (enter row 120 and RETURN with the mode up, a scanout client may then Acquire and present at 120 Hz) and selector 18 N48N_SEL_MODE_RELEASE (end it, wait, return the final result); verdict 16 HELD, deny 25 / 26, N48N_HOLD_* words; the result's former reserved0 / reserved1 (offsets 204 / 252) are hold_end / hold_flags (the size stays 512 B); 1.6 (kext 0.0.608): row 120's blanked-transition underflow reads, DIO attribution and lock-hold witness code in the result's former reserved[8] (the size stays 512 B); 1.5 (kext 0.0.607): row 120 (the 1440p 120 Hz trial) runs behind the boot-arg navi48-row120=1 with the clock hold (P4); the result's ext.reserved words carry the hold report (its size is unchanged); new deny reasons 22 / 23, verdict 15, flags 22..24; 1.4 (kext 0.0.606): selector 16's result grows from 256 to 512 B (underflow / resync / OTG-lock report) and it accepts the rows 1 (DP1 resync) and 2 (V_TOTAL under the OTG lock) and a flags word; 1.3 (kext 0.0.605): the timed mode-trial selector 16, native-S2d; 1.2 (kext 0.0.604): the DAL experiment selector 15, native-S2-DISPCLK; 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in n48n_info.reserved[2]. */
++#define N48N_ABI_MINOR     13u           /* 1.13 (kext 0.0.665, Navi 44 part 3): QueryInfo grows a 96 B die-topology tail, struct n48n_topo at byte 192, claimed by N48N_INFO_TOPO in n48n_info.flags. The selector keeps its exact-shape rule and now accepts two sizes (192 or 288), so a 1.12 client is answered exactly as before and a 1.13 client that meets an older kext gets BadArgument and falls back. The tail carries what drm_amdgpu_info_device carries and what Mesa's ac_fill_hw_info reads: max_shader_engines / max_sh_per_se / max_cu_per_sh / max_backends_per_se, the PHYSICAL num_rb_pipes (SE x RB-per-SE) beside the HARVESTED enabled_rb_pipes_mask, cu_active_number, the SEs that kept a CU, and cu_bitmap[4][2] in the [se % 4][sa + (se / 4) * 2] layout. WHY: every one of those is a Navi 48 number in the only place a kext-less consumer can get them - Mesa's canned gfx1201 row - and on Navi 44 (2 SE, 4 RBs, 32 CUs) a wrong CU mask is not cosmetic. No new selector, nothing removed. 1.12 (kext 0.0.662, M6 Stage 2): selectors 22..26 also accept INSTANCE 1 (the monitor A: HUBP1 / OTG1; slot ids tagged 0x10 | k) behind the boot-arg navi48-m6flip1=1 (with navi48-m6=1 and navi48-m6flip=1; with it OFF instance 1 is answered kIOReturnBadArgument exactly as 1.11 did); SCANX_ACQUIRE returns the instance's geometry in a fifth output word (a call with four output words still works: the fifth is not written); N48N_SCANQ_M6FLIP1 in scan_query.flags says all three latches are on; no struct changes. 1.11 (kext 0.0.661, M6 Stage 1b): selectors 22..26 N48N_SEL_SCANX_* - the scanout of INSTANCE 2 (the monitor B: HUBP2 / OTG2), poll-only, behind the boot-args navi48-m6=1 AND navi48-m6flip=1 (a latch OFF answers every one with Unsupported and touches nothing); N48N_SCANQ_M6FLIP in scan_query.flags says both are on; no struct changes. 1.10 (kext 0.0.640, GPU-apps G4): n48n_info.reserved[3..7] report the session's VRAM budget (N48N_INFO_R_* / N48N_BUDGET_* below), so a user-space allocator (Mesa/RADV) can size its VRAM heap; no selector, no struct size changes. A third client role (APP, a non-root uid >= 501 process on the kernel allow-list) exists behind the boot-args navi48-apps=1 + navi48-multisession=1: it reaches selectors 0, 1, 3..8 and 21 only (never ReadRegs 2, never scanout 9..14, never 15..20); a refused selector is kIOReturnNotPrivileged. 1.9 (kext 0.0.612): selector 21 N48N_SEL_BO_IMPORT_HOST (milestone #11 step 11c: import a page-aligned range of the CALLER's address space as a SYSTEM-memory BO; limits 64 MiB per BO, 256 MiB per client), the class of the N48N user client is renamed IOAccelNavi48NativeClient (WindowServer's sandbox admits iokit-open only for IOAccel* classes; the service name and type 'N48N' are unchanged), and a uid-88 caller is admitted behind the boot-arg navi48-metal-ws=1; 1.8 (kext 0.0.610): selectors 19 N48N_SEL_METAL_NUB_PUBLISH and 20 N48N_SEL_METAL_NUB_WITHDRAW (milestone #9 route A: the software Navi48MetalNub the aux accelerator kext matches; published only on demand, only with the boot-arg navi48-metal=1); 1.7 (kext 0.0.609): HELD mode for row 120: selector 17 N48N_SEL_MODE_HOLD (enter row 120 and RETURN with the mode up, a scanout client may then Acquire and present at 120 Hz) and selector 18 N48N_SEL_MODE_RELEASE (end it, wait, return the final result); verdict 16 HELD, deny 25 / 26, N48N_HOLD_* words; the result's former reserved0 / reserved1 (offsets 204 / 252) are hold_end / hold_flags (the size stays 512 B); 1.6 (kext 0.0.608): row 120's blanked-transition underflow reads, DIO attribution and lock-hold witness code in the result's former reserved[8] (the size stays 512 B); 1.5 (kext 0.0.607): row 120 (the 1440p 120 Hz trial) runs behind the boot-arg navi48-row120=1 with the clock hold (P4); the result's ext.reserved words carry the hold report (its size is unchanged); new deny reasons 22 / 23, verdict 15, flags 22..24; 1.4 (kext 0.0.606): selector 16's result grows from 256 to 512 B (underflow / resync / OTG-lock report) and it accepts the rows 1 (DP1 resync) and 2 (V_TOTAL under the OTG lock) and a flags word; 1.3 (kext 0.0.605): the timed mode-trial selector 16, native-S2d; 1.2 (kext 0.0.604): the DAL experiment selector 15, native-S2-DISPCLK; 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in n48n_info.reserved[2]. */
+ #define N48N_HELLO_F_MINOR (1u << 8)     /* Hello flags bit 8: "report the minor": out[0] = ABI | (MINOR << 16). Without it out[0] is exactly the major, as in v1.0. Bit 8, not 0: flags = 1, which T1 leg 1 sends and expects refused, still is. */
+ #define N48N_MAX_IBS       64u
+ #define N48N_MAX_BOS       4096u            /* handles 1..4095; 0 is never valid */
+@@ -38,7 +38,7 @@
+ /* ---- selectors of the native client (own numbering; type 0 is the legacy Navi48UserClient) ---------------- */
+ enum {
+     N48N_SEL_HELLO     = 0,   /* in: [0] client ABI (=1) [1] flags (0)          out: [0] kernel ABI [1] kext build [2] max IBs [3] vmid */
+-    N48N_SEL_QUERYINFO = 1,   /* struct out: n48n_info (192 B) */
++    N48N_SEL_QUERYINFO = 1,   /* struct out: n48n_info (192 B), or 192 + 96 B when the caller wants the n48n_topo tail (ABI 1.13) */
+     N48N_SEL_READREGS  = 2,   /* in: [0] ABSOLUTE dword offset (RREG32) [1] count 1..16 [2] instance (0xFFFFFFFF)   struct out: uint32_t[count] */
+     N48N_SEL_BOCREATE  = 3,   /* struct in: n48n_gem_create_in (32 B)   out: [0] handle [1] size [2] placed domain [3] placement bits */
+     N48N_SEL_BOFREE    = 4,   /* in: [0] handle */
+@@ -196,6 +196,36 @@ struct n48n_info {                 /* 192 B */
+ #define N48N_INFO_HUNG          (1u << 0)
+ #define N48N_INFO_S1B_POSITIVE  (1u << 1)
+ #define N48N_INFO_NATIVE_BOOT   (1u << 2)
++#define N48N_INFO_TOPO          (1u << 3)   /* ABI 1.13: the caller asked for 192 + sizeof(n48n_topo) bytes and this kext filled the tail */
++/* ABI 1.13 (kext 0.0.665): the die topology, n48n_topo, appended to the QueryInfo record. A caller that passes only the
++ * 192 B n48n_info still works, byte for byte as before; one that passes 192 + sizeof(n48n_topo) gets the tail filled and
++ * N48N_INFO_TOPO set. The shape check accepts either size, so an old kext refuses the big one and the caller falls back —
++ * it never reads a tail nobody wrote.
++ *
++ * WHY IT EXISTS: every consumer of the die geometry on Linux reads it out of the kernel's drm_amdgpu_info_device (Mesa's
++ * ac_fill_hw_info takes max_se / max_sa_per_se / num_cu_per_sh / the CU harvest bitmap / the RB mask and the RB count
++ * from there). Mesa's Darwin backend has no ioctl, so it substitutes a canned table — and that table has exactly one
++ * RDNA4 row, gfx1201 (Navi 48: 4 SE, 16 RBs, 64 CUs). On Navi 44 (gfx1200: 2 SE, 4 RBs, 32 CUs) every one of those
++ * numbers is wrong, and a wrong CU mask is not cosmetic: it is what the shader thread logic and the tiling math index
++ * by. The kext already computes all of it for its own bring-up (GB_ADDR_CONFIG, the SA/RB/CU harvest registers), so the
++ * fix is to publish it rather than to guess a second table per die. */
++struct n48n_topo {                 /* 96 B, at byte offset 192 of the QueryInfo output */
++    uint32_t size;                      /* 0: == sizeof(n48n_topo) — proof the tail was written by a kext that knows it */
++    uint32_t gc_version;                /* 4: (major<<16)|(minor<<8)|rev — 0x000c0000 gfx1200, 0x000c0001 gfx1201 */
++    uint32_t max_shader_engines;        /* 8:  SEs */
++    uint32_t max_sh_per_se;             /* 12: shader arrays per SE */
++    uint32_t max_cu_per_sh;             /* 16: CUs per shader array (8 on RDNA4) */
++    uint32_t max_backends_per_se;       /* 20: RBs per SE */
++    uint32_t num_rb_pipes;              /* 24: SE * RBs-per-SE, the PHYSICAL count the ioctl sends */
++    uint32_t enabled_rb_pipes_mask;     /* 28: the HARVESTED RB bitmap, bits 0..31 */
++    uint32_t enabled_rb_pipes_mask_hi;  /* 32: bits 32..63 (0 on every RDNA4 die) */
++    uint32_t cu_active_number;          /* 36: live CUs */
++    uint32_t cu_active_wgp_number;      /* 40: live WGPs (2 CUs each) */
++    uint32_t num_se;                    /* 44: SEs that kept at least one CU */
++    uint32_t cu_bitmap[4][2];           /* 48..79: ROW STRIDE 2, not the ioctl's 4. Element [se][sa] is written at cu_bitmap[se % 4][sa + (se / 4) * 2], which is the index ac_fill_hw_info uses; drm_amdgpu_info_device.cu_bitmap is [4][4] and RDNA4 only ever fills columns 0..1 of each row, so 4x2 holds every bit and a consumer copies ELEMENT BY ELEMENT, never with memcpy. bit c of a row = CU c of that shader array (a WGP sets two adjacent bits). */
++    uint32_t reserved[4];               /* 80..95: 0 */
++};
++#define N48N_TOPO_SIZE 96u
+ /* ABI 1.10 (kext 0.0.640): n48n_info.reserved[] words (an older kext leaves them 0, which reads as "no budget reported").
+  *   reserved[0],[1] = native write counter (diagnostic)   reserved[2] = ABI minor (1.1)
+  *   reserved[3] = N48N_BUDGET_* flags
+@@ -523,6 +553,10 @@ N48N_STATIC_ASSERT(sizeof(struct n48n_ctx) == 16, "n48n_ctx is 16 B");
+ N48N_STATIC_ASSERT(sizeof(struct n48n_cs_ib) == 32, "n48n_cs_ib is 32 B");
+ N48N_STATIC_ASSERT(sizeof(struct n48n_cs_in) == 32, "n48n_cs_in header is 32 B");
+ N48N_STATIC_ASSERT(sizeof(struct n48n_info) == 192, "n48n_info is 192 B");
++N48N_STATIC_ASSERT(sizeof(struct n48n_topo) == 96, "n48n_topo is 96 B");
++N48N_STATIC_ASSERT(sizeof(struct n48n_info) + sizeof(struct n48n_topo) == 288, "the extended QueryInfo record is 288 B");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_topo, num_rb_pipes) == 24, "topo.num_rb_pipes at 24");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_topo, cu_bitmap) == 48, "topo.cu_bitmap at 48");
+ N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_gem_va, va_address) == 16, "gem_va.va_address at 16");
+ N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_gem_va, vm_timeline_point) == 40, "gem_va.vm_timeline_point at 40");
+ N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_gem_va, input_fence_syncobj_handles) == 56, "gem_va.input_fence_syncobj_handles at 56");
+diff --git a/src/navi48-bringup/src/Navi48NativeClient.cpp b/src/navi48-bringup/src/Navi48NativeClient.cpp
+index 3ae32b5..860a18f 100644
+--- a/src/navi48-bringup/src/Navi48NativeClient.cpp
++++ b/src/navi48-bringup/src/Navi48NativeClient.cpp
+@@ -173,8 +173,13 @@ IOReturn IOAccelNavi48NativeClient::externalMethod(uint32_t selector, IOExternal
+ 		if (!shape(2, 4, 0, 0)) return kIOReturnBadArgument;
+ 		return amdgpu::n1c_hello(r, si[0], si[1], so);
+ 	case N48N_SEL_QUERYINFO:
+-		if (!shape(0, 0, 0, sizeof(n48n_info))) return kIOReturnBadArgument;
+-		return amdgpu::n1c_query_info(r, static_cast<n48n_info *>(args->structureOutput));
++		// 0.0.665 (ABI 1.13): two exact sizes and nothing between them — the 192 B record as always, or 192 + the 96 B
++		// topology tail for a caller that asks for it. An older kext refuses the big one, and the caller falls back.
++		if (shape(0, 0, 0, sizeof(n48n_info))) return amdgpu::n1c_query_info(r, static_cast<n48n_info *>(args->structureOutput));
++		if (shape(0, 0, 0, sizeof(n48n_info) + sizeof(n48n_topo)))
++			return amdgpu::n1c_query_info_ext(r, static_cast<n48n_info *>(args->structureOutput),
++			                                   reinterpret_cast<n48n_topo *>(static_cast<char *>(args->structureOutput) + sizeof(n48n_info)));
++		return kIOReturnBadArgument;
+ 	case N48N_SEL_READREGS: {
+ 		if (sic != 3 || soc != 0 || sis != 0) return kIOReturnBadArgument;
+ 		if (si[1] < 1 || si[1] > 16 || sos != (uint32_t)si[1] * 4u || args->structureOutput == nullptr) return kIOReturnBadArgument;
+diff --git a/src/navi48-bringup/src/amd/amdgpu_gfx.h b/src/navi48-bringup/src/amd/amdgpu_gfx.h
+index 281cc11..5c22055 100644
+--- a/src/navi48-bringup/src/amd/amdgpu_gfx.h
++++ b/src/navi48-bringup/src/amd/amdgpu_gfx.h
+@@ -342,6 +342,51 @@ kern_return_t gfx_setup_rb(const DeviceContext &dev, GFXConfig &cfg);
+ //
+ kern_return_t gfx_get_cu_info(const DeviceContext &dev, GFXConfig &cfg);
+ 
++//
++// GFXTopo — the die geometry as user space needs to see it: the same
++// values Linux hands every DRM client through amdgpu_info_ioctl's
++// drm_amdgpu_info_device (amdgpu_kms.c:952-1030). A consumer with no
++// kernel ioctl (our native path) cannot derive these any other way, and
++// a hardcoded table is only right for the die it was written for — Navi
++// 48 alone. Everything below comes out of GFXConfig, which the bring-up
++// path filled from GB_ADDR_CONFIG and the harvest registers of the card
++// that is actually fitted.
++//
++// Field names and semantics mirror the ioctl so that the ABI mapping is
++// a copy, not a translation:
++//   num_shader_engines            <- max_shader_engines
++//   num_shader_arrays_per_engine  <- max_sh_per_se
++//   num_cu_per_sh                 <- max_cu_per_sh
++//   enabled_rb_pipes_mask         <- backend_enable_mask (HARVESTED)
++//   num_rb_pipes                  <- max_backends_per_se * max_shader_engines
++//                                    (PHYSICAL — upstream multiplies the caps,
++//                                    it does not popcount the mask; gfx1201 is
++//                                    16 here and 0xffff in the mask)
++//   cu_active_number              <- cu_info.number
++//   cu_bitmap[][]                 <- cu_info.bitmap[][], which gfx_get_cu_info
++//                                    already stores as [se % 4][sa + (se / 4) * 2]
++//                                    — the exact layout ac_fill_hw_info reads
++//                                    (ac_gpu_info.c:1247).
++//
++struct GFXTopo {
++    bool      valid;                 // false until gfx_constants_init filled the config
++    uint32_t  gc_major, gc_minor, gc_rev;
++    uint32_t  max_shader_engines, max_sh_per_se, max_cu_per_sh, max_backends_per_se;
++    uint32_t  num_rb_pipes;          // physical SE x RB/SE
++    uint32_t  enabled_rb_pipes_mask; // harvested, bits 0..31
++    uint32_t  enabled_rb_pipes_mask_hi;
++    uint32_t  cu_active_number, cu_active_wgp_number;
++    uint32_t  num_se;                // SEs that keep at least one CU
++    uint32_t  cu_bitmap[4][2];
++};
++
++//
++// Fill `out` from `cfg` + `gc`. Pure: no MMIO, no locking, safe from any
++// client context. Zeroes `out` first, so a caller may pass an
++// uninitialised struct.
++//
++void gfx_topo_report(const GFXConfig &cfg, const IPVersion &gc, GFXTopo &out);
++
+ //
+ // Port of gfx_v12_0_init_compute_vmid (gfx_v12_0.c:1766). For each
+ // KFD VMID, GRBM-select it and program SH_MEM_CONFIG, SH_MEM_BASES,
+diff --git a/src/navi48-bringup/src/amd/gfx_v12_0.cpp b/src/navi48-bringup/src/amd/gfx_v12_0.cpp
+index d8e822e..b8b7936 100644
+--- a/src/navi48-bringup/src/amd/gfx_v12_0.cpp
++++ b/src/navi48-bringup/src/amd/gfx_v12_0.cpp
+@@ -617,6 +617,59 @@ gfx_get_cu_info(const DeviceContext &dev, GFXConfig &cfg)
+     return kIOReturnSuccess;
+ }
+ 
++//------------------------------------------------------------------
++// gfx_topo_report — the drm_amdgpu_info_device subset that describes
++// THIS card, read out of the config the harvest registers filled in.
++// Pure: no MMIO, no locking. The field-by-field rules (and the
++// upstream line numbers behind them) are on the struct in
++// amdgpu_gfx.h.
++//------------------------------------------------------------------
++void
++gfx_topo_report(const GFXConfig &cfg, const IPVersion &gc, GFXTopo &out)
++{
++    memset(&out, 0, sizeof(out));
++    out.gc_major = gc.major;
++    out.gc_minor = gc.minor;
++    out.gc_rev   = gc.rev;
++
++    // gfx_constants_init marks the config inited only once both harvest
++    // reads have run — and it keeps going when either one fails, so a
++    // config that is not inited yet has no geometry worth reporting. The
++    // consumer then has nothing to override its own table with, which is
++    // the honest answer rather than a zeroed one that looks like a die
++    // with no CUs.
++    if (!cfg.inited) return;
++    out.valid = true;
++
++    out.max_shader_engines  = cfg.max_shader_engines;
++    out.max_sh_per_se       = cfg.max_sh_per_se;
++    out.max_cu_per_sh       = cfg.max_cu_per_sh;
++    out.max_backends_per_se = cfg.max_backends_per_se;
++
++    // amdgpu_kms.c:970 — num_rb_pipes is the CAP product (SE x RB/SE), not
++    // the popcount of the harvest mask; :969 sends the mask itself. The
++    // two disagree on any harvested part, and RADV uses both.
++    out.num_rb_pipes          = cfg.max_backends_per_se * cfg.max_shader_engines;
++    out.enabled_rb_pipes_mask = cfg.active_rb_bitmap;
++    // The mask would only need the high word past 32 RBs; RDNA4 tops out at
++    // 8 SE x 8 RB/SE, and cfg.active_rb_bitmap is one uint32, so it is 0.
++    out.enabled_rb_pipes_mask_hi = 0;
++
++    out.cu_active_number     = cfg.num_active_cus;
++    out.cu_active_wgp_number = cfg.num_active_wgps;
++    memcpy(out.cu_bitmap, cfg.active_cu_bitmap, sizeof(out.cu_bitmap));
++
++    // ac_gpu_info.c:1269-1281 counts the live SEs itself the same way: an
++    // SE counts when any of its shader arrays kept a CU.
++    const uint32_t nse = cfg.max_shader_engines < 4 ? cfg.max_shader_engines : 4;
++    const uint32_t nsa = cfg.max_sh_per_se < 2 ? cfg.max_sh_per_se : 2;
++    for (uint32_t se = 0; se < nse; se++) {
++        for (uint32_t sa = 0; sa < nsa; sa++) {
++            if (out.cu_bitmap[se][sa] != 0) { out.num_se++; break; }
++        }
++    }
++}
++
+ //------------------------------------------------------------------
+ // gfx_init_compute_vmid — port of gfx_v12_0_init_compute_vmid
+ // (gfx_v12_0.c:1766).
+diff --git a/src/navi48-bringup/src/amd/native_s1c.cpp b/src/navi48-bringup/src/amd/native_s1c.cpp
+index bea98f0..7dbde60 100644
+--- a/src/navi48-bringup/src/amd/native_s1c.cpp
++++ b/src/navi48-bringup/src/amd/native_s1c.cpp
+@@ -1100,6 +1100,36 @@ IOReturn n1c_query_info(const N1cRef &ref, n48n_info *o) {
+     return kIOReturnSuccess;
+ }
+ 
++// ABI 1.13: QueryInfo with the die-topology tail (n48n_topo at byte 192 of the caller's buffer). The 192 B record is
++// written by n1c_query_info exactly as before, so every existing assertion about that function still holds; the tail is
++// filled from the config the harvest registers produced, and N48N_INFO_TOPO is claimed only when it really was.
++IOReturn n1c_query_info_ext(const N1cRef &ref, n48n_info *info, n48n_topo *topo) {
++    if (topo == nullptr) return kIOReturnBadArgument;
++    memset(topo, 0, sizeof(*topo));
++    IOReturn rc = n1c_query_info(ref, info);
++    if (rc != kIOReturnSuccess) return rc;
++
++    GFXTopo t;
++    gfx_topo_report(gCtx->gfx, gCtx->dev->ip.getVersion(IPBlock::GC), t);
++    if (!t.valid) return kIOReturnSuccess;   // bring-up has not filled the config yet: no tail, no flag
++
++    topo->gc_version               = ((uint32_t)t.gc_major << 16) | ((uint32_t)t.gc_minor << 8) | t.gc_rev;
++    topo->max_shader_engines       = t.max_shader_engines;
++    topo->max_sh_per_se            = t.max_sh_per_se;
++    topo->max_cu_per_sh            = t.max_cu_per_sh;
++    topo->max_backends_per_se      = t.max_backends_per_se;
++    topo->num_rb_pipes             = t.num_rb_pipes;
++    topo->enabled_rb_pipes_mask    = t.enabled_rb_pipes_mask;
++    topo->enabled_rb_pipes_mask_hi = t.enabled_rb_pipes_mask_hi;
++    topo->cu_active_number         = t.cu_active_number;
++    topo->cu_active_wgp_number     = t.cu_active_wgp_number;
++    topo->num_se                   = t.num_se;
++    memcpy(topo->cu_bitmap, t.cu_bitmap, sizeof(topo->cu_bitmap));
++    topo->size = (uint32_t)sizeof(*topo);
++    info->flags |= N48N_INFO_TOPO;
++    return kIOReturnSuccess;
++}
++
+ IOReturn n1c_read_regs(const N1cRef &ref, uint64_t off, uint64_t count, uint64_t instance, uint32_t *out) {
+     if (!sess_hello(ref)) return kIOReturnNotReady;
+     if (app_refused(ref, n48native::g4::kCallReadRegs)) return kIOReturnNotPrivileged;   // 0.0.640 (G4): an APP session never reads registers
+diff --git a/src/navi48-bringup/src/amd/native_s1c.h b/src/navi48-bringup/src/amd/native_s1c.h
+index 3f3983b..1fcd4c0 100644
+--- a/src/navi48-bringup/src/amd/native_s1c.h
++++ b/src/navi48-bringup/src/amd/native_s1c.h
+@@ -23,7 +23,7 @@ class IOUserClient;       // 0.0.641: n1c_unmap_for_close
+ 
+ namespace amdgpu {
+ 
+-constexpr uint32_t kN1cKextBuild = 664;   // the REAL build (0.0.659): Hello / QueryInfo report it; tests/native_s2a_test.cpp, native_s2_dal_test.cpp and native_s2d_test.cpp pin it to Info.plist so it cannot go stale again
++constexpr uint32_t kN1cKextBuild = 665;   // the REAL build (0.0.659): Hello / QueryInfo report it; tests/native_s2a_test.cpp, native_s2_dal_test.cpp and native_s2d_test.cpp pin it to Info.plist so it cannot go stale again
+ 
+ // Legacy-client sites refused once the native VM self-test has touched the GPU (contract 6.2). The legacy ring writers and the pool
+ // users that share vram_alloc without a lock.
+@@ -49,6 +49,9 @@ bool n1c_hung();
+ // until Hello succeeded. Locking is described in the contract: all but QueryInfo / ReadRegs / WaitSeq take the client lock.
+ IOReturn n1c_hello(const N1cRef &ref, uint64_t clientAbi, uint64_t flags, uint64_t out[4]);
+ IOReturn n1c_query_info(const N1cRef &ref, n48n_info *out);
++// 0.0.665 (ABI 1.13): the same record plus the die-topology tail, for a caller that passed 192 + sizeof(n48n_topo) bytes.
++// The tail is filled only once gfx_constants_init has produced a config; N48N_INFO_TOPO in info->flags says which case ran.
++IOReturn n1c_query_info_ext(const N1cRef &ref, n48n_info *out, n48n_topo *topo);
+ IOReturn n1c_read_regs(const N1cRef &ref, uint64_t dwordOff, uint64_t count, uint64_t instance, uint32_t *out);
+ IOReturn n1c_bo_create(const N1cRef &ref, const n48n_gem_create_in *in, uint64_t out[4]);
+ IOReturn n1c_bo_free(const N1cRef &ref, uint64_t handle);
+diff --git a/src/navi48-bringup/tests/native_disp2_test.cpp b/src/navi48-bringup/tests/native_disp2_test.cpp
+index 5cc392e..fc8fe3d 100644
+--- a/src/navi48-bringup/tests/native_disp2_test.cpp
++++ b/src/navi48-bringup/tests/native_disp2_test.cpp
+@@ -4703,8 +4703,8 @@ int main(int argc, char **argv) {
+         expect(cli.find("accel disp2 timing1440 2") != std::string::npos && cli.find("INSTANCE 2 at 2560x1440@60 (0.0.634") != std::string::npos, "0.0.634 CLI: the printed run script carries the 1440p sequence");
+     }
+     {   // 5. the version, the banned strings
+-        expect(count_of(plist, "0.0.664") == 2 && plist.find("0.0.630") == std::string::npos, "Info.plist is 0.0.664, carried twice");
+-        expect(s1c.find("kN1cKextBuild = 664;") != std::string::npos && count_of(nub, "664u") == 2, "the native client and both ops tables report build 664");
++        expect(count_of(plist, "0.0.665") == 2 && plist.find("0.0.630") == std::string::npos, "Info.plist is 0.0.665, carried twice");
++        expect(s1c.find("kN1cKextBuild = 665;") != std::string::npos && count_of(nub, "665u") == 2, "the native client and both ops tables report build 665");
+         const std::string p1 = std::string("pipe+") + "0x280", p2 = std::string("+") + "0x282", p3 = std::string("+") + "0x299";
+         const size_t c0 = cli.find("// ---- 0.0.631 (multi-monitor stage M4d)"), c1 = cli.find("static int cmd_accel(const char *what", c0 == std::string::npos ? 0 : c0);
+         const std::string cliNew = (c0 == std::string::npos || c1 == std::string::npos) ? std::string("missing") : cli.substr(c0, c1 - c0);
+diff --git a/src/navi48-bringup/tests/native_disp_test.cpp b/src/navi48-bringup/tests/native_disp_test.cpp
+index 7241225..e4c1490 100644
+--- a/src/navi48-bringup/tests/native_disp_test.cpp
++++ b/src/navi48-bringup/tests/native_disp_test.cpp
+@@ -1235,7 +1235,7 @@ int main(int argc, char **argv) {
+         expect(nub.find("op_disp_hook") != std::string::npos && nub.find("op_pci_device") != std::string::npos, "the ABI-2 members are wired");
+         expect(nub.find("*(const N48MetalOps **)param1 = n48disp::ops_shape(n48disp_latched_on()).dispFlags != 0u ? &gOps : &gOpsOff;") != std::string::npos, "callPlatformFunction hands out the display-OFF table (display members zero) unless the latch is ON (the table the aux kext sees decides display off)");
+         expect(nub.find("OSNumber *abi = OSNumber::withNumber((uint64_t)shape.abi, 32);") != std::string::npos && nub.find("out[2] = shape.abi; out[3] = (uint64_t)shape.size;") != std::string::npos, "the published ABI / size properties follow the latch-chosen shape");
+-        expect(nub.find("664u") != std::string::npos && nub.find("658u") == std::string::npos && nub.find("613u") == std::string::npos, "the ops table carries the build 664");
++        expect(nub.find("665u") != std::string::npos && nub.find("658u") == std::string::npos && nub.find("613u") == std::string::npos, "the ops table carries the build 665");
+         expect(nub.find("n48disp_pci_device(ctx)") != std::string::npos, "P1: op_pci_device is the gated hook");
+         expect(nub.find("n48disp::fact_mask(") != std::string::npos, "the factory mask goes through n48disp::fact_mask (OFF: the boot-arg's mask unchanged)");
+         expect(nub.find("n48disp_res62(") != std::string::npos, "slot 62 is handled by the display glue");
+@@ -1312,8 +1312,8 @@ int main(int argc, char **argv) {
+     if (!brg.empty()) expect(brg.find("pci->setProperty(\"VRAM,totalMB\", static_cast<uint64_t>(vramMB), 32);") != std::string::npos && brg.find("pci->setProperty(\"VRAM,totalsize\", d);") != std::string::npos && brg.find("setProperty(\"VRAM,TotalMB\", static_cast<uint64_t>(vramMB), 32);") != std::string::npos &&
+                               count_of(brg, "publishNativeVramOn(") == 2 && brg.find("if (amdgpu::native_s1b_latched()) publishNativeVramOn(pciDevice, vramMB);") != std::string::npos && brg.find("const uint64_t bytes = static_cast<uint64_t>(vramMB) << 20;") != std::string::npos,
+                               "K5: native boots only (inside the native latch) the IOPCIDevice also gets VRAM,totalMB (32-bit) and VRAM,totalsize (8-byte OSData, bytes); the old VRAM,TotalMB stays");
+-    expect(count_of(plist, "0.0.664") == 2 && plist.find("0.0.612") == std::string::npos, "Info.plist is 0.0.664, carried twice");
+-    expect(s1ch.find("kN1cKextBuild = 664;") != std::string::npos, "the native client reports build 660");
++    expect(count_of(plist, "0.0.665") == 2 && plist.find("0.0.612") == std::string::npos, "Info.plist is 0.0.665, carried twice");
++    expect(s1ch.find("kN1cKextBuild = 665;") != std::string::npos, "the native client reports build 660");
+     expect(ops.find("#define N48_METAL_ABI         3u") != std::string::npos && ops.find("N48_VC_DISPLAYPIPE    7u") != std::string::npos, "the ops header is ABI 3 (since 0.0.656) with the display class");
+     expect(pure.find("kNeedFacts") != std::string::npos && flow.find("e.facts_add(kNeedFacts)") != std::string::npos, "adopt adds the needed facts");
+     expect(count_of(flow, "e.md_prepare(") == 1 && count_of(flow, "mdc_teardown(e);") == 5 && flow.find("if (inst == n48m6::kInstDp) (void)submit_prepare(e, args[0]);") != std::string::npos && count_of(flow, "mdc_acquire(e.mdc(), md)") == 1, "0.0.616: ONE prepare in the whole flow (mdc_ensure, from submit), teardown after every disarm path, submit prepares, perform acquires");
+@@ -1433,7 +1433,7 @@ int main(int argc, char **argv) {
+                "M: ONE creation site (the verb), no selector, NO withdraw in M5");
+         expect(dnub.find("nub->attach(pci)") != std::string::npos && dnub.find("IOService *pci = navi48_bringup_pci();") != std::string::npos && dnub.find("setProperty(N48_DISP_INDEX_KEY, idx)") != std::string::npos && dnub.find("OSNumber::withNumber((uint64_t)index, 32)") != std::string::npos,
+                "M: the nub attaches to the GPU's IOPCIDevice (NOT to Navi48Bringup) with Navi48DisplayIndex = the instance's index (0.0.658: 1 = the monitor B, 2 = the monitor A)");
+-        expect(dnub.find("N48_METAL_OPS_MAGIC") == std::string::npos && dnub.find("N48_DISP_OPS_MAGIC, N48_DISP_ABI, (uint32_t)sizeof(N48DispOps), 664u, 0u, 0u,\n\top_snapshot, op_power, op_trace,\n\tnullptr, nullptr, nullptr,\n};") != std::string::npos, "M: the ops table: magic, ABI 1, its size, build 660, the three hooks, the M6 members NULL");
++        expect(dnub.find("N48_METAL_OPS_MAGIC") == std::string::npos && dnub.find("N48_DISP_OPS_MAGIC, N48_DISP_ABI, (uint32_t)sizeof(N48DispOps), 665u, 0u, 0u,\n\top_snapshot, op_power, op_trace,\n\tnullptr, nullptr, nullptr,\n};") != std::string::npos, "M: the ops table: magic, ABI 1, its size, build 660, the three hooks, the M6 members NULL");
+         expect(dnub.find("functionName->isEqualTo(N48_DISP_FN_SYMBOL)") != std::string::npos && dnub.find("*(const N48DispOps **)param1 = &gDispOps;") != std::string::npos, "M: callPlatformFunction(\"n48.disp.ops\") answers the table");
+         expect(dnub.find("n48fb::snapshot_hook_verdict(slot >= 0, slot >= 0 && __atomic_load_n(&gHaveSnap[slot], __ATOMIC_ACQUIRE) != 0u, out != nullptr) == 0") != std::string::npos && dnub.find("*out = gSnap[slot];") != std::string::npos && dnub.find("if (nub != nullptr && nub == (void *)gNub[i]) slot = (int)i;") != std::string::npos, "M: the snapshot hook answers only for A nub of ours, with ITS OWN index's snapshot, once published");
+         { const std::string mnub = slurp(K + "src/Navi48MetalNub.cpp"), dh2 = slurp(K + "src/amd/native_disp.h");
+diff --git a/src/navi48-bringup/tests/native_dispread_test.cpp b/src/navi48-bringup/tests/native_dispread_test.cpp
+index fe1c762..54839bb 100644
+--- a/src/navi48-bringup/tests/native_dispread_test.cpp
++++ b/src/navi48-bringup/tests/native_dispread_test.cpp
+@@ -1156,9 +1156,9 @@ static void s_pins(const std::string &root) {
+       expect(cli.find("verbs 91..99") != std::string::npos, "the CLI's admission hint names verbs 91..99");
+     }
+     // 7. the version
+-    expect(count_of(plist, "0.0.664") == 2 && plist.find("0.0.622") == std::string::npos, "Info.plist is 0.0.664, carried twice");
+-    expect(s1c.find("kN1cKextBuild = 664;") != std::string::npos, "the native client reports build 660");
+-    expect(count_of(nub, "664u") == 2 && nub.find("622u") == std::string::npos, "both ops tables carry the build 664");
++    expect(count_of(plist, "0.0.665") == 2 && plist.find("0.0.622") == std::string::npos, "Info.plist is 0.0.665, carried twice");
++    expect(s1c.find("kN1cKextBuild = 665;") != std::string::npos, "the native client reports build 660");
++    expect(count_of(nub, "665u") == 2 && nub.find("622u") == std::string::npos, "both ops tables carry the build 665");
+     // 8. the project rule: the banned strings appear in none of the new files
+     const std::string banned[3] = { std::string("pipe") + "+0x2" + "80", std::string("+0x2") + "82", std::string("+0x2") + "99" };
+     for (const std::string &b : banned) for (const std::string *f : { &flow, &hdr, &glue }) expect(f->find(b) == std::string::npos, "the project rule: no forbidden pipe-offset spelling in the new code");
+diff --git a/src/navi48-bringup/tests/native_dmubcmd_test.cpp b/src/navi48-bringup/tests/native_dmubcmd_test.cpp
+index 8304ac5..194b855 100644
+--- a/src/navi48-bringup/tests/native_dmubcmd_test.cpp
++++ b/src/navi48-bringup/tests/native_dmubcmd_test.cpp
+@@ -953,8 +953,8 @@ int main(int argc, char **argv) {
+         expect(cli.find(t) != std::string::npos, (std::string("the CLI carries ") + t).c_str());
+     expect(cli.find("static int cmd_dmubctx(const char *a1, const char *a2, const char *a3) {") != std::string::npos && cli.find("strcmp(a2, \"status\") != 0") != std::string::npos, "dmubctx takes `<ctx> status <value>`");
+     // 6. the version, the project rules
+-    expect(count_of(plist, "0.0.664") == 2 && plist.find("0.0.625") == std::string::npos, "Info.plist is 0.0.664, carried twice");
+-    expect(s1c.find("kN1cKextBuild = 664;") != std::string::npos, "the native client reports build 660");
++    expect(count_of(plist, "0.0.665") == 2 && plist.find("0.0.625") == std::string::npos, "Info.plist is 0.0.665, carried twice");
++    expect(s1c.find("kN1cKextBuild = 665;") != std::string::npos, "the native client reports build 660");
+     expect(drh.find("N48DR_STATUS_COUNT = 39") != std::string::npos, "the status enum ends at 39 (0.0.652: N48DR_HELD_REFUSED = 38)");
+     expect(mk.find("$(wildcard src/dcn/*.cpp)") != std::string::npos, "the Makefile builds src/dcn/*.cpp");
+     const std::vector<std::string> bannedStrings = { std::string("pipe") + "+0x" + "280", std::string("+0x") + "282", std::string("+0x") + "299" };   // spelled in pieces so this file itself never carries them
+diff --git a/src/navi48-bringup/tests/native_g1_test.cpp b/src/navi48-bringup/tests/native_g1_test.cpp
+index 693351f..ad6fc57 100644
+--- a/src/navi48-bringup/tests/native_g1_test.cpp
++++ b/src/navi48-bringup/tests/native_g1_test.cpp
+@@ -479,8 +479,8 @@ static void g9_pins(const std::string &root) {
+     // 0.0.626: the register-write claim of 0.0.623 was wrong and is corrected where it was made
+     expect(eng.find("No MMIO register write.") == std::string::npos && eng.find("\"No MMIO register write\", which was wrong") != std::string::npos, "the false 'No MMIO register write' comment is corrected");
+     // the version
+-    expect(count_of(plist, "<string>0.0.664</string>") == 2 && plist.find("0.0.625") == std::string::npos, "Info.plist is 0.0.664, carried twice");
+-    expect(hdr.find("constexpr uint32_t kN1cKextBuild = 664;") != std::string::npos, "the native client reports build 660");
++    expect(count_of(plist, "<string>0.0.665</string>") == 2 && plist.find("0.0.625") == std::string::npos, "Info.plist is 0.0.665, carried twice");
++    expect(hdr.find("constexpr uint32_t kN1cKextBuild = 665;") != std::string::npos, "the native client reports build 660");
+ }
+ 
+ int main(int argc, char **argv) {
+diff --git a/src/navi48-bringup/tests/native_g2_test.cpp b/src/navi48-bringup/tests/native_g2_test.cpp
+index eacc7ad..97aef22 100644
+--- a/src/navi48-bringup/tests/native_g2_test.cpp
++++ b/src/navi48-bringup/tests/native_g2_test.cpp
+@@ -431,8 +431,8 @@ static void t11_pins(const std::string &root) {
+     // banned strings, the version
+     const std::string b1 = std::string("pipe+0x2") + "80", b2 = std::string("+0x2") + "82", b3 = std::string("+0x2") + "99";
+     for (const std::string *f : { &eng, &pure, &ncl, &hdr }) expect(f->find(b1) == std::string::npos && f->find(b2) == std::string::npos && f->find(b3) == std::string::npos, "no banned pipe offsets");
+-    expect(count_of(plist, "<string>0.0.664</string>") == 2 && plist.find("0.0.626") == std::string::npos, "Info.plist is 0.0.664, carried twice");
+-    expect(hdr.find("constexpr uint32_t kN1cKextBuild = 664;") != std::string::npos, "the native client reports build 660");
++    expect(count_of(plist, "<string>0.0.665</string>") == 2 && plist.find("0.0.626") == std::string::npos, "Info.plist is 0.0.665, carried twice");
++    expect(hdr.find("constexpr uint32_t kN1cKextBuild = 665;") != std::string::npos, "the native client reports build 660");
+ }
+ 
+ // ---- T12: the G2 review fixes (0.0.629) -------------------------------------------------------------------------------------------------------------------------
+diff --git a/src/navi48-bringup/tests/native_g4_test.cpp b/src/navi48-bringup/tests/native_g4_test.cpp
+index 69dbf64..1254461 100644
+--- a/src/navi48-bringup/tests/native_g4_test.cpp
++++ b/src/navi48-bringup/tests/native_g4_test.cpp
+@@ -243,7 +243,7 @@ static void t5_budget() {
+     }
+     expect(N48N_INFO_R_BUDGET_FLAGS == 3u && N48N_INFO_R_BUDGET_CAP_LO == 4u && N48N_INFO_R_BUDGET_CAP_HI == 5u && N48N_INFO_R_BUDGET_AVAIL_LO == 6u && N48N_INFO_R_BUDGET_AVAIL_HI == 7u, "T5: the ABI indices");
+     expect(sizeof(((n48n_info *)nullptr)->reserved) / sizeof(uint32_t) == 8, "T5: reserved[] has eight words (the struct size is unchanged)");
+-    expect_u("T5: ABI minor 12", N48N_ABI_MINOR, 12);
++    expect_u("T5: ABI minor 13", N48N_ABI_MINOR, 13);
+ }
+ 
+ // ---- T6 -------------------------------------------------------------------------------------------------------------------------------------------------
+@@ -328,9 +328,9 @@ static void t8_pins(const std::string &root) {
+     const std::string cmd = slurp(root + "/tools/pc/navi48test.c"), pol = slurp(K + "src/amd/native_open_policy_pure.h"), g4p = slurp(K + "src/amd/native_g4_pure.h"), g2p = slurp(K + "src/amd/native_g2_pure.h");
+     expect(!eng.empty() && !engh.empty() && !cli.empty() && !clih.empty() && !brg.empty() && !ucl.empty() && !abi.empty() && !plist.empty() && !cmd.empty() && !pol.empty() && !g4p.empty() && !g2p.empty(), "T8: every source is readable");
+     // version and ABI
+-    expect(count_of(plist, "<string>0.0.664</string>") == 2 && plist.find("0.0.632") == std::string::npos, "T8: Info.plist is 0.0.664, carried twice");
+-    expect(engh.find("constexpr uint32_t kN1cKextBuild = 664;") != std::string::npos, "T8: the native client reports build 660");
+-    expect(abi.find("#define N48N_ABI_MINOR     12u ") != std::string::npos, "T8: ABI minor 12");
++    expect(count_of(plist, "<string>0.0.665</string>") == 2 && plist.find("0.0.632") == std::string::npos, "T8: Info.plist is 0.0.665, carried twice");
++    expect(engh.find("constexpr uint32_t kN1cKextBuild = 665;") != std::string::npos, "T8: the native client reports build 660");
++    expect(abi.find("#define N48N_ABI_MINOR     13u ") != std::string::npos, "T8: ABI minor 13");
+     expect(abi.find("#define N48N_BUDGET_VALID (1u << 0)") != std::string::npos && abi.find("#define N48N_BUDGET_APP   (1u << 1)") != std::string::npos, "T8: the budget flags are in the ABI header");
+     // the latch: one reader, latched once, needs multi
+     expect_u("T8: boot-arg navi48-apps is read in exactly one place in the whole kext", count_of(eng, "PE_parse_boot_argn(\"navi48-apps\""), 1);
+diff --git a/src/navi48-bringup/tests/native_g5_test.cpp b/src/navi48-bringup/tests/native_g5_test.cpp
+index c27f45f..cb670cf 100644
+--- a/src/navi48-bringup/tests/native_g5_test.cpp
++++ b/src/navi48-bringup/tests/native_g5_test.cpp
+@@ -508,9 +508,9 @@ static void t10_pins(const std::string &root) {
+     // banned strings (the pieces are joined here so this file does not carry them; tools/pc/navi48test.c already carries two lines from before 0.0.642: not checked here), the version
+     const std::string b1 = std::string("pipe+0x2") + "80", b2 = std::string("+0x2") + "82", b3 = std::string("+0x2") + "99";
+     for (const std::string *f : { &eng, &pure, &hdr, &brg }) expect(f->find(b1) == std::string::npos && f->find(b2) == std::string::npos && f->find(b3) == std::string::npos, "T10: no banned pipe offsets");
+-    expect(count_of(plist, "<string>0.0.664</string>") == 2 && plist.find("0.0.642") == std::string::npos, "T10: Info.plist is 0.0.664, carried twice");
+-    expect(hdr.find("constexpr uint32_t kN1cKextBuild = 664;") != std::string::npos, "T10: the native client reports build 660");
+-    expect(plist.find("<string>0.0.664</string>") != std::string::npos && eng.find("0.0.642\"") == std::string::npos, "T10: no stale version string in the engine");
++    expect(count_of(plist, "<string>0.0.665</string>") == 2 && plist.find("0.0.642") == std::string::npos, "T10: Info.plist is 0.0.665, carried twice");
++    expect(hdr.find("constexpr uint32_t kN1cKextBuild = 665;") != std::string::npos, "T10: the native client reports build 660");
++    expect(plist.find("<string>0.0.665</string>") != std::string::npos && eng.find("0.0.642\"") == std::string::npos, "T10: no stale version string in the engine");
+ }
+ 
+ int main(int argc, char **argv) {
+diff --git a/src/navi48-bringup/tests/native_g6_test.cpp b/src/navi48-bringup/tests/native_g6_test.cpp
+index 5681ac9..29752ab 100644
+--- a/src/navi48-bringup/tests/native_g6_test.cpp
++++ b/src/navi48-bringup/tests/native_g6_test.cpp
+@@ -173,13 +173,13 @@ static void r4_pins(const std::string &root) {
+     // both tables
+     expect_u("both tables end with op_native_open", count_of(nub, "\top_native_open,\n};"), 2u);
+     expect(nub.find("const N48MetalOps gOps = {") != std::string::npos && nub.find("const N48MetalOps gOpsOff = {") != std::string::npos && nub.find("gOpsV1") == std::string::npos, "the tables are gOps (display on) and gOpsOff (display off): both ABI 3");
+-    expect_u("both tables are built at 664", count_of(nub, "(uint32_t)sizeof(N48MetalOps), 664u,"), 2u);
++    expect_u("both tables are built at 665", count_of(nub, "(uint32_t)sizeof(N48MetalOps), 665u,"), 2u);
+     expect(nub.find("n48disp::ops_shape(n48disp_latched_on()).dispFlags != 0u ? &gOps : &gOpsOff;") != std::string::npos, "callPlatformFunction hands out gOps only with the display latch ON");
+     expect(nub.find("static_assert(N48_METAL_UC_N48N == N48N_UC_TYPE,") != std::string::npos, "the type constants are tied at compile time");
+     // the Info.plist version
+     const std::string plist = slurp(root + "/src/navi48-bringup/Info.plist");
+-    expect(plist.find("<string>0.0.664</string>") != std::string::npos && plist.find("0.0.654") == std::string::npos, "Info.plist says 0.0.664");
+-    expect(slurp(K + "amd/native_s1c.h").find("kN1cKextBuild = 664;") != std::string::npos, "Hello / QueryInfo report build 664");
++    expect(plist.find("<string>0.0.665</string>") != std::string::npos && plist.find("0.0.654") == std::string::npos, "Info.plist says 0.0.665");
++    expect(slurp(K + "amd/native_s1c.h").find("kN1cKextBuild = 665;") != std::string::npos, "Hello / QueryInfo report build 665");
+ }
+ 
+ int main(int argc, char **argv) {
+diff --git a/src/navi48-bringup/tests/native_hostimport_test.cpp b/src/navi48-bringup/tests/native_hostimport_test.cpp
+index d6d68c0..02d85c2 100644
+--- a/src/navi48-bringup/tests/native_hostimport_test.cpp
++++ b/src/navi48-bringup/tests/native_hostimport_test.cpp
+@@ -321,7 +321,7 @@ static void h5_pins(const std::string &root) {
+     const std::string pure = slurp(K + "src/amd/native_hostimport_pure.h"), plist = slurp(K + "Info.plist");
+     expect(!eng.empty() && !engh.empty() && !cli.empty() && !abi.empty() && !pure.empty(), "the sources are readable from the root given");
+     // the selector: number, shape, task
+-    expect_u("BoImportHost is the next free selector, 21", N48N_SEL_BO_IMPORT_HOST, 21); expect_u("ABI minor 12", N48N_ABI_MINOR, 12); expect_u("selector count 1.9", N48N_SEL_COUNT_1_9, 22);
++    expect_u("BoImportHost is the next free selector, 21", N48N_SEL_BO_IMPORT_HOST, 21); expect_u("ABI minor 13", N48N_ABI_MINOR, 13); expect_u("selector count 1.9", N48N_SEL_COUNT_1_9, 22);
+     expect_u("the ABI major is unchanged", N48N_ABI_VERSION, 1);
+     { const size_t c = cli.find("case N48N_SEL_BO_IMPORT_HOST:\n\t\tif (!shape(4, 4, 0, 0)) return kIOReturnBadArgument;\n"), r = cli.find("\t\treturn amdgpu::n1c_bo_import_host(r, task, si[0], si[1], si[2], si[3], so);", c == std::string::npos ? 0 : c);
+       expect(c != std::string::npos && r != std::string::npos && cli.substr(c, r - c).find("import_caller_ok(current_task(), task)") != std::string::npos,
+@@ -391,7 +391,7 @@ static void h5_pins(const std::string &root) {
+     expect(eng.find("kBoHost = 4") != std::string::npos && eng.find("IOMemoryDescriptor *hmd;") != std::string::npos && eng.find("uint64_t *hpages;") != std::string::npos && eng.find("uint64_t  importedBytes;") != std::string::npos, "the BO record and the session carry the import state");
+     expect(eng.find("static_assert(kRelNormal == kHostRelNormal && kRelLeak == kHostRelLeak && kRelClosing == kHostRelClosing") != std::string::npos, "the pure release modes are the kernel's RelMode");
+     expect(pure.find("constexpr uint64_t kImportMaxBo   = 64ull << 20;") != std::string::npos && pure.find("constexpr uint64_t kImportCap     = 4096ull << 20;") != std::string::npos, "the limits in the pure header");
+-    expect(plist.find("<string>0.0.664</string>") != std::string::npos, "Info.plist is 0.0.664");
++    expect(plist.find("<string>0.0.665</string>") != std::string::npos, "Info.plist is 0.0.665");
+     {   // 0.0.620: the cap refusal is logged (before and under the lock) with the cap read from the constant, and nothing else in the import path hard-codes 256 MiB
+         expect(imp.find("if (pre.rc == kNoMemory) N1C_LOG(\"import refused: per-client cap of %llu MiB reached (") != std::string::npos && imp.find("reached (%llu MiB held, %llu KiB asked)\", (unsigned long long)(kImportCap >> 20), ") != std::string::npos, "the advisory cap refusal is logged with kImportCap");
+         expect(imp.find("if (c.rc == kNoMemory) N1C_LOG(\"import refused: per-client cap of %llu MiB reached under the lock (") != std::string::npos && imp.find("reached under the lock (%llu MiB held, %llu KiB asked)\", (unsigned long long)(kImportCap >> 20), ") != std::string::npos, "the authoritative cap refusal is logged with kImportCap");
+diff --git a/src/navi48-bringup/tests/native_metal_test.cpp b/src/navi48-bringup/tests/native_metal_test.cpp
+index b094566..72d5425 100644
+--- a/src/navi48-bringup/tests/native_metal_test.cpp
++++ b/src/navi48-bringup/tests/native_metal_test.cpp
+@@ -348,7 +348,7 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
+     expect_u("selector count 1.8", N48N_SEL_COUNT_1_8, 21); expect_u("selector count 1.9", N48N_SEL_COUNT_1_9, 22); expect_u("BoImportHost is selector 21", N48N_SEL_BO_IMPORT_HOST, 21);
+     expect_u("selector count 1.7 unchanged", N48N_SEL_COUNT_1_7, 19);
+     expect_u("ABI major unchanged", N48N_ABI_VERSION, 1);
+-    expect_u("ABI minor 12 (1.12 since 0.0.662: instance 1 behind navi48-m6flip1; 1.11 since 0.0.661: the instance-2 scanout selectors 22..26)", N48N_ABI_MINOR, 12);
++    expect_u("ABI minor 13 (1.12 since 0.0.662: instance 1 behind navi48-m6flip1; 1.11 since 0.0.661: the instance-2 scanout selectors 22..26)", N48N_ABI_MINOR, 13);
+     expect(cli.find("case N48N_SEL_METAL_NUB_PUBLISH:\n\t\tif (!shape(1, 4, 0, 0)) return kIOReturnBadArgument;") != std::string::npos, "publish: shape 1 scalar in, 4 out, no structs");
+     expect(cli.find("case N48N_SEL_METAL_NUB_WITHDRAW:\n\t\tif (!shape(1, 1, 0, 0)) return kIOReturnBadArgument;") != std::string::npos, "withdraw: shape 1 in, 1 out, no structs");
+     {   // the selectors sit behind the same guard as every other native selector
+@@ -363,8 +363,8 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
+     expect(nub.find("n48metal::task_window(kind, size, reserve)") != std::string::npos, "task_window is the pure one");
+     expect(nub.find("n48metal::factory_mask(present, v)") != std::string::npos && nub.find("\"navi48-metal-fact\"") != std::string::npos, "factory_mask is the pure one behind navi48-metal-fact");
+     expect(nub.find("return (int)kIOReturnUnsupported;") != std::string::npos, "mm_hook refuses (no map entry point before #10)");
+-    expect(count_of(nub, "N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u, n48metal::kOpsFlags, 0u,") == 2 && nub.find("op_vhook, n48metal::kOpsCaps, 0,") != std::string::npos && nub.find("N48_DISP_F_ON, 0u, op_disp_hook, op_pci_device,\n\top_native_open,\n};") != std::string::npos, "the ABI-3 ops table identity: magic, abi 3, 152 bytes, build 657, flags, the generic hook and the caps, the display flag and the two display members, native_open");
+-    expect(nub.find("const N48MetalOps gOpsOff = {\n\tN48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u, n48metal::kOpsFlags, 0u,") != std::string::npos && nub.find("0u, 0u, nullptr, nullptr,\n\top_native_open,\n};") != std::string::npos, "the OFF table is ABI 3 / 152 bytes with no display members (flags 0, no hook, no PCI getter) and native_open");
++    expect(count_of(nub, "N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 665u, n48metal::kOpsFlags, 0u,") == 2 && nub.find("op_vhook, n48metal::kOpsCaps, 0,") != std::string::npos && nub.find("N48_DISP_F_ON, 0u, op_disp_hook, op_pci_device,\n\top_native_open,\n};") != std::string::npos, "the ABI-3 ops table identity: magic, abi 3, 152 bytes, build 657, flags, the generic hook and the caps, the display flag and the two display members, native_open");
++    expect(nub.find("const N48MetalOps gOpsOff = {\n\tN48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 665u, n48metal::kOpsFlags, 0u,") != std::string::npos && nub.find("0u, 0u, nullptr, nullptr,\n\top_native_open,\n};") != std::string::npos, "the OFF table is ABI 3 / 152 bytes with no display members (flags 0, no hook, no PCI getter) and native_open");
+     expect(nub.find("functionName->isEqualTo(N48_METAL_FN_SYMBOL)") != std::string::npos && nub.find("*(const N48MetalOps **)param1 = n48disp::ops_shape(n48disp_latched_on()).dispFlags != 0u ? &gOps : &gOpsOff;") != std::string::npos, "callPlatformFunction n48.metal.ops hands out the static table the latch chooses (the display-OFF ABI-3 table unless boot-arg navi48-metal-disp=1)");
+     expect(nub.find("if (!d || d != gDev || d->magic != kDevMagic) return;") != std::string::npos, "device_close is idempotent and identity-checked");
+     // -- 0.0.611: the vhook and the config are the pure code --
+@@ -386,8 +386,8 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
+         const size_t p = engh.find("kN1cKextBuild = "); const int build = p == std::string::npos ? -1 : std::atoi(engh.c_str() + p + 16);
+         const size_t v = plist.find("<string>0.0."); const int ver = v == std::string::npos ? -2 : std::atoi(plist.c_str() + v + 12);
+         expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version");
+-        expect_u("Info.plist is 0.0.664", (uint64_t)ver, 664); expect_u("the plist carries the version twice", count_of(plist, "0.0.664"), 2);
+-        expect(nub.find("664u") != std::string::npos && nub.find("658u") == std::string::npos && nub.find("613u") == std::string::npos, "both ops tables carry the build 664");
++        expect_u("Info.plist is 0.0.665", (uint64_t)ver, 665); expect_u("the plist carries the version twice", count_of(plist, "0.0.665"), 2);
++        expect(nub.find("665u") != std::string::npos && nub.find("658u") == std::string::npos && nub.find("613u") == std::string::npos, "both ops tables carry the build 665");
+     }
+     expect(mk.find("src/Navi48MetalNub.cpp") != std::string::npos, "the Makefile builds Navi48MetalNub.cpp");
+     expect(abi.find("N48N_SEL_METAL_NUB_PUBLISH") != std::string::npos && abi.find("Never done at boot") != std::string::npos, "the ABI header documents the publish selector");
+diff --git a/src/navi48-bringup/tests/native_rebar_test.cpp b/src/navi48-bringup/tests/native_rebar_test.cpp
+index 02e1ca6..57fd5e4 100644
+--- a/src/navi48-bringup/tests/native_rebar_test.cpp
++++ b/src/navi48-bringup/tests/native_rebar_test.cpp
+@@ -322,8 +322,8 @@ static void p5_pins(const std::string &root) {
+     expect(has(nbif, "writing BASE_LOW %#010x") && has(nbif, "writing BASE_HIGH %#010x") && at(nbif, "writing BASE_HIGH") < at(nbif, "kRegSelfringBaseHigh, aHigh, beforeHigh, high"), "P5 item 7: the self-ring low and high halves are logged before they are written");
+     // version
+     const std::string plist = slurp(root + "/src/navi48-bringup/Info.plist");
+-    expect(count_of(plist, "<string>0.0.664</string>") == 2, "P5: Info.plist is 0.0.664, carried twice");
+-    expect(has(s1ch, "constexpr uint32_t kN1cKextBuild = 664;"), "P5: the native client reports build 664");
++    expect(count_of(plist, "<string>0.0.665</string>") == 2, "P5: Info.plist is 0.0.665, carried twice");
++    expect(has(s1ch, "constexpr uint32_t kN1cKextBuild = 665;"), "P5: the native client reports build 665");
+ }
+ 
+ static void p6_vramstat(const std::string &root) {
+diff --git a/src/navi48-bringup/tests/native_s1c_test.cpp b/src/navi48-bringup/tests/native_s1c_test.cpp
+index 66cd6cf..88c4aa0 100644
+--- a/src/navi48-bringup/tests/native_s1c_test.cpp
++++ b/src/navi48-bringup/tests/native_s1c_test.cpp
+@@ -80,6 +80,21 @@ static void u1_abi() {
+     expect_u("struct sizes: gem_create_in", sizeof(n48n_gem_create_in), 32); expect_u("gem_va", sizeof(n48n_gem_va), 64);
+     expect_u("ctx", sizeof(n48n_ctx), 16); expect_u("cs_ib", sizeof(n48n_cs_ib), 32); expect_u("cs_in", sizeof(n48n_cs_in), 32);
+     expect_u("info", sizeof(n48n_info), 192);
++    // 0.0.665 (ABI 1.13): the die topology tail. Appended, never resized —
++    // the first 192 bytes of the 288-byte record are still the 1.12 record,
++    // so a caller that asks for 192 from a new kext and a caller that asks
++    // for 288 from an old one both get a defined answer.
++    expect_u("topo size == N48N_TOPO_SIZE", sizeof(n48n_topo), N48N_TOPO_SIZE);
++    expect_u("topo", N48N_TOPO_SIZE, 96);
++    expect_u("QueryInfo extended record", sizeof(n48n_info) + sizeof(n48n_topo), 288);
++    expect_u("topo flag", N48N_INFO_TOPO, 1u << 3);
++    expect_u("topo.flags stays a bit below the topo flag", N48N_INFO_S1B_POSITIVE < N48N_INFO_TOPO ? 1u : 0u, 1u);
++    expect_u("topo.size at 0", __builtin_offsetof(n48n_topo, size), 0);
++    expect_u("topo.gc_version at 4", __builtin_offsetof(n48n_topo, gc_version), 4);
++    expect_u("topo.num_rb_pipes at 24", __builtin_offsetof(n48n_topo, num_rb_pipes), 24);
++    expect_u("topo.cu_bitmap at 48", __builtin_offsetof(n48n_topo, cu_bitmap), 48);
++    expect_u("topo.cu_bitmap is the ioctl's 4x2", sizeof(((n48n_topo *)0)->cu_bitmap), 32);
++    expect_u("topo.reserved at 80", __builtin_offsetof(n48n_topo, reserved), 80);
+     // The return codes of the contract's table (section 1.1), as raw numbers.
+     expect_u("BadArgument", kBadArg, 0xe00002c2u); expect_u("NotFound", kNotFound, 0xe00002f0u); expect_u("Unsupported", kUnsupported, 0xe00002c7u);
+     expect_u("NoMemory", kNoMemory, 0xe00002bdu); expect_u("NoResources", kNoResources, 0xe00002beu); expect_u("NotReady", kNotReady, 0xe00002d8u);
+@@ -683,7 +698,7 @@ static void u12_pins(const std::string &root) {
+     }
+     // build plumbing
+     expect(mk.find("src/Navi48NativeClient.cpp") != std::string::npos, "the Makefile builds the client");
+-    expect(plist.find("<string>0.0.664</string>") != std::string::npos && count_of(plist, "0.0.664") == 2 && plist.find("0.0.605") == std::string::npos, "Info.plist is 0.0.664");
++    expect(plist.find("<string>0.0.665</string>") != std::string::npos && count_of(plist, "0.0.665") == 2 && plist.find("0.0.605") == std::string::npos, "Info.plist is 0.0.665");
+     expect(pure.find("kWbOffsetNativeSeq = 0x0C0u") != std::string::npos, "the native seqno slot offset");
+     // banned strings in the new files
+     const std::string bad1 = std::string("pipe+0x2") + "80", bad2 = std::string("+0x2") + "82", bad3 = std::string("+0x2") + "99";   // built at run time: this file must not contain the tokens
+diff --git a/src/navi48-bringup/tests/native_s2_dal_test.cpp b/src/navi48-bringup/tests/native_s2_dal_test.cpp
+index 41e510b..52e9dda 100644
+--- a/src/navi48-bringup/tests/native_s2_dal_test.cpp
++++ b/src/navi48-bringup/tests/native_s2_dal_test.cpp
+@@ -1275,7 +1275,7 @@ static void s_pins(const std::string &root) {
+     }
+     // the ABI
+     expect_u("N48N_SEL_DAL_STEP", N48N_SEL_DAL_STEP, 15); expect_u("selector count 1.2", N48N_SEL_COUNT_1_2, 16); expect_u("v1.1 count unchanged", N48N_SEL_COUNT_1_1, 15); expect_u("v1.0 count unchanged", N48N_SEL_COUNT, 9);
+-    expect_u("ABI major unchanged", N48N_ABI_VERSION, 1); expect_u("ABI minor 12 (1.12 since 0.0.662; 1.11 since 0.0.661; 1.10 since 0.0.640: the VRAM budget words; 1.9 since 0.0.612: BoImportHost; 1.8 since 0.0.610: the Metal nub selectors; 1.7 since 0.0.609; 1.6 was 0.0.608; 1.5 was 0.0.607; 1.4 grew the mode-trial result, the mode-trial selector arrived in 1.3, the DAL step selector in 1.2)", N48N_ABI_MINOR, 12);
++    expect_u("ABI major unchanged", N48N_ABI_VERSION, 1); expect_u("ABI minor 13 (1.12 since 0.0.662; 1.11 since 0.0.661; 1.10 since 0.0.640: the VRAM budget words; 1.9 since 0.0.612: BoImportHost; 1.8 since 0.0.610: the Metal nub selectors; 1.7 since 0.0.609; 1.6 was 0.0.608; 1.5 was 0.0.607; 1.4 grew the mode-trial result, the mode-trial selector arrived in 1.3, the DAL step selector in 1.2)", N48N_ABI_MINOR, 13);
+     expect_u("result size", sizeof(n48n_dal_result), 256);
+     expect(N48N_DAL_V_PASS == kPass && N48N_DAL_V_REFUSED == kRefused && N48N_DAL_V_TIMEOUT == kTimeout && N48N_DAL_V_REGRESSED == kRegressed && N48N_DAL_V_GLITCH == kGlitch && N48N_DAL_V_DENIED == kDenied && N48N_DAL_V_SHORT == kShort, "the ABI verdict values are the pure header's");
+     expect(N48N_DAL_STEP_E1B == kE1b && N48N_DAL_STEP_E2 == kE2 && N48N_DAL_STEP_E3 == kE3 && N48N_DAL_STEP_E4 == kE4, "the ABI step numbers are the pure header's");
+@@ -1292,7 +1292,7 @@ static void s_pins(const std::string &root) {
+     {
+         const size_t p = engh.find("kN1cKextBuild = "); const int build = p == std::string::npos ? -1 : std::atoi(engh.c_str() + p + 16);
+         const size_t v = plist.find("<string>0.0."); const int ver = v == std::string::npos ? -2 : std::atoi(plist.c_str() + v + 12);
+-        expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version"); expect_u("Info.plist is 0.0.664", (uint64_t)ver, 664); expect_u("the plist carries the version twice", count_of(plist, "0.0.664"), 2);
++        expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version"); expect_u("Info.plist is 0.0.665", (uint64_t)ver, 665); expect_u("the plist carries the version twice", count_of(plist, "0.0.665"), 2);
+     }
+     expect(mk.find("$(wildcard src/amd/*.cpp)") != std::string::npos, "the Makefile builds src/amd/*.cpp (smu_dal.cpp)");
+     // the tool
+diff --git a/src/navi48-bringup/tests/native_s2a_test.cpp b/src/navi48-bringup/tests/native_s2a_test.cpp
+index e375c92..b33a982 100644
+--- a/src/navi48-bringup/tests/native_s2a_test.cpp
++++ b/src/navi48-bringup/tests/native_s2a_test.cpp
+@@ -56,7 +56,7 @@ static void s1_abi() {
+     expect_u("the v1.0 selector count is unchanged (old clients' tables stay valid)", N48N_SEL_COUNT, 9);
+     expect_u("the ABI 1.1 selector count", N48N_SEL_COUNT_1_1, 15);
+     expect_u("ABI major unchanged: every v1.0 client still handshakes", N48N_ABI_VERSION, 1);
+-    expect_u("ABI minor (1.12 since 0.0.662; 1.11 since 0.0.661; 1.10 since 0.0.640: the VRAM budget words; 1.9 since 0.0.612: BoImportHost, selector 21; 1.8 since 0.0.610: the Metal nub selectors 19 / 20; 1.7 since 0.0.609: the row-120 HELD mode; 1.6 was 0.0.608: row 120 transition reads; 1.5 was 0.0.607: row 120 + the hold report; 1.4 was 0.0.606's 512 B result, 1.3 0.0.605's mode-trial selector, 1.2 0.0.604's DAL step; 1.11 since 0.0.661: the instance-2 scanout selectors 22..26; 1.12 since 0.0.662: the instance-1 (monitor A) scanout behind navi48-m6flip1)", N48N_ABI_MINOR, 12);
++    expect_u("ABI minor (1.12 since 0.0.662; 1.11 since 0.0.661; 1.10 since 0.0.640: the VRAM budget words; 1.9 since 0.0.612: BoImportHost, selector 21; 1.8 since 0.0.610: the Metal nub selectors 19 / 20; 1.7 since 0.0.609: the row-120 HELD mode; 1.6 was 0.0.608: row 120 transition reads; 1.5 was 0.0.607: row 120 + the hold report; 1.4 was 0.0.606's 512 B result, 1.3 0.0.605's mode-trial selector, 1.2 0.0.604's DAL step; 1.11 since 0.0.661: the instance-2 scanout selectors 22..26; 1.12 since 0.0.662: the instance-1 (monitor A) scanout behind navi48-m6flip1)", N48N_ABI_MINOR, 13);
+     expect(N48N_HELLO_F_MINOR != 1u && (N48N_HELLO_F_MINOR & 1u) == 0u, "the minor flag is not bit 0: T1's Hello(flags = 1) is still refused");
+     expect_u("query size", sizeof(n48n_scan_query), 96); expect_u("reg size", sizeof(n48n_scan_reg), 32);
+     expect_u("slot size", sizeof(n48n_scan_slot), 32);   expect_u("status size", sizeof(n48n_scan_status), 256);
+@@ -64,7 +64,7 @@ static void s1_abi() {
+     expect_u("no-slot value equal", N48N_SCAN_NO_SLOT, kNoSlot);
+     expect_u("format constant", N48N_SCAN_FMT_ARGB8888, kFmtArgb8888);
+     expect_u("a v1.0 client's Hello out[0] (no flag) would be exactly the major", (uint64_t)N48N_ABI_VERSION, 1);
+-    expect_u("with the flag out[0] = major | minor << 16", (uint64_t)N48N_ABI_VERSION | ((uint64_t)N48N_ABI_MINOR << 16), 0xC0001);
++    expect_u("with the flag out[0] = major | minor << 16", (uint64_t)N48N_ABI_VERSION | ((uint64_t)N48N_ABI_MINOR << 16), 0xD0001);
+ }
+ 
+ static BoRef vis(uint64_t mc, uint64_t size) { return BoRef{ true, mc, size }; }
+@@ -620,8 +620,8 @@ static void s11_pins(const std::string &root) {
+         const size_t v = plist.find("<string>0.0.");
+         const int ver = v == std::string::npos ? -2 : std::atoi(plist.c_str() + v + 12);
+         expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version (Hello can no longer print a stale build)");
+-        expect_u("Info.plist is 0.0.664", (uint64_t)ver, 664);
+-        expect_u("the plist carries the version twice", count_of(plist, "0.0.664"), 2);
++        expect_u("Info.plist is 0.0.665", (uint64_t)ver, 665);
++        expect_u("the plist carries the version twice", count_of(plist, "0.0.665"), 2);
+     }
+     expect(mk.find("$(wildcard src/dcn/*.cpp)") != std::string::npos, "the Makefile builds src/dcn/*.cpp");
+     // -- the tool --
+diff --git a/src/navi48-bringup/tests/native_s2d_test.cpp b/src/navi48-bringup/tests/native_s2d_test.cpp
+index be98de1..9af0b39 100644
+--- a/src/navi48-bringup/tests/native_s2d_test.cpp
++++ b/src/navi48-bringup/tests/native_s2d_test.cpp
+@@ -1522,7 +1522,7 @@ static void s_pins(const std::string &root) {
+     expect(!dcn.empty() && !dcnh.empty() && !eng.empty() && !engh.empty() && !cli.empty() && !boot.empty() && !pure.empty() && !tabh.empty() && !abi.empty() && !plist.empty() && !tool.empty() && !gen.empty(), "the sources are readable");
+     // ABI 1.3
+     expect_u("N48N_SEL_MODE_TRIAL is 16", N48N_SEL_MODE_TRIAL, 16); expect_u("selector count 1.3", N48N_SEL_COUNT_1_3, 17); expect_u("selectors 17 / 18 (1.7)", N48N_SEL_MODE_HOLD * 100 + N48N_SEL_MODE_RELEASE, 1718); expect_u("selector count 1.7", N48N_SEL_COUNT_1_7, 19); expect_u("selector count 1.2 unchanged", N48N_SEL_COUNT_1_2, 16);
+-    expect_u("selector count 1.1 unchanged", N48N_SEL_COUNT_1_1, 15); expect_u("selector count 1.0 unchanged", N48N_SEL_COUNT, 9); expect_u("ABI major unchanged", N48N_ABI_VERSION, 1); expect_u("ABI minor 12 (1.12 since 0.0.662; 1.11 since 0.0.661; 1.10 since 0.0.640: the VRAM budget words; 1.9 since 0.0.612: BoImportHost; 1.8 since 0.0.610: the Metal nub selectors 19 / 20; 1.7 since 0.0.609: the HELD mode, selectors 17 / 18; 1.6 was 0.0.608: the row-120 transition reads live in the result's former reserved[8]; 1.5 was 0.0.607; the struct sizes are unchanged)", N48N_ABI_MINOR, 12);
++    expect_u("selector count 1.1 unchanged", N48N_SEL_COUNT_1_1, 15); expect_u("selector count 1.0 unchanged", N48N_SEL_COUNT, 9); expect_u("ABI major unchanged", N48N_ABI_VERSION, 1); expect_u("ABI minor 13 (1.12 since 0.0.662; 1.11 since 0.0.661; 1.10 since 0.0.640: the VRAM budget words; 1.9 since 0.0.612: BoImportHost; 1.8 since 0.0.610: the Metal nub selectors 19 / 20; 1.7 since 0.0.609: the HELD mode, selectors 17 / 18; 1.6 was 0.0.608: the row-120 transition reads live in the result's former reserved[8]; 1.5 was 0.0.607; the struct sizes are unchanged)", N48N_ABI_MINOR, 13);
+     expect_u("mode result size (512 B since ABI 1.4; the first 256 B are the 1.3 layout)", sizeof(n48n_mode_result), 512); expect_u("the extension starts at 256", __builtin_offsetof(n48n_mode_result, ext), 256); expect_u("the extension is 256 B", sizeof(n48n_mode_ext), 256); expect_u("result offsets", __builtin_offsetof(n48n_mode_result, rate_before_mhz) * 1000 + __builtin_offsetof(n48n_mode_result, fifo_before), 48080);
+     expect_u("result offsets 2", __builtin_offsetof(n48n_mode_result, mismatch) * 1000 + __builtin_offsetof(n48n_mode_result, dto_phase), 128160);
+     expect_u("the ABI: health flag bit 12, the 208 counters and the 1.6 words at 224", N48N_MODE_F_HEALTH_BAD * 1000ull + __builtin_offsetof(n48n_mode_result, dio_write_errs) + __builtin_offsetof(n48n_mode_result, uf_optc_rs_dto), 4096000 + 208 + 224);
+@@ -1603,7 +1603,7 @@ static void s_pins(const std::string &root) {
+     {
+         const size_t p = engh.find("kN1cKextBuild = "); const int build = p == std::string::npos ? -1 : std::atoi(engh.c_str() + p + 16);
+         const size_t v = plist.find("<string>0.0."); const int ver = v == std::string::npos ? -2 : std::atoi(plist.c_str() + v + 12);
+-        expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version"); expect_u("Info.plist is 0.0.664", (uint64_t)ver, 664); expect_u("the plist carries the version twice", count_of(plist, "0.0.664"), 2);
++        expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version"); expect_u("Info.plist is 0.0.665", (uint64_t)ver, 665); expect_u("the plist carries the version twice", count_of(plist, "0.0.665"), 2);
+     }
+     // no log line of the glue can be cut by the 512-byte logger: literal length + 12 bytes per conversion at the widest
+     {
+diff --git a/src/navi48-bringup/tests/native_scanx_test.cpp b/src/navi48-bringup/tests/native_scanx_test.cpp
+index 3278384..44ebfa6 100644
+--- a/src/navi48-bringup/tests/native_scanx_test.cpp
++++ b/src/navi48-bringup/tests/native_scanx_test.cpp
+@@ -869,7 +869,7 @@ static void suite_pins(const std::string &root) {
+     EXPECT(has(disp, "void m6_flush_deferred() { if (n48m6flip_latched_on()) (void)n48m6::pub_rate_flush(gD.m6Rate, now_ns(), [this]() { m6_publish_now(); }); }") && disp.find("m6_flush_deferred();\n        const uint32_t r = n48m6::learn_surface") != std::string::npos, "M1: EVERY submit of ANY pipe (m6_learn, before the learn) flushes a deferred publish once its gap has passed: no Status call is needed");
+     EXPECT(has(disp, "if (!n48m6flip_latched_on() || n48m6::log_admit(gD.m6LogNs, now_ns())) {"), "S-2: the per-learn log line is rate-limited behind the latch");
+     // ABI / policy / client
+-    EXPECT(N48N_ABI_MINOR == 12u && N48N_SEL_SCANX_ACQUIRE == 22 && N48N_SEL_SCANX_REGISTER == 23 && N48N_SEL_SCANX_PRESENT == 24 && N48N_SEL_SCANX_STATUS == 25 && N48N_SEL_SCANX_RELEASE == 26 && N48N_SEL_COUNT_1_11 == 27 && N48N_SEL_COUNT_1_12 == 27, "X11: ABI 1.12, the same selectors 22..26 (no new selector)");
++    EXPECT(N48N_ABI_MINOR == 13u && N48N_SEL_SCANX_ACQUIRE == 22 && N48N_SEL_SCANX_REGISTER == 23 && N48N_SEL_SCANX_PRESENT == 24 && N48N_SEL_SCANX_STATUS == 25 && N48N_SEL_SCANX_RELEASE == 26 && N48N_SEL_COUNT_1_11 == 27 && N48N_SEL_COUNT_1_12 == 27, "X11: ABI 1.12, the same selectors 22..26 (no new selector)");
+     EXPECT(N48N_SCANQ_M6FLIP == (1u << 6) && N48N_SCANQ_M6FLIP1 == (1u << 7) && N48N_SCANX_INSTANCE == 2u && N48N_SCANX_SLOT_TAG == 0x20u && N48N_SCANX_INSTANCE_MONA == 1u && N48N_SCANX_SLOT_TAG_MONA == 0x10u, "X11: the flag bits, the instances, the tags");
+     EXPECT(N48N_SCANX_INSTANCE == kDescMonB.inst && N48N_SCANX_SLOT_TAG == kDescMonB.slotTag && N48N_SCANX_INSTANCE_MONA == kDescMonA.inst && N48N_SCANX_SLOT_TAG_MONA == kDescMonA.slotTag, "X11: the ABI's instances and tags are the descriptors'");
+     EXPECT(sizeof(n48n_scan_status) == 256 && sizeof(n48n_scan_reg) == 32, "X11: the structs are unchanged");
+@@ -898,7 +898,7 @@ static void suite_pins(const std::string &root) {
+     EXPECT(has(disp, "KernelEnv ke; (void)n48m6::pub_rate_flush(gD.m6Rate, now_ns(), [&ke]() { ke.m6_publish_now(); });") && has(glue, "if (n48m6_latched_on() && n48m6flip_latched_on()) n48disp_m6_flush();"), "R5: Status flushes a deferred table publish");
+     EXPECT(has(pure, "if (!__atomic_compare_exchange_n(&r.lastNs, &last, nowNs, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return false;") && has(pure, "struct PubRate { volatile uint64_t lastNs; volatile uint32_t dirty; };"), "M1: the flush wins its slot by compare-and-swap and PubRate is atomic");
+     // version / CLI
+-    EXPECT(count_of(plist, "<string>0.0.664</string>") == 2 && !has(plist, "<string>0.0.661</string>"), "X11: the kext is 0.0.664");
++    EXPECT(count_of(plist, "<string>0.0.665</string>") == 2 && !has(plist, "<string>0.0.661</string>"), "X11: the kext is 0.0.665");
+     EXPECT(has(clic, "in = 107;") && has(clic, "cmd_m6xstat(arg, arg2)") && has(clic, "dr_call(107, inst == 1u ?"), "X11: the CLI verb m6xstat (action 107) takes the instance");
+     EXPECT(has(clic, "static int cmd_m6xstat(const char *a1, const char *a2) {") && has(clic, "accel m6xstat <1|2> <0|1|2|all>") && has(clic, "m6xstat inst1 page %u: navi48-m6 %s, navi48-m6flip %s, navi48-m6flip1 %s"), "X11 (item 11): m6xstat <1|2> [page]; one argument stays a page of the monitor B");
+     EXPECT(has(clic, "page == 4") && has(clic, "AGDC 0x921 answered") && has(clic, "for (unsigned p = 0; p < 5; p++) rc |= m6stat_page(p);"), "X11 (item 11): m6stat prints the AGDC per-instance fields (page 4)");
+diff --git a/src/navi48-bringup/tests/navi44_die_test.cpp b/src/navi48-bringup/tests/navi44_die_test.cpp
+index ba33140..024dd96 100644
+--- a/src/navi48-bringup/tests/navi44_die_test.cpp
++++ b/src/navi48-bringup/tests/navi44_die_test.cpp
+@@ -2,16 +2,18 @@
+ // not need a GPU: the per-die firmware set (fw_table, patch 0002) and the
+ // per-die geometry fallback + GB_ADDR_CONFIG override (gfx_v12_0, patch 0003).
+ //
+-//     zig c++ -std=c++17 -I hosttest/shim -I src/amd -o navi44_die_test \
+-//         tests/navi44_die_test.cpp src/amd/fw_table.cpp \
+-//         src/amd/gfx_v12_0.cpp src/fw/*.c
+-//     ./navi44_die_test [firmware dir]
++//     zig c++ -std=c++17 -I hosttest/shim -I src/amd -I src/fw \
++//         -o navi44_die_test tests/navi44_die_test.cpp src/amd/fw_table.cpp \
++//         src/amd/gfx_v12_0.cpp <fw objects compiled with zig cc -std=c11>
++//     ./navi44_die_test [firmware dir]        # from src/navi48-bringup
+ //
+ // The firmware cases compare the embedded blobs against firmware/*.bin
+ // byte-for-byte, so they also catch an embed step that silently picked up
+ // the wrong file. The geometry cases drive the real public entry points:
+ // gfx_gpu_early_init() on a synthetic IP table, and gfx_get_gb_addr_config()
+-// against a scratch MMIO window standing in for BAR5.
++// against a scratch MMIO window standing in for BAR5. The topology cases run
++// the whole gfx_constants_init() sequence and pin the record the kext appends
++// to QueryInfo (ABI 1.13) against the Linux ioctl it reproduces.
+ #include "fw_table.h"
+ #include "amdgpu_gfx.h"
+ 
+@@ -500,6 +502,214 @@ void setupRbTests()
+     }
+ }
+ 
++// ------------------------------------------------- topology record (QueryInfo tail)
++//
++// gfx_topo_report is what the kext appends to QueryInfo (ABI 1.13) so Mesa can
++// stop assuming gfx1201. Its fields mirror Linux's amdgpu_info_ioctl one for
++// one, so the expectations below are written from that ioctl (amdgpu_kms.c
++// 952/953/969/970/1015/1020/1029) and not from GFXConfig — a copy that agrees
++// with the struct but not with the ioctl is exactly the bug this pins.
++//
++// The load-bearing pair is num_rb_pipes vs enabled_rb_pipes_mask: the first is
++// the PHYSICAL product SE x RB/SE, the second the HARVESTED bitmap. They are
++// asserted to disagree in the harvested case, which no other check here does.
++struct Brought {
++    GFXConfig cfg;
++    GFXTopo   topo;
++};
++
++// The real bring-up order, not a hand-built config: gfx_constants_init runs
++// early_init -> gb_addr_config -> setup_rb -> get_cu_info and marks the config
++// inited at the end, which is the gate gfx_topo_report reads.
++static Brought bringUp(Scratch &s, IPVersion v, uint32_t gb)
++{
++    s.dev.ip.setVersion(IPBlock::GC, v);
++    s.reg(gb);
++    Brought b{};
++    (void)gfx_constants_init(s.dev, b.cfg);
++    gfx_topo_report(b.cfg, v, b.topo);
++    return b;
++}
++
++void topoTests()
++{
++    std::printf("\n================ topology record (gfx_topo_report) ================\n");
++
++    const uint32_t kGb44 = packGb(1, 1, 1, 3, 1, 1);   // 2 SE, 2 RB/SE
++    const uint32_t kGb48 = packGb(2, 2, 2, 3, 1, 1);   // 4 SE, 4 RB/SE
++
++    // ---- Navi 44, a full die: 2 SE x 2 SA x 8 CU, 2 RB/SE ----
++    {
++        Scratch s;
++        const Brought b = bringUp(s, {12, 0, 0}, kGb44);
++        ok("navi44 topo: constants_init inited the config", b.cfg.inited);
++        ok("navi44 topo: valid", b.topo.valid);
++        eq("navi44 topo: gc version",
++           ((b.topo.gc_major << 16) | (b.topo.gc_minor << 8) | b.topo.gc_rev),
++           0x000C0000u);   // IP_VERSION(12,0,0) — 12 is decimal, not 0x12
++        eq("navi44 topo: max_shader_engines (:952)", b.topo.max_shader_engines, 2);
++        eq("navi44 topo: max_sh_per_se (:953)", b.topo.max_sh_per_se, 2);
++        eq("navi44 topo: max_cu_per_sh (:1029)", b.topo.max_cu_per_sh, 8);
++        eq("navi44 topo: max_backends_per_se", b.topo.max_backends_per_se, 2);
++        eq("navi44 topo: num_rb_pipes = 2 SE x 2 RB (:970)", b.topo.num_rb_pipes, 4);
++        eq("navi44 topo: enabled_rb_pipes_mask (:969)", b.topo.enabled_rb_pipes_mask, 0xFu);
++        eq("navi44 topo: mask_hi unused on RDNA4", b.topo.enabled_rb_pipes_mask_hi, 0u);
++        eq("navi44 topo: cu_active_number = 32 (:1015)", b.topo.cu_active_number, 32);
++        eq("navi44 topo: cu_active_wgp_number = 16", b.topo.cu_active_wgp_number, 16);
++        eq("navi44 topo: num_se from live rows", b.topo.num_se, 2);
++        for (uint32_t se = 0; se < 4; se++) {
++            for (uint32_t sa = 0; sa < 2; sa++) {
++                const uint32_t want = (se < 2) ? 0xFFu : 0u;   // 8 CUs, or no row
++                eq(("navi44 topo: cu_bitmap[" + std::to_string(se) + "][" +
++                    std::to_string(sa) + "] (:1020)").c_str(),
++                   b.topo.cu_bitmap[se][sa], want);
++            }
++        }
++        eq("navi44 topo: mask popcount == num_rbs",
++           __builtin_popcount(b.topo.enabled_rb_pipes_mask), b.cfg.num_rbs);
++    }
++
++    // ---- Navi 48, a full die: 4 SE x 2 SA x 8 CU, 4 RB/SE ----
++    // The die Mesa assumed for everyone: 64 CUs and a 16-bit RB mask.
++    {
++        Scratch s;
++        const Brought b = bringUp(s, {12, 0, 1}, kGb48);
++        ok("navi48 topo: valid", b.topo.valid);
++        eq("navi48 topo: gc version",
++           ((b.topo.gc_major << 16) | (b.topo.gc_minor << 8) | b.topo.gc_rev),
++           0x000C0001u);   // IP_VERSION(12,0,1)
++        eq("navi48 topo: max_shader_engines", b.topo.max_shader_engines, 4);
++        eq("navi48 topo: max_backends_per_se", b.topo.max_backends_per_se, 4);
++        eq("navi48 topo: num_rb_pipes = 4 SE x 4 RB", b.topo.num_rb_pipes, 16);
++        eq("navi48 topo: enabled_rb_pipes_mask", b.topo.enabled_rb_pipes_mask, 0xFFFFu);
++        eq("navi48 topo: cu_active_number = 64", b.topo.cu_active_number, 64);
++        eq("navi48 topo: cu_active_wgp_number = 32", b.topo.cu_active_wgp_number, 32);
++        eq("navi48 topo: num_se", b.topo.num_se, 4);
++        for (uint32_t se = 0; se < 4; se++) {
++            for (uint32_t sa = 0; sa < 2; sa++) {
++                eq(("navi48 topo: cu_bitmap[" + std::to_string(se) + "][" +
++                    std::to_string(sa) + "]").c_str(),
++                   b.topo.cu_bitmap[se][sa], 0xFFu);
++            }
++        }
++    }
++
++    // ---- Navi 44 with SE1 harvested off entirely (SAs 2 and 3 disabled) ----
++    // 1 shader array = 1 RB here, so the mask loses 2 bits while num_rb_pipes
++    // stays 4: the physical/harvested split made visible.
++    {
++        Scratch s;
++        s.dev.ip.setVersion(IPBlock::GC, {12, 0, 0});
++        s.reg(kGb44);
++        s.gc0(GFXRegs::GRBM_CC_GC_SA_UNIT_DISABLE,
++              0xCu << GRBM_CC_GC_SA_UNIT_DISABLE__SA_DISABLE__SHIFT);
++        const Brought b = bringUp(s, {12, 0, 0}, kGb44);
++        ok("navi44 SE1 gone: valid", b.topo.valid);
++        eq("navi44 SE1 gone: num_rb_pipes keeps the physical 4",
++           b.topo.num_rb_pipes, 4);
++        eq("navi44 SE1 gone: enabled_rb_pipes_mask is the harvested 2",
++           b.topo.enabled_rb_pipes_mask, 0x3u);
++        ok("navi44 SE1 gone: the two RB fields must not be equal",
++           b.topo.num_rb_pipes != b.topo.enabled_rb_pipes_mask);
++        eq("navi44 SE1 gone: num_rbs agrees with the mask", b.cfg.num_rbs, 2);
++        eq("navi44 SE1 gone: 16 CUs left", b.topo.cu_active_number, 16);
++        eq("navi44 SE1 gone: 8 WGPs left", b.topo.cu_active_wgp_number, 8);
++        eq("navi44 SE1 gone: num_se drops to 1", b.topo.num_se, 1);
++        eq("navi44 SE1 gone: SE0 SA0 row", b.topo.cu_bitmap[0][0], 0xFFu);
++        eq("navi44 SE1 gone: SE0 SA1 row", b.topo.cu_bitmap[0][1], 0xFFu);
++        eq("navi44 SE1 gone: SE1 SA0 row empty", b.topo.cu_bitmap[1][0], 0u);
++        eq("navi44 SE1 gone: SE1 SA1 row empty", b.topo.cu_bitmap[1][1], 0u);
++    }
++
++    // ---- Navi 44 with one WGP harvested in every live array ----
++    // CC_GC_SHADER_ARRAY_CONFIG.INACTIVE_WGPS is bit-per-WGP at 31:16 and is
++    // read broadcast-wide, so WGP0 disappearing costs 2 CUs in each of 4
++    // arrays: 32 -> 24, and a 0xfc row instead of 0xff. The RB mask is
++    // untouched — CU harvest and RB harvest are different fields, and Mesa
++    // needs both to be reported separately.
++    {
++        Scratch s;
++        s.dev.ip.setVersion(IPBlock::GC, {12, 0, 0});
++        s.reg(kGb44);
++        s.gc0(GFXRegs::CC_GC_SHADER_ARRAY_CONFIG,
++              0x1u << CC_GC_SHADER_ARRAY_CONFIG__INACTIVE_WGPS__SHIFT);
++        const Brought b = bringUp(s, {12, 0, 0}, kGb44);
++        ok("navi44 WGP0 off: valid", b.topo.valid);
++        eq("navi44 WGP0 off: 24 CUs", b.topo.cu_active_number, 24);
++        eq("navi44 WGP0 off: 12 WGPs", b.topo.cu_active_wgp_number, 12);
++        eq("navi44 WGP0 off: row is 8 CU bits minus the pair",
++           b.topo.cu_bitmap[0][0], 0xFCu);
++        eq("navi44 WGP0 off: every array loses the same WGP",
++           b.topo.cu_bitmap[1][1], 0xFCu);
++        eq("navi44 WGP0 off: RB mask unaffected", b.topo.enabled_rb_pipes_mask, 0xFu);
++        eq("navi44 WGP0 off: num_rb_pipes unaffected", b.topo.num_rb_pipes, 4);
++        eq("navi44 WGP0 off: num_se still 2", b.topo.num_se, 2);
++    }
++
++    // ---- the USER side of the same field ----
++    // get_cu_info ORs CC and USER before inverting, so a user-forced WGP
++    // disable harvests exactly like the factory fuse does.
++    {
++        Scratch s;
++        s.dev.ip.setVersion(IPBlock::GC, {12, 0, 0});
++        s.reg(kGb44);
++        s.gc1(GFXRegs::GC_USER_SHADER_ARRAY_CONFIG,
++              0xFu << GC_USER_SHADER_ARRAY_CONFIG__INACTIVE_WGPS__SHIFT);
++        const Brought b = bringUp(s, {12, 0, 0}, kGb44);
++        ok("navi44 all WGPs user-off: valid", b.topo.valid);
++        eq("navi44 all WGPs user-off: no CUs left", b.topo.cu_active_number, 0);
++        eq("navi44 all WGPs user-off: rows empty", b.topo.cu_bitmap[0][0], 0u);
++        eq("navi44 all WGPs user-off: num_se falls to 0", b.topo.num_se, 0);
++    }
++
++    // ---- a config that never went through constants_init ----
++    // Reporting zeros here would tell Mesa "this die has no CUs", which is a
++    // lie that propagates into the RADEON_DEBUG topology print and the RSR
++    // tables. valid=false is the signal for the kext to omit the tail and for
++    // Mesa to keep its own table.
++    {
++        GFXConfig cfg{};
++        GFXTopo t{};
++        gfx_topo_report(cfg, IPVersion{12, 0, 0}, t);
++        ok("uninited: not valid", !t.valid);
++        eq("uninited: gc version still reported", t.gc_minor, 0u);
++        eq("uninited: major still reported", t.gc_major, 12u);
++        eq("uninited: rev still reported", t.gc_rev, 0u);
++        eq("uninited: no SE count invented", t.max_shader_engines, 0u);
++        eq("uninited: no RB count invented", t.num_rb_pipes, 0u);
++        eq("uninited: no CU count invented", t.cu_active_number, 0u);
++        eq("uninited: no live SEs", t.num_se, 0u);
++        eq("uninited: mask left zero", t.enabled_rb_pipes_mask, 0u);
++    }
++    {
++        Scratch s;
++        s.dev.ip = IPBaseTable{};          // no GC base: constants_init refuses
++        s.reg(kGb44);
++        const Brought b = bringUp(s, {12, 0, 0}, kGb44);
++        ok("no GC base: constants_init did not reach inited", !b.cfg.inited);
++        ok("no GC base: tail stays invalid", !b.topo.valid);
++    }
++    {
++        // GB_ADDR_CONFIG unreadable (all-ones BAR) is the other realistic
++        // half-bring-up: constants_init still completes on the fallback caps,
++        // so the tail must report the fallback geometry rather than nothing.
++        Scratch s;
++        s.reg(0xFFFFFFFFu);
++        s.dev.ip.setVersion(IPBlock::GC, {12, 0, 0});
++        GFXConfig cfg{};
++        (void)gfx_constants_init(s.dev, cfg);
++        GFXTopo t{};
++        gfx_topo_report(cfg, IPVersion{12, 0, 0}, t);
++        ok("gb unreadable: still inited", cfg.inited);
++        ok("gb unreadable: tail valid", t.valid);
++        eq("gb unreadable: fallback SEs", t.max_shader_engines, 2);
++        eq("gb unreadable: fallback RBs/SE", t.max_backends_per_se, 2);
++        eq("gb unreadable: num_rb_pipes", t.num_rb_pipes, 4);
++        eq("gb unreadable: harvest regs read as 0 -> all CUs",
++           t.cu_active_number, 32);
++    }
++}
++
+ } // namespace
+ 
+ int main(int argc, char **argv)
+@@ -509,6 +719,7 @@ int main(int argc, char **argv)
+     firmwareTests(fwDir);
+     geometryTests();
+     setupRbTests();
++    topoTests();
+ 
+     std::printf("\n================ SUMMARY ================\n");
+     std::printf("%d check(s) failed out of %d\n", gFail, gRun);

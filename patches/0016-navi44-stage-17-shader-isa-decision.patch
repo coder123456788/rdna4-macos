@@ -1,0 +1,384 @@
+From d86a3bccb0be1c70d00f69c8e8e269a782f27a1b Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Thu, 29 Oct 2026 22:05:45 -0700
+Subject: [PATCH] 0016: decide, out loud, that stage 17's gfx1201 shader may
+ run on GC 12.0.0
+
+The compute dispatch is the rung everything else waits on: navi48-accel-gate=1
+publishes LoadAccelerator only after stage 17 passes, so "GPU acceleration"
+starts at a shader this port wrote itself. And both store_magic variants are
+assembled with -mcpu=gfx1201, for the other die.
+
+Nothing said so. 0012's gate checked the PSP blobs and stopped, which means a
+Navi 44 boot reaching stage 17 armed on an assumption nobody had written down -
+and a wave that never writes the result buffer looks exactly like a ring-setup
+failure, so the assumption could not even be tested afterwards.
+
+The reuse is defensible, and both arguments are offline-checkable, so state and
+test them: every opcode in either variant is GFX12 base with nothing from the
+gfx12_1 class, and Linux runs one GC path for both dies - gfx_v12_0.c falls
+through IP_VERSION(12, 0, 0)/(12, 0, 1) at :968 early init, :1425 queue
+topology, :1445 SC FIFO sizes and :3690 golden registers, so the ring, MQD and
+DISPATCH_DIRECT setup the shader lands on is the same code too.
+
+navi44_arm_gate() gains the blob as a fact and refuses only the thing that is
+not a judgement call: a 0-byte shader for a stage that uploads it, which
+navi44-force=1 cannot buy back. The decision reaches the registry as
+Navi44,ComputeBlob / ,ComputeBlobBytes / ,ComputeIsaNote, and the dispatch log
+prints "assembled for gfx1201, running on GC %u.%u.%u" with the version read
+from IP discovery - so the boot that hangs and the boot that passes are
+distinguishable by a photograph.
+
+The suite grows an opcode census that re-derives its whitelist from the .s
+sources on every run (107 checks, was 67), and eight more plants (39, was 31),
+including one that adds a non-base instruction to store_magic.s: the census is
+the check that can fail on a real future mistake rather than on a reworded
+comment.
+---
+ src/navi48-bringup/src/Navi48Bringup.cpp      |  24 ++++
+ src/navi48-bringup/src/amd/compute_test.cpp   |  10 +-
+ src/navi48-bringup/src/navi44_arm_gate.h      |  34 +++++
+ .../tests/navi44_arm_gate_plant.sh            |  19 ++-
+ .../tests/navi44_arm_gate_test.cpp            | 129 ++++++++++++++++++
+ 5 files changed, 211 insertions(+), 5 deletions(-)
+
+diff --git a/src/navi48-bringup/src/Navi48Bringup.cpp b/src/navi48-bringup/src/Navi48Bringup.cpp
+index 03580d3..869e502 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -44,6 +44,16 @@
+ 
+ #include "fw/fw_table.h"            // 0.0.664 (Navi 44 part 2): per-die firmware set, selected in probe()
+ 
++// 0016 — the stage-17 compute shader, so the Navi 44 gate can report what it is about to
++// let a writing stage upload. Same declaration as src/amd/compute_test.cpp's: C linkage
++// (the blobs are generated .c translation units), namespace-scoped names.
++namespace amdgpu {
++extern "C" {
++extern const size_t fw_shader_store_magic_size;
++extern const size_t fw_shader_store_magic_hsa_size;
++}
++} // namespace amdgpu
++
+ OSDefineMetaClassAndStructors(Navi48Bringup, IOService)
+ 
+ namespace {
+@@ -796,6 +806,13 @@ void Navi48Bringup::stagePSP() {
+ 		}
+ 		const amdgpu::FwBlob *sosProbe = amdgpu::fw_get(amdgpu::FwId::PSP_SOS);
+ 		facts.sosBlobPresent = sosProbe && sosProbe->data && sosProbe->size != 0;
++		// 0016: which shader stage 17 would upload, and how big it is. The ABI switch is
++		// the same boot-arg the ladder reads (Navi48Bringup.cpp's ctx.hsaAbi), so the gate
++		// judges the blob this boot actually runs, not whichever one we remembered.
++		uint32_t hsaAbi = 0;
++		PE_parse_boot_argn("navi48-hsa-abi", &hsaAbi, sizeof(hsaAbi));
++		facts.computeBlobName = hsaAbi ? "store_magic_hsa" : "store_magic";
++		facts.computeBlobBytes = static_cast<uint32_t>(hsaAbi ? amdgpu::fw_shader_store_magic_hsa_size : amdgpu::fw_shader_store_magic_size);
+ 		uint32_t force = 0;
+ 		facts.forceOverride = PE_parse_boot_argn("navi44-force", &force, sizeof(force)) && force != 0;
+ 
+@@ -811,6 +828,13 @@ void Navi48Bringup::stagePSP() {
+ 			N48LOG("psp-stage: Navi 44 gate ALLOWED (%s)%s", why,
+ 			       facts.forceOverride ? " — carried by navi44-force=1, not by the survey" : "");
+ 			setProperty("PSP,GateReason", why);
++			// The compute ladder's die assumption, in the registry where
++			// collect-survey.sh can photograph it. A stage-17 hang on Navi 44 is
++			// otherwise indistinguishable from a ring-setup hang.
++			setProperty("Navi44,ComputeBlob", facts.computeBlobName);
++			setProperty("Navi44,ComputeBlobBytes",
++			            static_cast<uint64_t>(facts.computeBlobBytes), 32);
++			setProperty("Navi44,ComputeIsaNote", n48::navi44ComputeIsaNote());
+ 		}
+ 	}
+ 
+diff --git a/src/navi48-bringup/src/amd/compute_test.cpp b/src/navi48-bringup/src/amd/compute_test.cpp
+index 1c96175..838cc2d 100644
+--- a/src/navi48-bringup/src/amd/compute_test.cpp
++++ b/src/navi48-bringup/src/amd/compute_test.cpp
+@@ -496,11 +496,17 @@ compute_dispatch_test(DeviceContext &dev, GMCContext &gmc, CPContext &cp,
+     const uint32_t sh_rsrc3 = hsaAbi ? kHsaPgmRsrc3 : kComputePgmRsrc3;
+     // The magic is part of the shader, so it switches with it.
+     const uint32_t sh_magic = hsaAbi ? kComputeMagicHsa : kComputeMagic;
++    // 0016: name the die under the blob. Both store_magic variants are assembled with
++    // -mcpu=gfx1201 (see shaders/*.s, tools/build-shader.sh) and reused on GC 12.0.0 on
++    // the strength of navi44ComputeIsaNote(); if a dispatch ever fails only on one of the
++    // two dies, this line is what makes the shader a suspect or clears it.
++    const IPVersion gcVer = dev.ip.getVersion(IPBlock::GC);
+     CS_LOG("shader: %s (%llu bytes), RSRC1=%#010x RSRC2=%#010x RSRC3=%#010x, "
+-           "s[0:1] = %s",
++           "s[0:1] = %s; assembled for gfx1201, running on GC %u.%u.%u",
+            hsaAbi ? "store_magic_hsa (LLVM-compiled)" : "store_magic (hand-written)",
+            (unsigned long long)sh_size, sh_rsrc1, sh_rsrc2, sh_rsrc3,
+-           hsaAbi ? "POINTER TO a kernarg buffer" : "the result buffer address");
++           hsaAbi ? "POINTER TO a kernarg buffer" : "the result buffer address",
++           gcVer.major, gcVer.minor, gcVer.rev);
+     r.kr               = kIOReturnNotReady;
+     r.lanes_checked    = kComputeThreadsX;
+     r.dispatch_initiator = kDispatchInitiator;
+diff --git a/src/navi48-bringup/src/navi44_arm_gate.h b/src/navi48-bringup/src/navi44_arm_gate.h
+index 8ac4ad3..b45539f 100644
+--- a/src/navi48-bringup/src/navi44_arm_gate.h
++++ b/src/navi48-bringup/src/navi44_arm_gate.h
+@@ -25,6 +25,10 @@
+ 
+ namespace n48 {
+ 
++// The stage the compute dispatch was added at, repeated here instead of including
++// amdgpu_init.h: this header is pure and the host suite compiles it alone.
++constexpr uint32_t kNavi44ComputeStage = 17;  // BringupStage::ComputeDispatch
++
+ struct Navi44ArmFacts {
+     bool     matchedNavi44      = false;  // PCI id said Navi 44 (0x7590 / 0x7591 ...)
+     bool     gcVersionKnown     = false;  // IP discovery resolved GC at all
+@@ -34,6 +38,10 @@ struct Navi44ArmFacts {
+     bool     discoveryValid     = false;  // the ROM's IP discovery table parsed
+     bool     forceOverride      = false;  // boot-arg navi44-force=1: arm on the owner's word
+     uint32_t requestedStage     = 0;      // navi48-stage=N; 0 means nothing was asked for
++    // 0016: stage 17 is the first rung that runs code *we* assembled rather than code the
++    // die ships. These two say which blob it will upload and how big it is.
++    uint32_t computeBlobBytes   = 0;      // size of the store_magic blob this ABI selects
++    const char *computeBlobName = nullptr;  // its name, for the log and the registry
+ };
+ 
+ enum class Navi44Arm {
+@@ -53,6 +61,16 @@ inline const char *navi44ArmReason(Navi44Arm v) {
+     return "refused";
+ }
+ 
++// 0016 — the sentence that explains why a shader assembled for the *other* die is the
++// right shader for this one. Owned here for the same reason the refusal texts are: the
++// log line, the registry key and the host test all read one string.
++inline const char *navi44ComputeIsaNote() {
++    return "gfx1201-assembled blob runs on GC 12.0.0: every opcode in both store_magic "
++           "variants is GFX12 base, none is gfx12_1-class, and Linux has one GC path for "
++           "both dies (gfx_v12_0.c falls through 12.0.0/12.0.1 at :968 early init, :1425 "
++           "queue topology, :1445 SC FIFO sizes, :3690 golden registers)";
++}
++
+ inline Navi44Arm navi44_arm_gate(const Navi44ArmFacts &f, const char **reasonOut) {
+     auto verdict = [&](Navi44Arm v, const char *r) {
+         if (reasonOut) *reasonOut = r;
+@@ -90,6 +108,22 @@ inline Navi44Arm navi44_arm_gate(const Navi44ArmFacts &f, const char **reasonOut
+         return verdict(Navi44Arm::Refuse,
+                        "no PSP SOS blob embedded for the selected firmware set - nothing to load");
+ 
++    // 0016 — stage 17 is where this ladder stops loading AMD's microcode and starts
++    // loading ours: compute_dispatch_test() uploads shaders/store_magic.s, assembled
++    // with -mcpu=gfx1201 for the other die. Reusing it is a decision, and the two facts
++    // behind it are checkable offline rather than assumed at boot — see
++    // navi44ComputeIsaNote(), whose opcode claim the host suite re-derives from the .s
++    // sources and whose fall-through claim is Linux's own source layout.
++    //
++    // What is NOT a decision is running nothing. A 0-byte blob is a build or link
++    // accident, and its hardware symptom is a wave that never writes the result buffer:
++    // a hang three stages deep with nothing in the log to blame. So this one refusal is
++    // unconditional - navi44-force=1 does not buy back a shader that does not exist.
++    if (f.requestedStage >= kNavi44ComputeStage && f.computeBlobBytes == 0)
++        return verdict(Navi44Arm::Refuse,
++                       "stage 17 uploads a compute shader but the blob this ABI selects is "
++                       "0 bytes - nothing would execute");
++
+     return verdict(Navi44Arm::Allow, "allowed");
+ }
+ 
+diff --git a/src/navi48-bringup/tests/navi44_arm_gate_plant.sh b/src/navi48-bringup/tests/navi44_arm_gate_plant.sh
+index 90cfcc5..465a082 100644
+--- a/src/navi48-bringup/tests/navi44_arm_gate_plant.sh
++++ b/src/navi48-bringup/tests/navi44_arm_gate_plant.sh
+@@ -30,9 +30,10 @@ mkdir -p "$SCR" || { echo "cannot make $SCR"; exit 2; }
+ trap 'rm -rf "$SCR"' EXIT
+ 
+ cp -R "$ROOT/src" "$SCR/src" || { echo "copy of src failed"; exit 2; }
++cp -R "$ROOT/shaders" "$SCR/shaders" || { echo "copy of shaders failed"; exit 2; }
+ cp -R "$ROOT/tests/dalshim" "$SCR/dalshim" 2>/dev/null
+ 
+-PRISTINE=$(find "$SCR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) \
++PRISTINE=$(find "$SCR/src" "$SCR/shaders" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' -o -name '*.s' \) \
+     | sort | xargs cat | cksum | awk '{print $1}')
+ 
+ build_run() {
+@@ -82,7 +83,7 @@ plant() {
+ 	return 0
+ }
+ 
+-restore_all() { rm -rf "$SCR/src"; cp -R "$ROOT/src" "$SCR/src"; }
++restore_all() { rm -rf "$SCR/src" "$SCR/shaders"; cp -R "$ROOT/src" "$SCR/src"; cp -R "$ROOT/shaders" "$SCR/shaders"; }
+ 
+ H=src/navi44_arm_gate.h
+ C=src/Navi48Bringup.cpp
+@@ -120,6 +121,18 @@ run_plant "gate: allow text changed"           "$H" 'return verdict(Navi44Arm::A
+ run_plant "gate: passthrough text changed"     "$H" '"not Navi 44 - existing behaviour"' '"passthrough"'
+ run_plant "gate: refusal text duplicated"      "$H" '"no PSP SOS blob embedded for the selected firmware set - nothing to load"' '"allowed"'
+ 
++# --- 0016: the stage-17 compute blob on a die it was not assembled for (section D) ---
++run_plant "gate: compute-blob check dropped"   "$H" 'if (f.requestedStage >= kNavi44ComputeStage && f.computeBlobBytes == 0)' 'if (false)'
++run_plant "gate: stage-17 threshold moved"     "$H" 'constexpr uint32_t kNavi44ComputeStage = 17;' 'constexpr uint32_t kNavi44ComputeStage = 16;'
++run_plant "gate: ISA note lost its target"     "$H" '"gfx1201-assembled blob runs on GC 12.0.0: every opcode in both store_magic "' '"the blob runs on this die: "'
++run_plant "kext: blob size faked"              "$C" 'hsaAbi ? amdgpu::fw_shader_store_magic_hsa_size : amdgpu::fw_shader_store_magic_size' '32u : 32u'
++run_plant "kext: ABI boot-arg renamed"         "$C" 'PE_parse_boot_argn("navi48-hsa-abi", &hsaAbi, sizeof(hsaAbi))' 'PE_parse_boot_argn("navi48-hsa", &hsaAbi, sizeof(hsaAbi))'
++run_plant "kext: ISA note not published"       "$C" 'setProperty("Navi44,ComputeIsaNote", n48::navi44ComputeIsaNote());' 'setProperty("Navi44,ComputeNote", n48::navi44ComputeIsaNote());'
++run_plant "shader log drops the die"           "src/amd/compute_test.cpp" '"s[0:1] = %s; assembled for gfx1201, running on GC %u.%u.%u",' '"s[0:1] = %s",'
++# The census whitelist is the check that can actually fail on a real future mistake: an
++# LLVM bump that starts emitting a gfx12_1-class opcode into store_magic.s.
++run_plant "shaders: non-base opcode planted"   "shaders/store_magic.s" '	s_endpgm' '	v_add_u32_e64 v2, v2, s[0:1]'
++
+ # --- the kext's use of it (section C pins these) ---
+ run_plant "kext: label not fed to the gate"    "$C" 'facts.matchedNavi44      = navi44ByPciId;' 'facts.matchedNavi44      = false;'
+ run_plant "kext: discovery validity faked"     "$C" 'facts.discoveryValid     = ipDiscovery.isValid();' 'facts.discoveryValid     = true;'
+@@ -153,7 +166,7 @@ echo "caught:   $PASSN"
+ echo "escaped:  $FAILN  ${FAIL[*]:-}"
+ echo "plant-errors: $MISSN  ${MISS[*]:-}"
+ 
+-AFTER=$(find "$SCR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) \
++AFTER=$(find "$SCR/src" "$SCR/shaders" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' -o -name '*.s' \) \
+     | sort | xargs cat | cksum | awk '{print $1}')
+ if [ "$AFTER" != "$PRISTINE" ]; then
+ 	echo "PRISTINE CHECKSUM CHANGED - the copy is polluted; investigate before trusting any result"
+diff --git a/src/navi48-bringup/tests/navi44_arm_gate_test.cpp b/src/navi48-bringup/tests/navi44_arm_gate_test.cpp
+index f1d8712..79b6f0f 100644
+--- a/src/navi48-bringup/tests/navi44_arm_gate_test.cpp
++++ b/src/navi48-bringup/tests/navi44_arm_gate_test.cpp
+@@ -353,11 +353,140 @@ static void sectionC(const std::string &root) {
+ 	          "cp_v12_0.cpp names the real upstream table");
+ }
+ 
++// ---------------------------------------------------------------------------
++// D. 0016: the compute ladder on a die the shader was not assembled for
++// ---------------------------------------------------------------------------
++// Stage 17 is the only rung that runs code this port wrote itself, and the blob was
++// assembled for the other die. Two things have to be true for that to be honest, and
++// one of them is not a claim anyone can eyeball: the opcodes. So the whitelist below is
++// derived from the .s sources on every run — add a gfx12_1-class instruction to
++// store_magic.s and this suite fails, instead of a Navi 44 boot hanging four stages
++// later with a log that names nothing.
++static void sectionD(const std::string &root) {
++	printf("== D: the stage-17 shader blob on GC 12.0.0 ==\n");
++
++	auto slurp = [&](const char *rel) {
++		std::ifstream in(std::string(root) + rel, std::ios::binary);
++		std::ostringstream ss; ss << in.rdbuf();
++		std::string s = ss.str();
++		s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());
++		return s;
++	};
++
++	// D1: the gate's own truth table for the new branch.
++	{
++		Navi44ArmFacts f = healthy();
++		f.requestedStage = 16;
++		f.computeBlobBytes = 0;
++		CHECK_MSG(verdict(f) == Navi44Arm::Allow,
++		          "stage 16 (PM4Test) uploads no shader, so a 0-byte blob is not its problem");
++		f.requestedStage = 17;
++		CHECK_MSG(verdict(f) == Navi44Arm::Refuse,
++		          "stage 17 with a 0-byte blob is refused");
++		const char *why = run(f);
++		CHECK_MSG(std::strstr(why, "0 bytes") != nullptr, "and the refusal says 0 bytes");
++		f.forceOverride = true;
++		CHECK_MSG(verdict(f) == Navi44Arm::Refuse,
++		          "navi44-force=1 does not buy back a shader that does not exist");
++		f.forceOverride = false;
++		f.computeBlobBytes = 32;
++		CHECK_MSG(verdict(f) == Navi44Arm::Allow, "a real blob arms stage 17");
++		// A Navi 48 boot is never gated on this either — same rule as the rest of the gate.
++		Navi44ArmFacts n48 = f;
++		n48.matchedNavi44 = false;
++		n48.computeBlobBytes = 0;
++		CHECK_MSG(verdict(n48) == Navi44Arm::Allow, "the RX 9070 XT keeps its behaviour");
++		// Nothing asked for: the stage-17 branch must not fire on a survey boot.
++		Navi44ArmFacts survey = healthy();
++		survey.requestedStage = 0;
++		survey.computeBlobBytes = 0;
++		CHECK_MSG(verdict(survey) == Navi44Arm::NothingAsked,
++		          "a survey boot stays 'nothing asked for'");
++	}
++
++	// D2: the note the kext publishes has to say both halves of the argument.
++	{
++		const std::string note = n48::navi44ComputeIsaNote();
++		CHECK_MSG(note.find("gfx1201") != std::string::npos, "the note names the assembly target");
++		CHECK_MSG(note.find("12.0.0") != std::string::npos, "the note names the die it runs on");
++		CHECK_MSG(note.find("gfx_v12_0.c") != std::string::npos,
++		          "the note cites the Linux source the fall-through claim came from");
++	}
++
++	// D3: the opcode census — the load-bearing check.
++	for (const char *rel : {"/shaders/store_magic.s", "/shaders/store_magic_hsa.s"}) {
++		const std::string src = slurp(rel);
++		CHECK_MSG(!src.empty(), "the shader source is readable");
++		if (src.empty()) continue;
++		// The two spellings differ (hand-written uses `--gfx1201`, LLVM's clang emits
++		// `-unknown-gfx1201`), so what is pinned is that the target line names gfx1201.
++		CHECK_MSG(src.find(".amdgcn_target") != std::string::npos &&
++		          src.find("gfx1201\"") != std::string::npos,
++		          "and really is assembled for gfx1201, as the note claims");
++
++		static const char *kBase[] = {
++			"v_and_b32", "v_lshlrev_b32", "v_add_nc_u32", "global_store_b32",
++			"s_wait_storecnt", "global_wb", "s_endpgm", "s_load_b64",
++			"v_add_nc_u32_e32", "v_lshlrev_b32_e32", "s_wait_kmcnt",
++		};
++		int seen = 0;
++		std::istringstream in(src);
++		std::string line;
++		while (std::getline(in, line)) {
++			size_t p = line.find_first_not_of(" \t");
++			if (p == std::string::npos) continue;
++			// Directives, labels, comments and register-units are not instructions.
++			char c = line[p];
++			if (c == '.' || c == ';' || c == '/' || c == '#') continue;
++			size_t e = line.find_first_of(" \t,", p);
++			std::string tok = line.substr(p, e - p);
++			if (tok.size() > 1 && tok.back() == ':') continue;  // label definition
++			if (tok.compare(0, 3, "s[0") == 0 || tok.find('=') != std::string::npos) continue;
++			if (std::strchr("vsg", c) == nullptr && tok != "global_store_b32" &&
++			    tok != "global_wb") continue;
++			const bool base = std::any_of(std::begin(kBase), std::end(kBase),
++			                             [&](const char *b) { return tok == b; });
++			CHECK_MSG(base, ("opcode " + tok + " is not in the GFX12 base whitelist").c_str());
++			if (base) seen++;
++		}
++		CHECK_MSG(seen >= 5, "the census actually looked at instructions");
++	}
++
++	// D4: the kext feeds the new facts and publishes them; the dispatch log names the die.
++	{
++		const std::string cpp = slurp("/src/Navi48Bringup.cpp");
++		CHECK_MSG(!cpp.empty(), "read Navi48Bringup.cpp");
++		CHECK_MSG(cpp.find("facts.computeBlobBytes = static_cast<uint32_t>(") != std::string::npos,
++		          "the blob size is read, not assumed");
++		CHECK_MSG(cpp.find("hsaAbi ? amdgpu::fw_shader_store_magic_hsa_size : amdgpu::fw_shader_store_magic_size")
++		          != std::string::npos,
++		          "and read from the two real blob symbols, not from a constant");
++		CHECK_MSG(cpp.find("PE_parse_boot_argn(\"navi48-hsa-abi\", &hsaAbi, sizeof(hsaAbi))")
++		          != std::string::npos,
++		          "the gate judges the ABI this boot selected, the same arg the ladder reads");
++		CHECK_MSG(cpp.find("extern const size_t fw_shader_store_magic_size;") != std::string::npos,
++		          "the blob's own declaration is in scope");
++		CHECK_MSG(cpp.find("setProperty(\"Navi44,ComputeBlob\", facts.computeBlobName)")
++		          != std::string::npos, "the blob is published by name");
++		CHECK_MSG(cpp.find("setProperty(\"Navi44,ComputeIsaNote\", n48::navi44ComputeIsaNote())")
++		          != std::string::npos, "and the ISA decision is published as one owned string");
++		CHECK_MSG(cpp.find("Navi44,ComputeBlobBytes") != std::string::npos,
++		          "the byte count reaches the registry, where collect-survey.sh can see it");
++
++		const std::string ct = slurp("/src/amd/compute_test.cpp");
++		CHECK_MSG(ct.find("assembled for gfx1201, running on GC %u.%u.%u") != std::string::npos,
++		          "the dispatch log names the blob target and the die together");
++		CHECK_MSG(ct.find("dev.ip.getVersion(IPBlock::GC)") != std::string::npos,
++		          "and takes the die from IP discovery, not from a boot-arg");
++	}
++}
++
+ int main(int argc, char **argv) {
+ 	const std::string root = argc > 1 ? argv[1] : ".";
+ 	sectionA();
+ 	sectionB(root);
+ 	sectionC(root);
++	sectionD(root);
+ 	printf("\n%d checks, %d failures\n", gChecks, gFailures);
+ 	return gFailures == 0 ? 0 : 1;
+ }
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,196 @@
+diff --git a/src/navi48-bringup/src/Navi48Bringup.cpp b/src/navi48-bringup/src/Navi48Bringup.cpp
+index e12ba73..b50c677 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -29,6 +29,8 @@
+ #include "amd/native_g2_pure.h"        // 0.0.627 (GPU-apps G2): sessstat (verb 103, boot-arg navi48-multisession=1)
+ #include "amd/native_g4_pure.h"        // 0.0.640 (GPU-apps G4): appallow (verb 104, boot-args navi48-apps=1 + navi48-multisession=1)
+ #include "dcn/navi48_fbname.hpp"
++#include "dcn41.h"              // 0.0.665 (Navi 44 survey): DCN41_NUM_SEGS for surveyDcn
++#include "dcn41_allow.h"        // ditto: the write allowlist's own arming test against the DMU bases
+ #include <IOKit/IOLib.h>
+ #include <kern/thread.h>            // current_thread() - the MM-window priority owner identity (0.0.433)
+ #include <sys/proc.h>               // build 0.0.512 Part B: proc_selfpid/proc_name on the clock88w watch lines
+@@ -515,9 +517,129 @@ void Navi48Bringup::surveyIPs() {
+ 		snprintf(key, sizeof(key), "IP,%s", w.name);
+ 		snprintf(ver, sizeof(ver), "%u.%u.%u", ip.major, ip.minor, ip.revision);
+ 		setProperty(key, ver);
++		// The segment bases themselves: every register offset in regs.hpp and the
++		// ported modules is relative to one of these, and they are not guaranteed
++		// to be Navi 48's. One string per IP so the whole table fits in a survey.
++		char segs[192];
++		size_t n = 0;
++		for (uint8_t s = 0; s < ip.numBases && s < IpDiscovery::MaxBases && n + 12 < sizeof(segs); s++)
++			n += snprintf(segs + n, sizeof(segs) - n, s ? " %08x" : "%08x", ip.bases[s]);
++		segs[n < sizeof(segs) ? n : sizeof(segs) - 1] = '\0';
++		snprintf(key, sizeof(key), "IP,%s,Segs", w.name);
++		setProperty(key, segs);
+ 	}
+ }
+ 
++// ---------------------------------------------------------------------------
++// surveyDcn — the DMU segment bases, and whether the display write allowlist
++// would arm for them. Both read-only: dcn41_allow_init does no register I/O at
++// all, it only compares the bases this die reports with the ones the generated
++// range table was built for (dcn41_allow.c:79-84).
++//
++// This is the display layer's single hard precondition. A Navi 44 that reports
++// anything other than 0x12 / 0xc0 / 0x34c0 / 0x9000 / 0x2403c00 leaves the
++// allowlist unarmed and the whole display path INERT (DCN41_E_BASES), which is
++// safe but silent — the property makes it visible without booting a stage.
++// ---------------------------------------------------------------------------
++void Navi48Bringup::surveyDcn() {
++	IpDiscovery::IpEntry e {};
++	if (!ipDiscovery.findIp(IpDiscovery::HwDmu, 0, e)) {
++		N48LOG("dcn-survey: no DMU (hwId 271) entry in discovery — display layer cannot resolve bases");
++		return;
++	}
++	char key[16], segs[192];
++	size_t n = 0;
++	segs[0] = '\0';
++	const uint8_t shown = e.numBases < DCN41_NUM_SEGS ? e.numBases : (uint8_t)DCN41_NUM_SEGS;
++	for (uint8_t s = 0; s < shown; s++) {
++		snprintf(key, sizeof(key), "DMU,Seg%u", s);
++		setProperty(key, static_cast<uint64_t>(e.bases[s]), 32);
++		n += snprintf(segs + n, sizeof(segs) - n, s ? " %08x" : "%08x", e.bases[s]);
++	}
++	setProperty("DMU,SegCount", static_cast<uint64_t>(e.numBases), 8);
++	setProperty("DMU,Segs", segs);
++	if (e.numBases < DCN41_NUM_SEGS) {
++		N48LOG("dcn-survey: DMU reports %u segments; the display layer needs %u — allowlist cannot arm",
++		       e.numBases, DCN41_NUM_SEGS);
++		setProperty("DMU,AllowlistArms", false);
++		return;
++	}
++	dcn41_allow_state st {};
++	const int rc = dcn41_allow_init(&st, e.bases, static_cast<uint32_t>(rmmioSize / 4));
++	N48LOG("dcn-survey: allowlist would %s for segs %08x %08x %08x %08x %08x, BAR5 %u dwords (%s)",
++	       rc == DCN41_ALLOW_OK ? "ARM" : "REFUSE", e.bases[0], e.bases[1], e.bases[2], e.bases[3],
++	       e.bases[4], static_cast<uint32_t>(rmmioSize / 4), dcn41_allow_reason_name(rc));
++	setProperty("DMU,AllowlistArms", rc == DCN41_ALLOW_OK);
++	setProperty("DMU,AllowlistReason", dcn41_allow_reason_name(rc));
++}
++
++// ---------------------------------------------------------------------------
++// surveyGeometry — the two numbers a Navi 44 survey exists to produce, both
++// through the bring-up's own code rather than a second decoder:
++//
++//   GB_ADDR_CONFIG   decoded by gfx_get_gb_addr_config (amd/gfx_v12_0.cpp), the
++//                    function whose SE count sizes gfx_setup_rb's harvest
++//                    masks. Navigation here also exercises patch 0003's
++//                    per-version caps: gfx_gpu_early_init seeds 2 SE / 2 RB on
++//                    GC 12.0.0, the register then overrides them.
++//   FB_LOCATION      the MMHUB window buildDeviceContext turns into vramMcBase.
++//                    VRAM byte 0 has to sit at BASE << 24 for every stage above
++//                    the PSP chain to address memory correctly.
++//
++// Reads one GC register and two MMHUB registers. Nothing is written.
++// ---------------------------------------------------------------------------
++void Navi48Bringup::surveyGeometry() {
++	amdgpu::DeviceContext probe {};
++	probe.rmmio = rmmio;
++	probe.rmmioSize = rmmioSize;
++	if (!amdgpu::fill_ip_base_table(ipDiscovery, probe.ip)) {
++		N48LOG("geometry: IP base table incomplete — GB_ADDR_CONFIG not decoded");
++	} else {
++		amdgpu::GFXConfig cfg {};
++		if (amdgpu::gfx_gpu_early_init(probe, cfg) != kIOReturnSuccess) {
++			N48LOG("geometry: gpu_early_init refused — no caps to compare against");
++		} else {
++			const uint32_t expSE = cfg.max_shader_engines;
++			const uint32_t expRB = cfg.max_backends_per_se;
++			if (amdgpu::gfx_get_gb_addr_config(probe, cfg) != kIOReturnSuccess) {
++				N48LOG("geometry: GB_ADDR_CONFIG unreadable — the register refused a decode");
++			} else {
++				N48LOG("geometry: GB_ADDR_CONFIG=0x%08x -> %u SE, %u RB/SE, %u pipes, %u PKRs, "
++				       "interleave %u B, %u frags (die caps were %u SE / %u RB/SE)",
++				       cfg.gb_addr_config_raw, cfg.num_shader_engines, cfg.num_rb_per_se,
++				       cfg.num_pipes, cfg.num_pkrs, cfg.pipe_interleave_size,
++				       cfg.max_compressed_frags, expSE, expRB);
++				setProperty("GB_ADDR,Config", static_cast<uint64_t>(cfg.gb_addr_config_raw), 32);
++				setProperty("GB_ADDR,ShaderEngines", static_cast<uint64_t>(cfg.num_shader_engines), 32);
++				setProperty("GB_ADDR,RBPerSE", static_cast<uint64_t>(cfg.num_rb_per_se), 32);
++				setProperty("GB_ADDR,Pipes", static_cast<uint64_t>(cfg.num_pipes), 32);
++				setProperty("GB_ADDR,Pkrs", static_cast<uint64_t>(cfg.num_pkrs), 32);
++				setProperty("GB_ADDR,InterleaveBytes", static_cast<uint64_t>(cfg.pipe_interleave_size), 32);
++				setProperty("GB_ADDR,MaxCompressedFrags", static_cast<uint64_t>(cfg.max_compressed_frags), 32);
++				setProperty("GB_ADDR,ExpectedSE", static_cast<uint64_t>(expSE), 32);
++				setProperty("GB_ADDR,ExpectedRBPerSE", static_cast<uint64_t>(expRB), 32);
++				setProperty("GB_ADDR,SE_Match", cfg.num_shader_engines == expSE);
++				setProperty("GB_ADDR,RB_Match", cfg.num_rb_per_se == expRB);
++			}
++		}
++	}
++
++	const uint32_t fbBase = regReadIp(IpDiscovery::HwMmhub, 0, 0, n48::kFbLocationBaseDword);
++	const uint32_t fbTop  = regReadIp(IpDiscovery::HwMmhub, 0, 0, n48::kFbLocationTopDword);
++	if (fbBase == 0xFFFFFFFF || fbTop == 0xFFFFFFFF) {
++		N48LOG("geometry: MMHUB FB_LOCATION unreadable — the stages cannot build a device context either");
++		return;
++	}
++	const uint64_t mcBase = static_cast<uint64_t>(fbBase & n48::kFbLocationMask) << 24;
++	const uint64_t mcTop  = static_cast<uint64_t>(fbTop & n48::kFbLocationMask) << 24;
++	N48LOG("geometry: FB_LOCATION base=0x%08x top=0x%08x -> VRAM MC 0x%llx .. one page below 0x%llx",
++	       fbBase, fbTop, mcBase, mcTop);
++	setProperty("MMHUB,FBLocationBase", static_cast<uint64_t>(fbBase), 32);
++	setProperty("MMHUB,FBLocationTop", static_cast<uint64_t>(fbTop), 32);
++	setProperty("MMHUB,McBase", mcBase, 64);
++	setProperty("MMHUB,McTop", mcTop, 64);
++}
++
+ void Navi48Bringup::surveyPSP() {
+ 	uint32_t boot = regReadIp(IpDiscovery::HwMp0, 0, 0, n48::kPspC2PMsg35);
+ 	uint32_t sol  = regReadIp(IpDiscovery::HwMp0, 0, 0, n48::kPspC2PMsg81);
+@@ -623,9 +745,9 @@ bool Navi48Bringup::buildDeviceContext() {
+ 	dev.vramSizeBytes = static_cast<uint64_t>(vramMB) << 20;
+ 	dev.vramBase  = vramBase;
+ 	dev.vramLimit = bar0Limit;   // 0.0.663 (ReBAR item 3): n48rebar::plan_bar0's clamp (== bar0Size at a 256 MiB BAR0); finishVramPlan has run (stagePSP)
+-	uint32_t fbBase = regReadIp(IpDiscovery::HwMmhub, 0, 0, 0x0554);
++	uint32_t fbBase = regReadIp(IpDiscovery::HwMmhub, 0, 0, n48::kFbLocationBaseDword);
+ 	if (fbBase == 0xFFFFFFFF) { N48LOG("dev: cannot read FB_LOCATION_BASE"); return false; }
+-	dev.vramMcBase = static_cast<uint64_t>(fbBase & 0x00FFFFFF) << 24;
++	dev.vramMcBase = static_cast<uint64_t>(fbBase & n48::kFbLocationMask) << 24;
+ 	if (!amdgpu::fill_ip_base_table(ipDiscovery, dev.ip)) { N48LOG("dev: IP base table incomplete"); return false; }
+ 	N48LOG("dev: context ready — MC base 0x%llx, region vram+[0x%llx, 0x%llx), GC base 0x%x MP0 base 0x%x MMHUB base 0x%x",
+ 	       dev.vramMcBase, dev.vramBase, dev.vramLimit, dev.ip.get(amdgpu::IPBlock::GC),
+@@ -7384,6 +7506,8 @@ bool Navi48Bringup::start(IOService *provider) {
+ 		N48LOG("start: IP discovery unavailable — MMIO works, but no register map");
+ 	} else {
+ 		surveyIPs();
++		surveyDcn();
++		surveyGeometry();
+ 		surveyPSP();
+ 		surveySMU();
+ 		if (!PE_parse_boot_argn("navi48-stage", &targetStage, sizeof(targetStage))) targetStage = 0;
+diff --git a/src/navi48-bringup/src/Navi48Bringup.hpp b/src/navi48-bringup/src/Navi48Bringup.hpp
+index e7edeb2..ef6cb93 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.hpp
++++ b/src/navi48-bringup/src/Navi48Bringup.hpp
+@@ -111,6 +111,8 @@ private:
+ 	bool probeMemSize();
+ 	bool loadOnDieDiscovery();
+ 	void surveyIPs();
++	void surveyDcn();      // DMU segment bases + whether the write allowlist would arm for them
++	void surveyGeometry(); // GB_ADDR_CONFIG decode + MMHUB FB_LOCATION, both read-only
+ 	void surveyPSP();
+ 	void surveySMU();
+ 	void stagePSP();       // navi48-psp=1 (== navi48-stage=5)
+diff --git a/src/navi48-bringup/src/regs.hpp b/src/navi48-bringup/src/regs.hpp
+index 70dfc2c..170f043 100644
+--- a/src/navi48-bringup/src/regs.hpp
++++ b/src/navi48-bringup/src/regs.hpp
+@@ -28,6 +28,14 @@ static constexpr uint8_t  kNbifMemsizeSeg   = 2;
+ static constexpr uint32_t kNbifMemsizeDword = 0x00c3;
+ static constexpr uint32_t kNbifMemsizeByteFallback = 0x378c;
+ 
++// --- MMHUB framebuffer window (HwMmhub, instance 0, segment 0) --------------
++// MMMC_VM_FB_LOCATION_BASE/_TOP (amdgpu_ip.h MMHUBRegs). The MC address of
++// VRAM byte 0 is BASE << 24 — the assumption buildDeviceContext makes, so the
++// survey reads both and publishes them for the one boot that can check it.
++static constexpr uint32_t kFbLocationBaseDword = 0x0554;
++static constexpr uint32_t kFbLocationTopDword  = 0x0555;
++static constexpr uint32_t kFbLocationMask      = 0x00FFFFFF;
++
+ // --- MP0 / PSP scratch mailbox (HwMp0, instance 0, segment 0) ----------------
+ // C2PMSG registers (mp_14_0_2_offset.h). Read-only status we survey:
+ static constexpr uint32_t kPspC2PMsg35 = 0x0063; // bit31 = bootloader ready

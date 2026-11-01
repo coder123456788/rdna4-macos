@@ -1,0 +1,611 @@
+From b600d6ba0f9e22a8c1e12840fe9a2244ea34a153 Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Fri, 30 Oct 2026 17:33:52 -0700
+Subject: [PATCH] 0020: make the screen answer whether Apple took the card
+
+0019 prints what this kext decided; it cannot say whether the decision was
+enough. Publishing LoadAccelerator only makes the card eligible - Apple's
+personality still has to match, attach, and reach the end of its own start().
+On a machine with no keyboard, that question had no answer at all.
+
+The positive signal already exists: GraphicsAccelerator::start() announces
+itself over SpecialAMDKey (type 0x00), and Navi48AccelPeer handles it. The mark
+is recorded there before the enable that follows can fail. The negative signal
+needs a watcher, so accel_takeover.cpp starts a kernel_thread_start poller that
+sleeps in one-second steps for 20 s and stands down the moment the flag lands;
+only the miss prints "NO TAKEOVER ... personality did not match this device id".
+
+accel_takeover_report.h owns the rule that keeps that sentence honest: it arms
+only when the report was requested AND LoadAccelerator actually went up, so a
+closed gate is never blamed on the personality. The positive block is held from
+the poller's thread, never Apple's, so start() is not stalled.
+
+accel_takeover_report_test: 73 checks. accel_takeover_report_plant.sh: 41
+plants, all caught. Cross-build: 80 objects, 7,249,248 B, MH_KEXT_BUNDLE, no
+undefined symbols.
+---
+ CHANGES.md                                    |  27 ++-
+ src/navi48-bringup/src/Navi48Bringup.cpp      |  12 ++
+ src/navi48-bringup/src/accel_takeover.cpp     |  85 ++++++++
+ .../src/accel_takeover_report.h               |  58 ++++++
+ .../src/apple/Navi48AccelPeer.cpp             |   5 +
+ .../tests/accel_takeover_report_plant.sh      | 163 +++++++++++++++
+ .../tests/accel_takeover_report_test.cpp      | 186 ++++++++++++++++++
+ 6 files changed, 509 insertions(+), 1 deletion(-)
+ create mode 100644 src/navi48-bringup/src/accel_takeover.cpp
+ create mode 100644 src/navi48-bringup/src/accel_takeover_report.h
+ create mode 100644 src/navi48-bringup/tests/accel_takeover_report_plant.sh
+ create mode 100644 src/navi48-bringup/tests/accel_takeover_report_test.cpp
+
+diff --git a/src/navi48-bringup/src/Navi48Bringup.cpp b/src/navi48-bringup/src/Navi48Bringup.cpp
+index e34636f..06264dd 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -46,6 +46,7 @@
+ 
+ #include "accel_fire_at_boot.h"     // 0017: may this boot run the fire path with no userspace verb?
+ #include "accel_boot_report.h"      // 0019: the boot screen is the report - no keyboard here
++#include "accel_takeover_report.h"  // 0020: ...and the screen reports whether Apple took the card
+ 
+ // 0016 — the stage-17 compute shader, so the Navi 44 gate can report what it is about to
+ // let a writing stage upload. Same declaration as src/amd/compute_test.cpp's: C linkage
+@@ -7826,6 +7827,17 @@ bool Navi48Bringup::start(IOService *provider) {
+ 					IOSleep(1000);
+ 				}
+ 			}
++
++			// 0020: 0019 reports what WE decided; this reports what APPLE did with it. Armed
++			// only when the report was asked for and LoadAccelerator actually went up, because
++			// "Apple never started" on a boot that published nothing would blame the
++			// personality for the gate's decision. The positive side prints from Navi48AccelPeer's
++			// kReqAccelStarted handler; this thread is only the timeout.
++			if (n48::accel_takeover_armed(ff.argRequested, fireCalled && fireKr == 0)) {
++				n48::takeover_arm();
++				setProperty("Navi48,AccelTakeover", "watching for Apple's accelerator to announce itself");
++				n48::takeover_start_poller();
++			}
+ 		}
+ 		// MILESTONE 3 step 1 (0.0.235): the IH -> Apple completion bridge can be
+ 		// armed at boot instead of by a verb, which is what makes it part of a
+diff --git a/src/navi48-bringup/src/accel_takeover.cpp b/src/navi48-bringup/src/accel_takeover.cpp
+new file mode 100644
+index 0000000..c169452
+--- /dev/null
++++ b/src/navi48-bringup/src/accel_takeover.cpp
+@@ -0,0 +1,85 @@
++//  0020 — the takeover watchdog. accel_takeover_report.h owns the decision; this file owns the
++//  two signals and the one thread that waits for the negative one.
++//
++//  Why a thread at all: the positive signal arrives on Apple's own registry thread, inside
++//  GraphicsAccelerator::start(). Nothing else in this kext is running at that point that could
++//  notice its absence — start() has returned from the fire call and the -v console is otherwise
++//  silent — so the only way to say "it never came" is to wait for it from a thread of our own.
++//  Same idiom as AppleHardwareHook.cpp's kIQ stamp poller: kernel_thread_start, deallocate, done.
++
++#include "accel_takeover_report.h"
++
++#include "amd/n48log.h"
++#include <IOKit/IOLib.h>
++#include <kern/thread.h>
++
++#define TAKELOG(fmt, ...) ::amdgpu::n48_logf("takeover: " fmt "\n", ##__VA_ARGS__)
++
++namespace {
++
++volatile uint32_t gArmed;
++volatile uint32_t gStarted;
++volatile uint32_t gBlockPrinted;
++
++void print_block(n48::TakeoverVerdict v, uint32_t waited) {
++    for (uint32_t t = 0; t <= n48::kTakeoverHold; t++) {
++        TAKELOG("========== NAVI 44 TAKEOVER REPORT %u/%u ==========", t, n48::kTakeoverHold);
++        TAKELOG("%s", n48::accel_takeover_headline(v));
++        if (v == n48::TakeoverVerdict::Started) {
++            TAKELOG("Apple's accelerator announced itself %u s after LoadAccelerator was "
++                    "published - it matched this card and ran its own start()", waited);
++        } else {
++            TAKELOG("waited %u s after LoadAccelerator was published; no SpecialAMDKey type 0x00 "
++                    "arrived from Apple's accelerator", waited);
++        }
++        TAKELOG("no terminal needed: photograph this screen");
++        if (t >= n48::kTakeoverHold) break;
++        IOSleep(1000);
++    }
++}
++
++void takeover_poller(void *, wait_result_t) {
++    uint32_t waited = 0;
++    while (waited < n48::kTakeoverWaitSeconds) {
++        IOSleep(1000);
++        waited++;
++        if (__atomic_load_n(&gStarted, __ATOMIC_ACQUIRE)) break;
++    }
++    const n48::TakeoverVerdict v =
++        n48::accel_takeover_verdict(__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE) != 0,
++                                    __atomic_load_n(&gStarted, __ATOMIC_ACQUIRE) != 0);
++    if (v == n48::TakeoverVerdict::NotArmed) return;
++    uint32_t expected = 0;
++    if (!__atomic_compare_exchange_n(&gBlockPrinted, &expected, 1u, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
++    print_block(v, waited);
++}
++
++} // namespace
++
++namespace n48 {
++
++void takeover_arm() {
++    __atomic_store_n(&gArmed, 1u, __ATOMIC_RELEASE);
++}
++
++// Called from Apple's start() through SpecialAMDKey, so it must not sleep: the block is held
++// by the poller, whose thread is ours, not Apple's.
++void takeover_mark_started(void *accel) {
++    if (!__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE)) return;
++    __atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE);
++    TAKELOG("Apple's accelerator announced itself over SpecialAMDKey 0x00 (accel=%p) - "
++            "the handover happened", accel);
++}
++
++void takeover_start_poller() {
++    thread_t th = nullptr;
++    const kern_return_t kr = kernel_thread_start(&takeover_poller, nullptr, &th);
++    if (kr != KERN_SUCCESS) {
++        TAKELOG("kernel_thread_start failed (0x%x) - no timeout report on this boot", kr);
++        return;
++    }
++    thread_deallocate(th);
++    TAKELOG("watching %u s for Apple's accelerator to announce itself", kTakeoverWaitSeconds);
++}
++
++} // namespace n48
+diff --git a/src/navi48-bringup/src/accel_takeover_report.h b/src/navi48-bringup/src/accel_takeover_report.h
+new file mode 100644
+index 0000000..b0b5d96
+--- /dev/null
++++ b/src/navi48-bringup/src/accel_takeover_report.h
+@@ -0,0 +1,58 @@
++//  accel_takeover_report.h — patch 0020: did Apple's accelerator actually take the card?
++//
++//  0019 prints what this kext decided (was LoadAccelerator published, and why). That decision
++//  is necessary but not sufficient: Apple's accelerator personality carries an IOPCIMatch, and
++//  publishing LoadAccelerator only makes the card ELIGIBLE to match it. The question the boot
++//  screen has never answered is whether Apple's accelerator actually attached and reached the
++//  end of its own start().
++//
++//  The hardware answers it through two signals that already exist in this tree:
++//
++//    positive — GraphicsAccelerator::start() announces itself over SpecialAMDKey with type 0x00
++//               as the last thing before it decides whether it started
++//               (Navi48AccelPeer::handleSpecialAMDKey, kReqAccelStarted);
++//    negative — the wait below expires with no such call.
++//
++//  The negative signal is only meaningful if the card was actually offered: "Apple never
++//  started" on a boot that never published LoadAccelerator would blame the personality for the
++//  gate's decision. accel_takeover_armed() is that rule, and it is the one decision here that
++//  can produce a wrong verdict on its own.
++#pragma once
++
++#include <stdint.h>
++
++namespace n48 {
++
++constexpr uint32_t kTakeoverWaitSeconds = 20;  // 1 s steps; the 0019 hold runs out first
++constexpr uint32_t kTakeoverHold        = 5;   // repeats of the block, so a photograph catches it
++
++enum class TakeoverVerdict { NotArmed, Started, TimedOut };
++
++inline bool accel_takeover_armed(bool reportRequested, bool published) {
++    return reportRequested && published;
++}
++
++inline TakeoverVerdict accel_takeover_verdict(bool armed, bool appleStarted) {
++    if (!armed) return TakeoverVerdict::NotArmed;
++    return appleStarted ? TakeoverVerdict::Started : TakeoverVerdict::TimedOut;
++}
++
++inline const char *accel_takeover_headline(TakeoverVerdict v) {
++    switch (v) {
++    case TakeoverVerdict::Started:
++        return "TAKEOVER: Apple's accelerator started - the handover happened";
++    case TakeoverVerdict::TimedOut:
++        return "NO TAKEOVER: LoadAccelerator was published but Apple's accelerator never "
++               "announced itself - its personality did not match this card's device id";
++    case TakeoverVerdict::NotArmed:
++        return "takeover: not tracked - the report was not requested, or nothing was published";
++    }
++    return "takeover: unknown verdict";
++}
++
++// ---- runtime, defined in accel_takeover.cpp ----
++void takeover_arm();
++void takeover_mark_started(void *accel);
++void takeover_start_poller();
++
++} // namespace n48
+diff --git a/src/navi48-bringup/src/apple/Navi48AccelPeer.cpp b/src/navi48-bringup/src/apple/Navi48AccelPeer.cpp
+index 4b43076..a3fcf50 100644
+--- a/src/navi48-bringup/src/apple/Navi48AccelPeer.cpp
++++ b/src/navi48-bringup/src/apple/Navi48AccelPeer.cpp
+@@ -23,6 +23,7 @@
+ #include "scanout_copy.h"
+ #include "fastcopy.h"         // build 0.0.496: switch 63, the residency copy through SDMA (chunk plan, result word)
+ #include "hybrid_policy.h"    // build 0.0.503 (HYBRID.md H1): switch 68, who may open the accelerator (slot 239)
++#include "accel_takeover_report.h"  // 0020: kReqAccelStarted is the proof Apple took the card
+ #include <sys/kauth.h>        // build 0.0.503: kauth_getuid, the caller's uid for the hybrid policy
+ #include <kern/task.h>        // build 0.0.503: current_task, compared with newUserClient's owner (counted only)
+ 
+@@ -3485,6 +3486,10 @@ IOReturn Navi48AccelPeer::handleSpecialAMDKey(uint32_t type, void *p2, void *p3,
+     case kReqAccelStarted:
+         PEERLOG("  -> accelerator announcing itself (accel=%p); returning SUCCESS "
+                 "— this is the gate start() gives up on", p2);
++        // 0020: this call is the takeover proof the boot screen was missing - record it before
++        // anything else here can fail, so the report says "Apple took the card" even if the
++        // enable below is what goes wrong next.
++        n48::takeover_mark_started(p2);
+         // p2 IS the accelerator (it passes its own `this`), and start() is
+         // finished by the time it asks. Exactly the moment to mark it enabled.
+         force_accelerator_enabled(p2);
+diff --git a/src/navi48-bringup/tests/accel_takeover_report_plant.sh b/src/navi48-bringup/tests/accel_takeover_report_plant.sh
+new file mode 100644
+index 0000000..4f46898
+--- /dev/null
++++ b/src/navi48-bringup/tests/accel_takeover_report_plant.sh
+@@ -0,0 +1,163 @@
++#!/usr/bin/env bash
++#
++#  accel_takeover_report_plant.sh — prove the 0020 suite can actually fail.
++#
++#  Usage (from anywhere):  ZIG=/path/to/zig.exe bash tests/accel_takeover_report_plant.sh
++#
++#  One break at a time, planted into a COPY of the real sources, and the suite must catch it.
++#  This block answers the one question 0019 cannot: whether Apple's accelerator took the card
++#  after LoadAccelerator went up. A wrong answer here is worse than no answer — it either
++#  accuses the personality for the gate's refusal, or reports a takeover that never happened.
++#
++#  Rules (same as the other *_plant.sh here):
++#    * needles are SINGLE-LINE, because the checkout is CRLF and a multi-line needle never
++#      matches;
++#    * every needle must be found, or the run aborts - a drifted needle silently becomes
++#      "no plant applied", which reads exactly like a passing suite;
++#    * the pristine checksum is taken up front and re-checked at the end;
++#    * `control` runs the untouched copy first.
++#
++set -u
++
++ZIG="${ZIG:?set ZIG to the zig (or zig c++) driver to use}"
++HERE="$(cd "$(dirname "$0")" && pwd)"
++ROOT="$(cd "$HERE/.." && pwd)"
++SCR="$(mktemp -d)"
++mkdir -p "$SCR" || { echo "cannot make $SCR"; exit 2; }
++trap 'rm -rf "$SCR"' EXIT
++
++cp -R "$ROOT/src" "$SCR/src" || { echo "copy of src failed"; exit 2; }
++cp -R "$ROOT/tests/dalshim" "$SCR/dalshim" 2>/dev/null
++
++PRISTINE=$(find "$SCR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) \
++    | sort | xargs cat | cksum | awk '{print $1}')
++
++build_run() {
++	# "$ZIG" stays quoted: the toolchain path contains spaces on this workstation.
++	"$ZIG" c++ -std=c++17 -O1 -I "$SCR/dalshim" -I "$SCR/src" \
++		"$HERE/accel_takeover_report_test.cpp" -o "$SCR/t" >"$SCR/build.log" 2>&1 || {
++		echo "    BUILD FAILED"; sed -n '1,6p' "$SCR/build.log"; return 2; }
++	"$SCR/t" "$SCR" >"$SCR/run.log" 2>&1
++	return $?
++}
++
++count_matches() { # file needle -> echoes the number of occurrences
++	N="$2" perl -0777 -ne 'my $c = () = $_ =~ /\Q$ENV{N}\E/g; print $c' "$1"
++}
++
++plant() {
++	local file="$1" needle="$2" repl="$3" occ="${4:-1}"
++	local path="$SCR/$file"
++	cp "$ROOT/$file" "$path"                       # always plant from pristine
++	local found
++	found=$(count_matches "$path" "$needle")
++	if [ "${found:-0}" -lt "$occ" ]; then
++		echo "    NEEDLE MISSING (occ $occ of $found): $needle"
++		return 9
++	fi
++	N="$needle" R="$repl" O="$occ" perl -0777 -i -pe '
++		my $n = $ENV{N}; my $r = $ENV{R}; my $want = $ENV{O}; my $i = 0;
++		s/\Q$n\E/$i++; ($i == $want) ? $r : $n/ge;
++	' "$path"
++	local after afterRepl
++	after=$(count_matches "$path" "$needle")
++	afterRepl=$(count_matches "$path" "$repl")
++	if [ "$after" -ge "$occ" ] && [ "${afterRepl:-0}" -eq 0 ]; then
++		echo "    PLANT DID NOT LAND"
++		return 9
++	fi
++	return 0
++}
++
++restore_all() { rm -rf "$SCR/src"; cp -R "$ROOT/src" "$SCR/src"; }
++
++H=src/accel_takeover_report.h
++R=src/accel_takeover.cpp
++C=src/Navi48Bringup.cpp
++P=src/apple/Navi48AccelPeer.cpp
++
++declare -a PASS FAIL MISS
++PASSN=0 FAILN=0 MISSN=0
++run_plant() { # LABEL FILE NEEDLE REPL [OCC]
++	local label="$1"; shift
++	printf '  %-56s' "$label"
++	if ! plant "$@"; then echo "PLANT-ERROR"; MISS+=("$label"); MISSN=$((MISSN + 1)); restore_all; return; fi
++	build_run
++	local rc=$?
++	if [ "$rc" -eq 0 ]; then echo "ESCAPED (suite still passed)"; FAIL+=("$label"); FAILN=$((FAILN + 1));
++	else echo "caught (rc=$rc)"; PASS+=("$label"); PASSN=$((PASSN + 1)); fi
++	restore_all
++}
++
++echo "== control: the untouched copy =="
++if build_run; then echo "  control PASSED - plants below are meaningful"
++else echo "  control FAILED - the copy/build step is broken, stopping"; exit 1; fi
++
++echo "== plants: when a takeover may be reported at all =="
++run_plant "armed: a closed gate is still watched"    "$H" 'return reportRequested && published;' 'return reportRequested;'
++run_plant "armed: always on"                         "$H" 'return reportRequested && published;' 'return true;'
++run_plant "verdict: the armed guard is dropped"      "$H" 'if (!armed) return TakeoverVerdict::NotArmed;' 'if (false) return TakeoverVerdict::NotArmed;'
++run_plant "verdict: the two outcomes are swapped"    "$H" 'return appleStarted ? TakeoverVerdict::Started : TakeoverVerdict::TimedOut;' 'return appleStarted ? TakeoverVerdict::TimedOut : TakeoverVerdict::Started;'
++run_plant "wait: 20 s becomes 2 s"                   "$H" 'constexpr uint32_t kTakeoverWaitSeconds = 20;' 'constexpr uint32_t kTakeoverWaitSeconds = 2;'
++run_plant "wait: 20 s becomes a very long wait"      "$H" 'constexpr uint32_t kTakeoverWaitSeconds = 20;' 'constexpr uint32_t kTakeoverWaitSeconds = 1000;'
++run_plant "hold: 5 becomes one flash"                "$H" 'constexpr uint32_t kTakeoverHold        = 5;' 'constexpr uint32_t kTakeoverHold        = 1;'
++run_plant "hold: 5 becomes forty"                    "$H" 'constexpr uint32_t kTakeoverHold        = 5;' 'constexpr uint32_t kTakeoverHold        = 40;'
++
++echo "== plants: the headline an owner photographs =="
++run_plant "headline: started loses the handover"     "$H" 'return "TAKEOVER: Apple'"'"'s accelerator started - the handover happened";' 'return "TAKEOVER: Apple'"'"'s accelerator started";'
++run_plant "headline: timeout loses the personality"  "$H" '"announced itself - its personality did not match this card'"'"'s device id";' '"announced itself";'
++run_plant "headline: timeout loses never-started"    "$H" '"announced itself - its personality did not match this card'"'"'s device id";' '"came back with the wrong device id";'
++run_plant "headline: not-armed reads as the enum"    "$H" 'return "takeover: not tracked - the report was not requested, or nothing was published";' 'return "TakeoverVerdict::NotArmed";'
++run_plant "headline: an empty screen"                "$H" 'return "TAKEOVER: Apple'"'"'s accelerator started - the handover happened";' 'return "";'
++run_plant "headline: TimedOut case no longer handled" "$H" 'case TakeoverVerdict::TimedOut:' 'case TakeoverVerdict::TimedOut :'
++
++echo "== plants: header hygiene (the decision stays pure) =="
++run_plant "header: IOKit leaks in"                   "$H" '//  gate'"'"'s decision. accel_takeover_armed() is that rule, and it is the one decision here that' '//  gate'"'"'s decision (IOKit is not available here). accel_takeover_armed() is that rule, and it is the one decision here that'
++run_plant "header: IOSleep leaks in"                 "$H" '//  can produce a wrong verdict on its own.' '//  can produce a wrong verdict on its own. IOSleep is not.'
++run_plant "header: setProperty leaks in"             "$H" '//    positive — GraphicsAccelerator::start() announces itself over SpecialAMDKey with type 0x00' '//    positive — setProperty is published, then GraphicsAccelerator::start() announces itself with type 0x00'
++
++echo "== plants: the positive signal (it must be recorded where Apple sends it) =="
++run_plant "peer: header not included"                "$P" '#include "accel_takeover_report.h"' '#include "accel_takeover_report_gone.h"'
++run_plant "peer: the mark is dropped"                "$P" 'n48::takeover_mark_started(p2);' ';'
++run_plant "peer: the mark gets the wrong object"     "$P" 'n48::takeover_mark_started(p2);' 'n48::takeover_mark_started(nullptr);'
++
++echo "== plants: the negative signal (one thread, one block, stands down on success) =="
++run_plant "rt: the thread is never started"          "$R" 'kernel_thread_start(&takeover_poller' 'kernel_thread_start(&takeover_poller_gone'
++run_plant "rt: the thread handle is leaked"          "$R" 'thread_deallocate(th)' 'th = nullptr'
++run_plant "rt: the wait ignores the positive signal" "$R" 'if (__atomic_load_n(&gStarted, __ATOMIC_ACQUIRE)) break;' 'if (false) break;'
++run_plant "rt: the wait is not the tested constant"  "$R" 'while (waited < n48::kTakeoverWaitSeconds) {' 'while (waited < 5) {'
++run_plant "rt: the first sleep is gone"              "$R" 'IOSleep(1000);' 'IOSleep(0);' 1
++run_plant "rt: the wait-loop sleep is gone"          "$R" 'IOSleep(1000);' 'IOSleep(0);' 2
++run_plant "rt: the verdict ignores the signal"       "$R" 'n48::accel_takeover_verdict(__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE) != 0,' 'n48::accel_takeover_verdict(true,'
++run_plant "rt: the started flag is never set"        "$R" '__atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE);' '__atomic_store_n(&gStarted, 0u, __ATOMIC_RELEASE);'
++run_plant "rt: the mark sleeps on Apple's thread"    "$R" '__atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE);' '__atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE); IOSleep(500);'
++run_plant "rt: the arming never takes"               "$R" '__atomic_store_n(&gArmed, 1u, __ATOMIC_RELEASE);' '__atomic_store_n(&gArmed, 0u, __ATOMIC_RELEASE);'
++run_plant "rt: the mark ignores arming"              "$R" 'if (!__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE)) return;' 'if (false) return;'
++run_plant "rt: the block is never printed"           "$R" 'print_block(v, waited);' ';'
++run_plant "rt: the block runs one second long"       "$R" 'if (t >= n48::kTakeoverHold) break;' 'if (t > n48::kTakeoverHold) break;'
++run_plant "rt: two blocks can print"                 "$R" '__atomic_compare_exchange_n(&gBlockPrinted' '__atomic_compare_exchange_n(&gBlockPrintedX'
++
++echo "== plants: the xsrc wiring (armed only after a real publish) =="
++run_plant "xsrc: header not included"                "$C" '#include "accel_takeover_report.h"' '#include "accel_takeover_report_gone.h"'
++run_plant "xsrc: armed on any requested boot"        "$C" 'n48::accel_takeover_armed(ff.argRequested, fireCalled && fireKr == 0)' 'n48::accel_takeover_armed(ff.argRequested, true)'
++run_plant "xsrc: armed on every boot"                "$C" 'n48::accel_takeover_armed(ff.argRequested, fireCalled && fireKr == 0)' 'n48::accel_takeover_armed(true, true)'
++run_plant "xsrc: an errored fire is still watched"   "$C" 'n48::accel_takeover_armed(ff.argRequested, fireCalled && fireKr == 0)' 'n48::accel_takeover_armed(ff.argRequested, fireCalled)'
++run_plant "xsrc: arming is dropped"                  "$C" 'n48::takeover_arm();' ';'
++run_plant "xsrc: the poller is never started"        "$C" 'n48::takeover_start_poller();' ';'
++run_plant "xsrc: the property is renamed"            "$C" 'setProperty("Navi48,AccelTakeover"' 'setProperty("Navi48,AccelTakeoverX"'
++
++echo "== summary =="
++# Plain integers: `${#ARR[@]}` on an empty array is an unbound-variable fatal under set -u.
++echo "caught:   $PASSN"
++echo "escaped:  $FAILN  ${FAIL[*]:-}"
++echo "plant-errors: $MISSN  ${MISS[*]:-}"
++
++AFTER=$(find "$SCR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) \
++    | sort | xargs cat | cksum | awk '{print $1}')
++if [ "$AFTER" != "$PRISTINE" ]; then
++	echo "PRISTINE CHECKSUM CHANGED - the copy is polluted; investigate before trusting any result"
++	exit 3
++fi
++echo "pristine tree unchanged after the run (checksum $PRISTINE)"
++
++[ "$FAILN" -eq 0 ] && [ "$MISSN" -eq 0 ]
+diff --git a/src/navi48-bringup/tests/accel_takeover_report_test.cpp b/src/navi48-bringup/tests/accel_takeover_report_test.cpp
+new file mode 100644
+index 0000000..3c069d4
+--- /dev/null
++++ b/src/navi48-bringup/tests/accel_takeover_report_test.cpp
+@@ -0,0 +1,186 @@
++//  accel_takeover_report_test.cpp — host suite for the takeover report (patch 0020).
++//
++//  Build (any machine, no Mac, no GPU):
++//    zig c++ -std=c++17 -Wall -Wextra -O1 -I tests/dalshim -I src \
++//        tests/accel_takeover_report_test.cpp -o /tmp/accel_takeover_report_test.exe
++//    /tmp/accel_takeover_report_test.exe .
++//
++//  argv[1] is the navi48-bringup root, used by the source-pin sections.
++//
++//  What this suite is for: 0019's block proves the gate opened; this one has to prove that the
++//  card was actually taken. The failure that matters is the quiet one — a verdict printed on a
++//  boot where LoadAccelerator never went up ("Apple did not match" blaming the personality for
++//  the gate's decision), or a timeout that fires while the positive signal was already recorded.
++//  Section A is the first, section C pins the second out of accel_takeover.cpp.
++
++#include "accel_takeover_report.h"
++
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <sstream>
++#include <string>
++
++using n48::TakeoverVerdict;
++
++static int gChecks = 0, gFailures = 0;
++static void report(const char *file, int line, const char *what, bool ok) {
++	gChecks++;
++	if (ok) return;
++	gFailures++;
++	printf("FAIL %s:%d: %s\n", file, line, what);
++}
++#define CHECK(cond) report(__FILE__, __LINE__, #cond, (cond))
++
++namespace {
++
++std::string slurp(const std::string &path) {
++	std::ifstream in(path, std::ios::binary);
++	if (!in) return "";
++	std::ostringstream ss;
++	ss << in.rdbuf();
++	std::string s = ss.str();
++	for (auto &c : s) if (c == '\r') c = '\n';
++	while (!s.empty() && s.back() == '\n') s.pop_back();
++	return s;
++}
++
++bool has(const std::string &hay, const std::string &needle) {
++	return hay.find(needle) != std::string::npos;
++}
++
++size_t count_of(const std::string &hay, const std::string &needle) {
++	size_t n = 0, p = 0;
++	while ((p = hay.find(needle, p)) != std::string::npos) { n++; p += needle.size(); }
++	return n;
++}
++
++// The rules in prose, written out by hand rather than reusing the header's expression.
++TakeoverVerdict expect_verdict(bool armed, bool started) {
++	if (!armed) return TakeoverVerdict::NotArmed;
++	if (started) return TakeoverVerdict::Started;
++	return TakeoverVerdict::TimedOut;
++}
++
++} // namespace
++
++int main(int argc, char **argv) {
++	const std::string root = argc > 1 ? argv[1] : ".";
++
++	// ---------------------------------------------------------------- A: arming and verdict
++	// A report about a takeover must not exist unless the card was offered to Apple: the
++	// headline for TimedOut names the personality, so printing it after a closed gate would
++	// accuse the wrong thing.
++	CHECK(!n48::accel_takeover_armed(false, false));
++	CHECK(!n48::accel_takeover_armed(false, true));    // a publish nobody asked to watch
++	CHECK(!n48::accel_takeover_armed(true, false));    // asked, but LoadAccelerator never went up
++	CHECK(n48::accel_takeover_armed(true, true));
++
++	for (int armedI = 0; armedI < 2; armedI++)
++		for (int startedI = 0; startedI < 2; startedI++) {
++			const bool a = armedI != 0, s = startedI != 0;
++			CHECK(n48::accel_takeover_verdict(a, s) == expect_verdict(a, s));
++			// An unarmed watch can never report a takeover, whatever the signal says.
++			if (!a) CHECK(n48::accel_takeover_verdict(a, s) == TakeoverVerdict::NotArmed);
++		}
++
++	// The watch must outlast the 0019 hold, or the two blocks overwrite each other on screen.
++	CHECK(n48::kTakeoverWaitSeconds >= 20);
++	CHECK(n48::kTakeoverWaitSeconds <= 120);
++	CHECK(n48::kTakeoverHold >= 3);
++	CHECK(n48::kTakeoverHold <= 20);
++
++	// ---------------------------------------------------------------- B: the headline
++	const TakeoverVerdict allv[] = { TakeoverVerdict::NotArmed, TakeoverVerdict::Started,
++	                                 TakeoverVerdict::TimedOut };
++	for (TakeoverVerdict v : allv) {
++		const char *h = n48::accel_takeover_headline(v);
++		CHECK(h && h[0]);                       // never an empty screen
++		CHECK(!has(h, "TakeoverVerdict"));      // an owner photographs English, not an enum
++	}
++	const char *started = n48::accel_takeover_headline(TakeoverVerdict::Started);
++	const char *timedOut = n48::accel_takeover_headline(TakeoverVerdict::TimedOut);
++	const char *notArmed = n48::accel_takeover_headline(TakeoverVerdict::NotArmed);
++	CHECK(std::strcmp(started, timedOut) != 0);
++	CHECK(std::strcmp(started, notArmed) != 0);
++	CHECK(std::strcmp(timedOut, notArmed) != 0);
++	CHECK(has(started, "TAKEOVER"));
++	CHECK(has(started, "started"));
++	CHECK(has(started, "handover"));
++	CHECK(!has(started, "never"));
++	CHECK(has(timedOut, "NO TAKEOVER"));
++	CHECK(has(timedOut, "never"));
++	CHECK(has(timedOut, "personality"));
++	CHECK(has(timedOut, "device id"));
++	CHECK(!has(timedOut, "handover happened"));
++	CHECK(has(notArmed, "not tracked"));
++
++	// ---------------------------------------------------------------- C: xsrc wiring
++	const std::string bringup = slurp(root + "/src/Navi48Bringup.cpp");
++	const std::string peer = slurp(root + "/src/apple/Navi48AccelPeer.cpp");
++	const std::string rt = slurp(root + "/src/accel_takeover.cpp");
++	CHECK(!bringup.empty());
++	CHECK(!peer.empty());
++	CHECK(!rt.empty());
++
++	// armed from the fire block, and only when the fire call published
++	CHECK(has(bringup, "#include \"accel_takeover_report.h\""));
++	CHECK(has(bringup, "n48::accel_takeover_armed(ff.argRequested, fireCalled && fireKr == 0)"));
++	CHECK(has(bringup, "n48::takeover_arm();"));
++	CHECK(has(bringup, "n48::takeover_start_poller();"));
++	CHECK(has(bringup, "setProperty(\"Navi48,AccelTakeover\""));
++	// ...and after the 0019 block, so the screen carries the decision before the watch starts
++	CHECK(bringup.find("n48::accel_report_mode(ff.argRequested, holdRequested)") <
++	      bringup.find("n48::accel_takeover_armed(ff.argRequested, fireCalled && fireKr == 0)"));
++	CHECK(bringup.find("const IOReturn fkr = accelExperiment(1 /*fire*/") <
++	      bringup.find("n48::accel_takeover_armed(ff.argRequested, fireCalled && fireKr == 0)"));
++
++	// the positive signal is recorded inside kReqAccelStarted, before anything else can fail
++	CHECK(has(peer, "#include \"accel_takeover_report.h\""));
++	CHECK(has(peer, "n48::takeover_mark_started(p2);"));
++	const size_t caseStart = peer.rfind("case kReqAccelStarted:");   // the handler's label, not req_name's
++	const size_t mark = peer.find("n48::takeover_mark_started(p2);");
++	const size_t caseNext = peer.find("case kReqIsDeviceValid:", mark);
++	CHECK(caseStart != std::string::npos);
++	CHECK(mark != std::string::npos && caseStart < mark);
++	CHECK(caseNext != std::string::npos && mark < caseNext);
++	CHECK(mark < peer.find("force_accelerator_enabled(p2);"));
++
++	// the negative signal: a thread that waits, one second at a time, and stands down the
++	// moment the positive one is recorded
++	CHECK(has(rt, "kernel_thread_start(&takeover_poller, nullptr, &th)"));
++	CHECK(has(rt, "thread_deallocate(th)"));
++	CHECK(has(rt, "while (waited < n48::kTakeoverWaitSeconds)"));
++	CHECK(has(rt, "if (__atomic_load_n(&gStarted, __ATOMIC_ACQUIRE)) break;"));
++	CHECK(count_of(rt, "IOSleep(1000);") == 2);   // one in print_block, one in the wait loop
++	CHECK(has(rt, "__atomic_store_n(&gArmed, 1u, __ATOMIC_RELEASE);"));
++	CHECK(has(rt, "__atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE);"));
++	CHECK(has(rt, "if (!__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE)) return;"));
++	CHECK(has(rt, "n48::accel_takeover_verdict(__atomic_load_n(&gArmed, __ATOMIC_ACQUIRE) != 0,"));
++	CHECK(has(rt, "print_block(v, waited);"));
++	CHECK(has(rt, "if (t >= n48::kTakeoverHold) break;"));
++	// The positive side runs inside Apple's start(): it must not hold the screen for kTakeoverHold.
++	const size_t markDef = rt.find("void takeover_mark_started(");
++	const size_t nextDef = rt.find("void takeover_start_poller(");
++	CHECK(markDef != std::string::npos && markDef < nextDef);
++	CHECK(!has(rt.substr(markDef, nextDef - markDef), "IOSleep"));
++	// One block per boot, whichever signal wins the race.
++	CHECK(has(rt, "__atomic_compare_exchange_n(&gBlockPrinted, &expected, 1u, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)"));
++
++	// ---------------------------------------------------------------- D: header hygiene
++	const std::string hdr = slurp(root + "/src/accel_takeover_report.h");
++	CHECK(!hdr.empty());
++	CHECK(!has(hdr, "IOKit"));
++	CHECK(!has(hdr, "setProperty"));
++	CHECK(!has(hdr, "IOLog("));
++	CHECK(!has(hdr, "IOSleep"));
++	CHECK(!has(hdr, "kernel_thread_start"));
++	CHECK(count_of(hdr, "kTakeoverWaitSeconds") == 1);
++	CHECK(count_of(hdr, "kTakeoverHold") == 1);
++	CHECK(has(hdr, "case TakeoverVerdict::TimedOut:"));
++	CHECK(has(hdr, "return reportRequested && published;"));
++
++	if (gFailures == 0) printf("OK: %d checks, 0 failures\n", gChecks);
++	else                printf("%d checks, %d failures\n", gChecks, gFailures);
++	return gFailures == 0 ? 0 : 1;
++}
+-- 
+2.52.0.windows.1
+

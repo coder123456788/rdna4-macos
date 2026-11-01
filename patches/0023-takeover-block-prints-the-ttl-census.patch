@@ -1,0 +1,117 @@
+From 0e141edd54ca726b3a3762d7ba15da094411ca5c Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Sat, 31 Oct 2026 09:55:04 -0700
+Subject: [PATCH] 0023: print the TTL census in the takeover block
+
+---
+ src/navi48-bringup/src/accel_takeover.cpp     | 33 +++++++++++++++++++
+ .../tests/accel_takeover_report_plant.sh      |  8 +++++
+ .../tests/accel_takeover_report_test.cpp      | 15 +++++++++
+ 3 files changed, 56 insertions(+)
+
+diff --git a/src/navi48-bringup/src/accel_takeover.cpp b/src/navi48-bringup/src/accel_takeover.cpp
+index 3229531..738a541 100644
+--- a/src/navi48-bringup/src/accel_takeover.cpp
++++ b/src/navi48-bringup/src/accel_takeover.cpp
+@@ -10,6 +10,7 @@
+ #include "accel_takeover_report.h"
+ 
+ #include "amd/n48log.h"
++#include "apple/Navi48Ttl.hpp"
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+ #include <kern/thread.h>
+@@ -68,6 +69,37 @@ n48::TakeoverFacts gather_facts() {
+     return f;
+ }
+ 
++// 0023: the verdict is one bit; this is where Apple's driver went. Navi48Ttl counts every one of
++// the 43 entry points Apple can call and remembers the first it called that is not implemented,
++// so a start() that dies has a place, not just a failure. Read after the wait, so the numbers
++// report what Apple did rather than what was bound. A benign race with Apple's own thread.
++void print_ttl_census() {
++    const uint32_t calls = gNavi48Ttl.totalCalls();
++    const int first = gNavi48Ttl.firstUnsupported();
++    uint32_t touched = 0;
++    for (int s = 0; s < 43; s++) if (gNavi48Ttl.callCount(s) != 0) touched++;
++    TAKELOG("ttl: bound=%u calls=%u slots=%u/43 first unsupported=%d",
++            gNavi48Ttl.bound() ? 1u : 0u, calls, touched, first);
++    static const char hex[] = "0123456789abcdef";
++    char buf[112];
++    uint32_t pos = 0;
++    for (int s = 0; s < 43; s++) {
++        if (gNavi48Ttl.callCount(s) == 0) continue;
++        if (pos + 4 > (uint32_t)(sizeof(buf) - 1)) {
++            buf[pos] = 0;
++            TAKELOG("ttl slots reached: %s", buf);
++            pos = 0;
++        }
++        if (pos) buf[pos++] = ' ';
++        buf[pos++] = hex[s >> 4];
++        buf[pos++] = hex[s & 15];
++    }
++    if (pos) {
++        buf[pos] = 0;
++        TAKELOG("ttl slots reached: %s", buf);
++    }
++}
++
+ // 0022: the id IOKit matched on. `device-id` here is the injected DeviceProperties value, not
+ // config space, so on a spoofed boot this is the only in-band proof that the injection reached
+ // the card: a wrong device path fails silently and would otherwise read exactly like a refusal.
+@@ -97,6 +129,7 @@ void print_block(n48::TakeoverVerdict v, uint32_t waited, const n48::TakeoverFac
+             TAKELOG("card: device-id 0x%04x  vendor-id 0x%04x  (IOKit properties; 0 = none injected)",
+                     injected_id(prov, "device-id"), injected_id(prov, "vendor-id"));
+         }
++        print_ttl_census();
+         TAKELOG("no terminal needed: photograph this screen");
+         if (t >= n48::kTakeoverHold) break;
+         IOSleep(1000);
+diff --git a/src/navi48-bringup/tests/accel_takeover_report_plant.sh b/src/navi48-bringup/tests/accel_takeover_report_plant.sh
+index d83a951..1d6f5a4 100644
+--- a/src/navi48-bringup/tests/accel_takeover_report_plant.sh
++++ b/src/navi48-bringup/tests/accel_takeover_report_plant.sh
+@@ -137,6 +137,14 @@ run_plant "rt: the block is never printed"           "$R" 'print_block(v, waited
+ run_plant "rt: the block runs one second long"       "$R" 'if (t >= n48::kTakeoverHold) break;' 'if (t > n48::kTakeoverHold) break;'
+ run_plant "rt: two blocks can print"                 "$R" '__atomic_compare_exchange_n(&gBlockPrinted' '__atomic_compare_exchange_n(&gBlockPrintedX'
+ 
++echo "== plants: the TTL census (0023 - where Apple's driver went) =="
++run_plant "rt: the census is never printed"          "$R" 'print_ttl_census();' ';'
++run_plant "rt: the total is not read"                "$R" 'const uint32_t calls = gNavi48Ttl.totalCalls();' 'const uint32_t calls = 0;'
++run_plant "rt: the first unsupported is hidden"      "$R" 'const int first = gNavi48Ttl.firstUnsupported();' 'const int first = -1;'
++run_plant "rt: the hook binding is not reported"     "$R" 'gNavi48Ttl.bound() ? 1u : 0u' '1u'
++run_plant "rt: the slot scan is dropped"             "$R" 'for (int s = 0; s < 43; s++) if (gNavi48Ttl.callCount(s) != 0) touched++;' 'for (int s = 0; s < 43; s++) if (gNavi48Ttl.callCount(s) != 0) { }'
++run_plant "rt: the census line loses the first slot" "$R" 'ttl: bound=%u calls=%u slots=%u/43 first unsupported=%d' 'ttl: bound=%u calls=%u slots=%u/43'
++
+ echo "== plants: the xsrc wiring (armed only after a real publish) =="
+ run_plant "xsrc: header not included"                "$C" '#include "accel_takeover_report.h"' '#include "accel_takeover_report_gone.h"'
+ run_plant "xsrc: armed on any requested boot"        "$C" 'n48::accel_takeover_armed(ff.argRequested, fireCalled && fireKr == 0)' 'n48::accel_takeover_armed(ff.argRequested, true)'
+diff --git a/src/navi48-bringup/tests/accel_takeover_report_test.cpp b/src/navi48-bringup/tests/accel_takeover_report_test.cpp
+index c7c6ce3..188d418 100644
+--- a/src/navi48-bringup/tests/accel_takeover_report_test.cpp
++++ b/src/navi48-bringup/tests/accel_takeover_report_test.cpp
+@@ -192,6 +192,21 @@ int main(int argc, char **argv) {
+ 	const size_t startedBranch = rt.find("if (v == n48::TakeoverVerdict::Started) {");
+ 	const size_t idLine = rt.find("card: device-id 0x%04x");
+ 	CHECK(startedBranch != std::string::npos && idLine != std::string::npos && idLine > startedBranch);
++	// 0023: the TTL census is where Apple's driver went - the counters Navi48Ttl recorded during
++	// the wait, printed on both verdicts before the screen is declared photographable. A verdict
++	// without it says Apple failed but not at which of the 43 entry points.
++	CHECK(has(rt, "#include \"apple/Navi48Ttl.hpp\""));
++	CHECK(has(rt, "const uint32_t calls = gNavi48Ttl.totalCalls();"));
++	CHECK(has(rt, "const int first = gNavi48Ttl.firstUnsupported();"));
++	CHECK(has(rt, "gNavi48Ttl.bound() ? 1u : 0u"));
++	CHECK(has(rt, "for (int s = 0; s < 43; s++) if (gNavi48Ttl.callCount(s) != 0) touched++;"));
++	CHECK(has(rt, "ttl: bound=%u calls=%u slots=%u/43 first unsupported=%d"));
++	const size_t censusCall = rt.find("print_ttl_census();");
++	const size_t censusDef = rt.find("void print_ttl_census() {");
++	CHECK(censusDef != std::string::npos && censusCall != std::string::npos && censusDef < censusCall);
++	CHECK(count_of(rt, "print_ttl_census();") == 1);
++	CHECK(censusCall > startedBranch);   // both verdicts carry it, not just the timeout
++	CHECK(censusCall < rt.find("no terminal needed: photograph this screen"));
+ 	CHECK(has(rt, "if (t >= n48::kTakeoverHold) break;"));
+ 	// The positive side runs inside Apple's start(): it must not hold the screen for kTakeoverHold.
+ 	const size_t markDef = rt.find("void takeover_mark_started(");
+-- 
+2.52.0.windows.1
+

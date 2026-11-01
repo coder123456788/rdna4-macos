@@ -1,0 +1,74 @@
+From 67bafd2435317b3e0fee3eee3ea8cd1f108424d5 Mon Sep 17 00:00:00 2001
+From: port <port@localhost>
+Date: Sat, 31 Oct 2026 09:43:36 -0700
+Subject: [PATCH] 0022: report the injected device id a takeover timeout
+ matched against
+
+---
+ src/navi48-bringup/src/accel_takeover.cpp        | 16 ++++++++++++++++
+ .../tests/accel_takeover_report_test.cpp         |  8 ++++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/src/navi48-bringup/src/accel_takeover.cpp b/src/navi48-bringup/src/accel_takeover.cpp
+index 046a8dd..3229531 100644
+--- a/src/navi48-bringup/src/accel_takeover.cpp
++++ b/src/navi48-bringup/src/accel_takeover.cpp
+@@ -13,6 +13,7 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+ #include <kern/thread.h>
++#include <libkern/c++/OSData.h>
+ #include <libkern/c++/OSMetaClass.h>
+ #include <libkern/c++/OSSymbol.h>
+ 
+@@ -67,6 +68,18 @@ n48::TakeoverFacts gather_facts() {
+     return f;
+ }
+ 
++// 0022: the id IOKit matched on. `device-id` here is the injected DeviceProperties value, not
++// config space, so on a spoofed boot this is the only in-band proof that the injection reached
++// the card: a wrong device path fails silently and would otherwise read exactly like a refusal.
++uint16_t injected_id(::IOService *prov, const char *name) {
++    if (!prov) return 0;
++    OSData *d = OSDynamicCast(OSData, prov->getProperty(name));
++    if (!d || d->getLength() < 4) return 0;
++    const uint8_t *b = (const uint8_t *)d->getBytesNoCopy();
++    if (!b) return 0;
++    return (uint16_t)(b[0] | (b[1] << 8));
++}
++
+ void print_block(n48::TakeoverVerdict v, uint32_t waited, const n48::TakeoverFacts &f) {
+     for (uint32_t t = 0; t <= n48::kTakeoverHold; t++) {
+         TAKELOG("========== NAVI 44 TAKEOVER REPORT %u/%u ==========", t, n48::kTakeoverHold);
+@@ -80,6 +93,9 @@ void print_block(n48::TakeoverVerdict v, uint32_t waited, const n48::TakeoverFac
+             TAKELOG("%s", n48::accel_takeover_diagnosis(f));
+             TAKELOG("kext loaded=%u  accelerator child=%u", f.appleKextLoaded ? 1u : 0u,
+                     f.accelAttached ? 1u : 0u);
++            IOService *prov = (IOService *)__atomic_load_n(&gProvider, __ATOMIC_ACQUIRE);
++            TAKELOG("card: device-id 0x%04x  vendor-id 0x%04x  (IOKit properties; 0 = none injected)",
++                    injected_id(prov, "device-id"), injected_id(prov, "vendor-id"));
+         }
+         TAKELOG("no terminal needed: photograph this screen");
+         if (t >= n48::kTakeoverHold) break;
+diff --git a/src/navi48-bringup/tests/accel_takeover_report_test.cpp b/src/navi48-bringup/tests/accel_takeover_report_test.cpp
+index 07b87ad..c7c6ce3 100644
+--- a/src/navi48-bringup/tests/accel_takeover_report_test.cpp
++++ b/src/navi48-bringup/tests/accel_takeover_report_test.cpp
+@@ -184,6 +184,14 @@ int main(int argc, char **argv) {
+ 	CHECK(has(rt, "getChildIterator(gIOServicePlane)"));
+ 	CHECK(has(rt, "__atomic_store_n(&gProvider, (uintptr_t)provider, __ATOMIC_RELEASE);"));
+ 	CHECK(has(rt, "n48::accel_takeover_diagnosis(f)"));
++	// 0022: the injected id must be reported on a timeout; without it a spoof that never
++	// reached the device is indistinguishable from Apple refusing the card.
++	CHECK(has(rt, "injected_id(prov, \"device-id\")"));
++	CHECK(has(rt, "card: device-id 0x%04x"));
++	// The id line belongs to the negative branch: a takeover needs no excuse line.
++	const size_t startedBranch = rt.find("if (v == n48::TakeoverVerdict::Started) {");
++	const size_t idLine = rt.find("card: device-id 0x%04x");
++	CHECK(startedBranch != std::string::npos && idLine != std::string::npos && idLine > startedBranch);
+ 	CHECK(has(rt, "if (t >= n48::kTakeoverHold) break;"));
+ 	// The positive side runs inside Apple's start(): it must not hold the screen for kTakeoverHold.
+ 	const size_t markDef = rt.find("void takeover_mark_started(");
+-- 
+2.52.0.windows.1
+

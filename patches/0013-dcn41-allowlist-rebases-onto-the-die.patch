@@ -1,0 +1,725 @@
+diff --git a/src/dcn41/dcn41_allow.c b/src/dcn41/dcn41_allow.c
+index b3e42aa..07561ca 100644
+--- a/src/dcn41/dcn41_allow.c
++++ b/src/dcn41/dcn41_allow.c
+@@ -10,8 +10,10 @@
+ 
+ #pragma GCC poison float double
+ 
++static int rebase_range(uint32_t index, const uint32_t seg[5], uint32_t *lo, uint32_t *hi);
++
+ static const char *const k_reason_name[DCN41_ALLOW_REASON_COUNT] = {
+-    "OK", "UNARMED", "WINDOW", "INDIRECT", "BLOCK", "RANGE"
++    "OK", "UNARMED", "WINDOW", "INDIRECT", "BLOCK", "RANGE", "REBASE"
+ };
+ 
+ const char *dcn41_allow_reason_name(int reason)
+@@ -47,6 +49,18 @@ int dcn41_allow_range_at(uint32_t index, uint32_t *abs_lo, uint32_t *abs_hi, uin
+     return 0;
+ }
+ 
++int dcn41_allow_range_at_seg(uint32_t index, const uint32_t seg[5], uint32_t *lo, uint32_t *hi,
++                             uint32_t *base_idx, const char **name)
++{
++    if (index >= DCN41_ALLOW_RANGE_COUNT)
++        return -1;
++    if (base_idx)
++        *base_idx = dcn41_allow_ranges[index].base_idx;
++    if (name)
++        *name = dcn41_allow_ranges[index].name;
++    return rebase_range(index, seg, lo, hi);
++}
++
+ static void zero_state(struct dcn41_allow_state *st)
+ {
+     uint8_t *p = (uint8_t *)st;
+@@ -65,9 +79,64 @@ static void copy_tag(char *dst, const char *src)
+     dst[i] = '\0';
+ }
+ 
++/* One generated range, moved from the segment base it was written against onto this card's.
++ * `seg` is what IP discovery reported for hwId 271; NULL means "do not move it", which is the
++ * identity because the table is absolute against exactly those bases. */
++static int rebase_range(uint32_t index, const uint32_t seg[5], uint32_t *lo, uint32_t *hi)
++{
++    const struct dcn41_allow_range *r = &dcn41_allow_ranges[index];
++    uint32_t base, off_lo, off_hi, b = r->base_idx;
++
++    if (b >= 5u)
++        return -1;                    /* the table names a segment that does not exist */
++    if (seg && seg[b] == 0u)
++        return -2;                    /* the card left this segment unfiled */
++    if (r->abs_lo < dcn41_allow_expected_segs[b] || r->abs_hi < dcn41_allow_expected_segs[b])
++        return -3;                    /* a mis-generated table: an address below its own base */
++    off_lo = r->abs_lo - dcn41_allow_expected_segs[b];
++    off_hi = r->abs_hi - dcn41_allow_expected_segs[b];
++    base = seg ? seg[b] : dcn41_allow_expected_segs[b];
++    if (base + off_lo < base || base + off_hi < base)
++        return -4;                    /* wrapped: these are not BAR5-sized bases */
++    if (lo)
++        *lo = base + off_lo;
++    if (hi)
++        *hi = base + off_hi;
++    return 0;
++}
++
++/* Does a rebased range sit on a denial? Hard-deny windows first, then the named blocks. Returns 1
++ * and the group/slot, or -1 when the range is clear of every denial. The denials are absolute
++ * addresses of OTHER blocks and are never rebased, which is what makes a hit a contradiction. */
++static int deny_overlap(uint32_t lo, uint32_t hi, uint32_t *group, uint32_t *slot)
++{
++    uint32_t i;
++
++    for (i = 0; i < DCN41_HARD_DENY_COUNT; i++) {
++        if (lo <= dcn41_hard_deny[i].abs_hi && hi >= dcn41_hard_deny[i].abs_lo) {
++            if (group)
++                *group = 0u;
++            if (slot)
++                *slot = i;
++            return 1;
++        }
++    }
++    for (i = 0; i < DCN41_DENY_BLOCK_COUNT; i++) {
++        if (lo <= dcn41_deny_blocks[i].abs_hi && hi >= dcn41_deny_blocks[i].abs_lo) {
++            if (group)
++                *group = 1u;
++            if (slot)
++                *slot = i;
++            return 1;
++        }
++    }
++    return -1;
++}
++
+ int dcn41_allow_init(struct dcn41_allow_state *st, const uint32_t seg[5], uint32_t mmio_dwords)
+ {
+     uint32_t i, highest = 0;
++    int rc;
+ 
+     if (!st)
+         return DCN41_ALLOW_UNARMED;
+@@ -75,16 +144,34 @@ int dcn41_allow_init(struct dcn41_allow_state *st, const uint32_t seg[5], uint32
+     if (!seg)
+         return DCN41_ALLOW_UNARMED;
+ 
+-    /* The range table is absolute addresses computed for one specific set of segment bases. If this
+-     * card reports different ones, the table is about a different address space and must not be
+-     * used: stay unarmed rather than guess. */
++    st->rebase_index = -1;
++    st->rebase_overlap = -1;
+     for (i = 0; i < 5u; i++) {
++        st->seg[i] = seg[i];
+         if (seg[i] != dcn41_allow_expected_segs[i])
+-            return DCN41_ALLOW_UNARMED;
++            st->rebased = 1u;
+     }
++
++    /* The range table is absolute for one card's segment bases; a different die reports its own,
++     * and the writer already forms every display address as seg[BASE_IDX] + offset from them
++     * (dcn41_abs, navi48_dcn.cpp). So rebase, and refuse only the bases that cannot be display
++     * hardware: a segment that reported nothing, a range that wrapped, or a range that lands on
++     * an indirect window or a named SMU/PSP block. */
+     for (i = 0; i < DCN41_ALLOW_RANGE_COUNT; i++) {
+-        if (dcn41_allow_ranges[i].abs_hi > highest)
+-            highest = dcn41_allow_ranges[i].abs_hi;
++        uint32_t lo = 0, hi = 0, group = 0, slot = 0;
++
++        rc = rebase_range(i, seg, &lo, &hi);
++        if (rc != 0) {
++            st->rebase_index = (int32_t)i;
++            return DCN41_ALLOW_REBASE;
++        }
++        if (deny_overlap(lo, hi, &group, &slot) == 1) {
++            st->rebase_index = (int32_t)i;
++            st->rebase_overlap = (int32_t)(group * 100u + slot);
++            return DCN41_ALLOW_REBASE;
++        }
++        if (hi > highest)
++            highest = hi;
+     }
+     if (mmio_dwords == 0u || mmio_dwords <= highest)
+         return DCN41_ALLOW_UNARMED;
+@@ -95,7 +182,7 @@ int dcn41_allow_init(struct dcn41_allow_state *st, const uint32_t seg[5], uint32
+     return DCN41_ALLOW_OK;
+ }
+ 
+-int dcn41_allow_classify(uint32_t abs_dword, uint32_t mmio_dwords,
++int dcn41_allow_classify(uint32_t abs_dword, uint32_t mmio_dwords, const uint32_t seg[5],
+                          const char **range_name, const char **why)
+ {
+     uint32_t i;
+@@ -130,9 +217,14 @@ int dcn41_allow_classify(uint32_t abs_dword, uint32_t mmio_dwords,
+         }
+     }
+ 
+-    /* 4. The allow table - the only thing that can return OK. */
++    /* 4. The allow table - the only thing that can return OK. Each range is rebased onto the
++     *    bases actually passed in, so this answers for the card the caller is holding. */
+     for (i = 0; i < DCN41_ALLOW_RANGE_COUNT; i++) {
+-        if (abs_dword >= dcn41_allow_ranges[i].abs_lo && abs_dword <= dcn41_allow_ranges[i].abs_hi) {
++        uint32_t lo = 0, hi = 0;
++
++        if (rebase_range(i, seg, &lo, &hi) != 0)
++            continue;                     /* a range this die cannot express is not writable */
++        if (abs_dword >= lo && abs_dword <= hi) {
+             if (range_name)
+                 *range_name = dcn41_allow_ranges[i].name;
+             return DCN41_ALLOW_OK;
+@@ -173,7 +265,7 @@ bool dcn41_allow_write(struct dcn41_allow_state *st, uint32_t abs_dword, uint32_
+ 
+     st->writes_seen++;
+     seq = (uint32_t)st->writes_seen;
+-    reason = dcn41_allow_classify(abs_dword, st->mmio_dwords, 0, 0);
++    reason = dcn41_allow_classify(abs_dword, st->mmio_dwords, st->seg, 0, 0);
+     st->by_reason[reason]++;
+ 
+     if (reason == DCN41_ALLOW_OK) {
+diff --git a/src/dcn41/dcn41_allow.h b/src/dcn41/dcn41_allow.h
+index 1c98717..e5abc81 100644
+--- a/src/dcn41/dcn41_allow.h
++++ b/src/dcn41/dcn41_allow.h
+@@ -12,10 +12,17 @@
+  * SMU, or its firmware ROM. This file is that promise expressed as code rather than as care:
+  *
+  *   1. DENY BY DEFAULT. dcn41_allow_classify() returns a refusal reason unless a range matches.
+- *   2. The guard is INERT until dcn41_allow_init() succeeds, and init refuses unless the caller's
+- *      five DMU segment bases are exactly the ones this card's discovery table reports and the ones
+- *      the range table was generated for. An allowlist of absolute addresses is meaningless if the
+- *      bases moved, so a mismatch disables every write instead of trusting stale ranges.
++ *   2. The guard is INERT until dcn41_allow_init() succeeds. The generated range table is absolute
++ *      BAR5 addresses computed for one card's DMU segment bases, and a card reports its own; init
++ *      therefore SUBTRACTS the bases the table was generated for and ADDS the ones this card
++ *      reports, per range, using each range's own BASE_IDX - which is what Linux does when it
++ *      forms WREG32(DCN, 0, reg_X) from the same dcn_4_1_0_offset.h. A die whose bases differ gets
++ *      the same relative windows, not the Navi 48 absolutes, and not nothing. It still refuses to
++ *      arm when the rebasing does not behave like display hardware: a segment that reports base 0,
++ *      a rebased range that wraps or falls outside the mapped BAR5, or a rebased range that lands
++ *      on an indirect window or a named SMU/PSP block (DCN41_ALLOW_REBASE). Those are not
++ *      different-but-valid bases; they are bases that would make an allowlisted address mean
++ *      something else.
+  *   3. INDIRECT WINDOWS ARE HARD-DENIED, BEFORE the allow table is consulted. The low BAR5 page
+  *      holds MM_INDEX/MM_DATA and NBIO's PCIE_INDEX2/RSMU_INDEX pairs; a write there selects a
+  *      target anywhere in SMN - SMU, SMUIO, THM, the SPI ROM - and the next write goes to it. That
+@@ -55,6 +62,7 @@ enum dcn41_allow_reason {
+     DCN41_ALLOW_INDIRECT,        /* an SMN/VRAM indirect-access window (hard deny, see the header) */
+     DCN41_ALLOW_BLOCK,           /* inside a named SMU/PSP/SMUIO block (hard deny) */
+     DCN41_ALLOW_RANGE,           /* outside every display range - the DEFAULT */
++    DCN41_ALLOW_REBASE,          /* init refused: these bases cannot be rebased into display ranges */
+     DCN41_ALLOW_REASON_COUNT
+ };
+ 
+@@ -74,6 +82,10 @@ struct dcn41_allow_state {
+     uint32_t magic;                           /* DCN41_ALLOW_STATE_MAGIC once init succeeded */
+     uint32_t armed;                           /* 1 only if init validated the bases and the window */
+     uint32_t mmio_dwords;                     /* the BAR5 window init was given */
++    uint32_t seg[5];                          /* the DMU bases this state was armed against */
++    uint32_t rebased;                         /* 1 if those differ from the generated table's own */
++    int32_t rebase_index;                     /* the range that refused to rebase, or -1 */
++    int32_t rebase_overlap;                   /* the deny window a rebased range landed on, or -1 */
+     uint64_t writes_seen;                     /* every call to dcn41_allow_write */
+     uint64_t allowed;
+     uint64_t refused;
+@@ -88,15 +100,22 @@ struct dcn41_allow_state {
+     struct dcn41_allow_sample allow[DCN41_ALLOW_SAMPLES];
+ };
+ 
+-/* Arm the guard. Returns DCN41_ALLOW_OK, or a reason (never OK) if it refuses:
+- *  - seg must equal the five bases the range table was generated for, element for element;
+- *  - mmio_dwords must be non-zero and must cover the highest allowed range.
++/* Arm the guard against the five DMU segment bases THIS card's IP discovery reports (seg may be
++ * shorter than 5 only in the sense that all five are read; the generated table's own bases are
++ * dcn41_allow_expected_segs and every range is moved by its own BASE_IDX). Returns
++ * DCN41_ALLOW_OK, or a reason (never OK) if it refuses:
++ *  - mmio_dwords must be non-zero and must cover the highest rebased range;
++ *  - a segment a range is built on must be non-zero and the rebasing must not wrap;
++ *  - no rebased range may land on an indirect window or a named SMU/PSP block - that is
++ *    DCN41_ALLOW_REBASE, and st->rebase_index / st->rebase_overlap say which.
+  * On refusal the state is zeroed and left UNARMED, so every subsequent write is refused. */
+ int dcn41_allow_init(struct dcn41_allow_state *st, const uint32_t seg[5], uint32_t mmio_dwords);
+ 
+-/* Pure classification, no state. *range_name and *why are optional out-parameters: on OK
+- * *range_name names the display block, on a refusal *why is the documented reason text (or NULL). */
+-int dcn41_allow_classify(uint32_t abs_dword, uint32_t mmio_dwords,
++/* Pure classification, no state: the same decision dcn41_allow_write() makes for the bases `seg`
++ * (NULL means the generated table's own bases, i.e. no rebasing). *range_name and *why are
++ * optional out-parameters: on OK *range_name names the display block, on a refusal *why is the
++ * documented reason text (or NULL). */
++int dcn41_allow_classify(uint32_t abs_dword, uint32_t mmio_dwords, const uint32_t seg[5],
+                          const char **range_name, const char **why);
+ 
+ /* The gate. Returns true only if the write may proceed; the caller MUST NOT touch hardware on
+@@ -115,6 +134,11 @@ const char *dcn41_allow_reason_name(int reason);
+ uint32_t dcn41_allow_range_count(void);
+ int dcn41_allow_range_at(uint32_t index, uint32_t *abs_lo, uint32_t *abs_hi, uint32_t *base_idx,
+                          const char **name);
++/* The same range after rebasing onto `seg` (NULL = the table's own bases, so identical to
++ * dcn41_allow_range_at). Used to say what a synthetic or a different die's windows are, without
++ * any caller but dcn41_allow.c itself getting to know the generated table. */
++int dcn41_allow_range_at_seg(uint32_t index, const uint32_t seg[5], uint32_t *lo, uint32_t *hi,
++                             uint32_t *base_idx, const char **name);
+ uint32_t dcn41_allow_total_dwords(void);
+ 
+ #ifdef __cplusplus
+diff --git a/src/dcn41/dcn41_allow_ranges.h b/src/dcn41/dcn41_allow_ranges.h
+index c5d6746..54ddd05 100644
+--- a/src/dcn41/dcn41_allow_ranges.h
++++ b/src/dcn41/dcn41_allow_ranges.h
+@@ -90,8 +90,9 @@ static const struct dcn41_allow_range dcn41_allow_ranges[DCN41_ALLOW_RANGE_COUNT
+     { 0x00009e43u, 0x00009f64u, 3u, "HPO..ABM3" },  /* seg3 + 0x00e43..0x00f64, 164 regs in 6 block(s) */
+ };
+ 
+-/* The segment bases the table above was generated for. dcn41_allow_init refuses any other set:
+- * an allowlist of absolute addresses means nothing if the bases moved. */
++/* The segment bases the table above was generated for. dcn41_allow_init() moves every range
++ * by its own BASE_IDX onto the bases this card's IP discovery reports, so a die that numbers
++ * its display segments elsewhere gets the same relative windows; these are the subtrahend. */
+ static const uint32_t dcn41_allow_expected_segs[5] = {
+     0x00000012u, 0x000000c0u, 0x000034c0u, 0x00009000u, 0x02403c00u
+ };
+diff --git a/src/dcn41/tests/test_dcn41_allow.c b/src/dcn41/tests/test_dcn41_allow.c
+index 5aa76f0..6f317f9 100644
+--- a/src/dcn41/tests/test_dcn41_allow.c
++++ b/src/dcn41/tests/test_dcn41_allow.c
+@@ -72,7 +72,7 @@ static void test_positive_control(void)
+     for (i = 0; i < sizeof(legal) / sizeof(legal[0]); i++) {
+         bool ok = dcn41_allow_write(&st, legal[i].a, 0x12345678u, legal[i].tag);
+         CHECK(ok, "legal display write 0x%08x (%s) must be ALLOWED", legal[i].a, legal[i].tag);
+-        CHECK(dcn41_allow_classify(legal[i].a, BAR5_DWORDS, &name, &why) == DCN41_ALLOW_OK,
++        CHECK(dcn41_allow_classify(legal[i].a, BAR5_DWORDS, kSegs, &name, &why) == DCN41_ALLOW_OK,
+               "classify 0x%08x OK", legal[i].a);
+         CHECK(name != 0, "an allowed address names its range (0x%08x)", legal[i].a);
+     }
+@@ -103,14 +103,14 @@ static void test_smu_refused(void)
+ 
+     arm(&st);
+     for (i = 0; i < sizeof(smu) / sizeof(smu[0]); i++) {
+-        int r = dcn41_allow_classify(smu[i], BAR5_DWORDS, 0, &why);
++        int r = dcn41_allow_classify(smu[i], BAR5_DWORDS, kSegs, 0, &why);
+         bool ok = dcn41_allow_write(&st, smu[i], 0xdeadbeefu, "smu-probe");
+         CHECK(!ok, "SMU-range write 0x%08x must be REFUSED", smu[i]);
+         /* 0x16282 and friends are past a 1 MiB BAR5, so WINDOW catches them first; the named-block
+          * denial is what catches them when the window is larger. Either way it is never OK. */
+         CHECK(r == DCN41_ALLOW_BLOCK || r == DCN41_ALLOW_WINDOW,
+               "0x%08x refused as BLOCK or WINDOW, got %s", smu[i], dcn41_allow_reason_name(r));
+-        CHECK(dcn41_allow_classify(smu[i], 0x4000000u, 0, &why) == DCN41_ALLOW_BLOCK,
++        CHECK(dcn41_allow_classify(smu[i], 0x4000000u, kSegs, 0, &why) == DCN41_ALLOW_BLOCK,
+               "with a window big enough to reach it, 0x%08x is refused as a NAMED BLOCK", smu[i]);
+         CHECK(why != 0, "the named-block refusal carries its documentation (0x%08x)", smu[i]);
+     }
+@@ -159,7 +159,7 @@ static void test_out_of_range_refused(void)
+ 
+     arm(&st);
+     for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+-        int r = dcn41_allow_classify(bad[i].a, BAR5_DWORDS, 0, &why);
++        int r = dcn41_allow_classify(bad[i].a, BAR5_DWORDS, kSegs, 0, &why);
+         bool ok = dcn41_allow_write(&st, bad[i].a, 0xa5a5a5a5u, "stray");
+         CHECK(!ok, "0x%08x (%s) must be REFUSED", bad[i].a, bad[i].what);
+         CHECK(r == bad[i].reason, "0x%08x (%s): expected %s, got %s", bad[i].a, bad[i].what,
+@@ -184,7 +184,7 @@ static void test_out_of_range_refused(void)
+           "dropped samples counted: %u", st.refuse_dropped);
+ }
+ 
+-/* ---- 4. deny by default: the guard is inert until it is armed with THIS card's bases -------- */
++/* ---- 4. deny by default: the guard is inert until it is armed, and armed means armed WELL ---- */
+ static void test_deny_by_default(void)
+ {
+     struct dcn41_allow_state st;
+@@ -197,16 +197,39 @@ static void test_deny_by_default(void)
+           "an un-inited state refuses even a legal display address");
+     CHECK(st.by_reason[DCN41_ALLOW_UNARMED] == 1u, "counted as UNARMED");
+ 
+-    /* initialised with bases that are not this card's */
+-    for (i = 0; i < 5; i++)
+-        wrong[i] = kSegs[i];
+-    wrong[2] = 0x000034c1u;                     /* one dword off on the main DCN segment */
++    /* 0013: bases that are not the generated card's no longer refuse - they are rebased (see
++     * section 6). What refuses is a base that cannot BE display hardware, and each of these four
++     * is a different way of failing to be. */
++    for (i = 0; i < 5; i++) wrong[i] = kSegs[i];
++    wrong[1] = 0x00000040u;    /* seg1's first range (offset 0x40..0xbe) moves onto the low page */
+     rc = dcn41_allow_init(&st, wrong, BAR5_DWORDS);
+-    CHECK(rc == DCN41_ALLOW_UNARMED, "init refuses bases that are not the ones the table was built for");
+-    CHECK(st.armed == 0u, "and leaves the guard unarmed");
+-    CHECK(!dcn41_allow_write(&st, 0x00005003u, 1u, "otgctl"), "so every write is refused");
++    CHECK(rc == DCN41_ALLOW_REBASE, "refused: a display range over the indirect-access page, got %s",
++          dcn41_allow_reason_name(rc));
++    CHECK(st.armed == 0u, "and the guard stays unarmed");
++    CHECK(st.rebase_index == 0, "which range: %d", st.rebase_index);
++    CHECK(st.rebase_overlap == 0, "which denial: %d", st.rebase_overlap);
++
++    for (i = 0; i < 5; i++) wrong[i] = kSegs[i];
++    wrong[1] = 0x00016000u;    /* the same range moved onto MP1/SMU instead */
++    rc = dcn41_allow_init(&st, wrong, BAR5_DWORDS);
++    CHECK(rc == DCN41_ALLOW_REBASE, "refused: a display range over the SMU block");
++    CHECK(st.rebase_overlap == 100, "named block 0, got %d", st.rebase_overlap);
++
++    for (i = 0; i < 5; i++) wrong[i] = kSegs[i];
++    wrong[2] = 0u;             /* the card did not fill this segment in at all */
++    rc = dcn41_allow_init(&st, wrong, BAR5_DWORDS);
++    CHECK(rc == DCN41_ALLOW_REBASE, "refused: a display segment with base 0");
++
++    for (i = 0; i < 5; i++) wrong[i] = kSegs[i];
++    wrong[3] = 0xfffffff0u;    /* offset + base wraps past the end of the address space */
++    rc = dcn41_allow_init(&st, wrong, BAR5_DWORDS);
++    CHECK(rc == DCN41_ALLOW_REBASE, "refused: bases whose rebase wraps out of the BAR");
++
++    memset(&st, 0, sizeof(st));
++    (void)dcn41_allow_init(&st, wrong, BAR5_DWORDS);
++    CHECK(!dcn41_allow_write(&st, 0x00009000u, 1u, "mpcc"), "so every write is refused");
+ 
+-    /* a window too small to contain the table's own top range */
++    /* a window too small to contain the rebased top range */
+     rc = dcn41_allow_init(&st, kSegs, 0x1000u);
+     CHECK(rc == DCN41_ALLOW_UNARMED, "init refuses a BAR5 window smaller than the allowed ranges");
+     rc = dcn41_allow_init(&st, kSegs, 0u);
+@@ -216,7 +239,135 @@ static void test_deny_by_default(void)
+     CHECK(!dcn41_allow_write(0, 0x00005003u, 1u, "otgctl"), "a NULL state refuses");
+ }
+ 
+-/* ---- 5. the table itself: disjoint, ordered, inside BAR5, and it covers what we need -------- */
++/* ---- 5. 0013: a die with different DMU bases gets the same windows, moved ---------------------
++ *
++ * The synthetic second die is not a real card. Its bases are chosen so that every range lands
++ * between the denials, and its expected addresses are computed BY HAND from the offsets already
++ * quoted in this file's header comment (seg2 + 0x1b43, seg3 + 0x0, seg1 + 0x80, seg2 + 0x60a) and
++ * from kSegs - which came from the driver log, not from dcn41_allow_ranges.h. No expectation here
++ * reads the generated table through the code under test, because a rebase that moved the windows to
++ * the wrong place would otherwise agree with itself and pass. */
++static void test_rebase(void)
++{
++    struct dcn41_allow_state st;
++    /* seg1..3 are the display segments; each is a distinct, denial-free home for its ranges. */
++    static const uint32_t other[5] = { 0x00000020u, 0x00000200u, 0x00001000u, 0x00007000u,
++                                       0x00100000u };
++    /* Only segment 4 differs - a segment the table never uses. rebased must still say the bases
++     * were not the generated ones, while every range stays exactly where it was. */
++    static const uint32_t seg4only[5] = { 0x00000012u, 0x000000c0u, 0x000034c0u, 0x00009000u,
++                                          0x02404000u };
++    uint32_t n = dcn41_allow_range_count(), i;
++    int rc;
++
++    /* 5a. the identity: this card's own bases move nothing, and NULL means the same thing */
++    for (i = 0; i < n; i++) {
++        uint32_t lo = 0, hi = 0, b = 0, xlo = 0, xhi = 0;
++        (void)dcn41_allow_range_at(i, &lo, &hi, 0, 0);
++        CHECK(dcn41_allow_range_at_seg(i, kSegs, &xlo, &xhi, &b, 0) == 0, "range %u rebases", i);
++        CHECK(xlo == lo && xhi == hi, "range %u unchanged under its own bases (0x%08x..0x%08x)",
++              i, xlo, xhi);
++    }
++    rc = dcn41_allow_init(&st, kSegs, BAR5_DWORDS);
++    CHECK(rc == DCN41_ALLOW_OK, "the card's own bases arm, got %s",
++          dcn41_allow_reason_name(rc));
++    CHECK(st.rebased == 0u, "and are not reported as a rebase");
++    CHECK(st.rebase_index == -1 && st.rebase_overlap == -1, "no rebase diagnostics on success");
++    for (i = 0; i < 5u; i++)
++        CHECK(st.seg[i] == kSegs[i], "the armed state keeps the bases (seg[%u])", i);
++    for (i = 0; i < n; i++) {
++        uint32_t lo = 0, hi = 0;
++        const char *na = 0, *nb = 0;
++        (void)dcn41_allow_range_at(i, &lo, &hi, 0, 0);
++        CHECK(dcn41_allow_classify(lo, BAR5_DWORDS, 0, &na, 0) == DCN41_ALLOW_OK,
++              "NULL bases classify range %u's own lo", i);
++        CHECK(dcn41_allow_classify(lo, BAR5_DWORDS, kSegs, &nb, 0) == DCN41_ALLOW_OK,
++              "and so do the card's own bases");
++        CHECK(na == nb, "NULL and this card's bases name the same range %u", i);
++    }
++
++    /* 5b. the synthetic die: every range carries its own segment's delta */
++    rc = dcn41_allow_init(&st, other, BAR5_DWORDS);
++    CHECK(rc == DCN41_ALLOW_OK, "a die with other DMU bases arms, got %s",
++          dcn41_allow_reason_name(rc));
++    CHECK(st.rebased == 1u, "and says so");
++    for (i = 0; i < 5u; i++)
++        CHECK(st.seg[i] == other[i], "state keeps the bases it armed against [%u]", i);
++    for (i = 0; i < n; i++) {
++        uint32_t lo = 0, hi = 0, b = 9, xlo = 0, xhi = 0;
++        (void)dcn41_allow_range_at(i, &lo, &hi, &b, 0);
++        CHECK(dcn41_allow_range_at_seg(i, other, &xlo, &xhi, 0, 0) == 0,
++              "range %u is expressible on the second die", i);
++        CHECK(xlo == lo - kSegs[b] + other[b] && xhi == hi - kSegs[b] + other[b],
++              "range %u moved by seg[%u]'s own delta (0x%08x..0x%08x)", i, b, xlo, xhi);
++        CHECK(xhi - xlo == hi - lo, "range %u kept its size", i);
++        CHECK(xlo > 0x000000ffu, "range %u clears the hard-denied low page", i);
++        CHECK(xhi < 0x00016000u, "range %u clears the MP1/SMU block", i);
++    }
++    /* The registers the display path actually writes, at this die's addresses. */
++    CHECK(dcn41_allow_classify(0x00002b43u, BAR5_DWORDS, other, 0, 0) == DCN41_ALLOW_OK,
++          "OTG0_OTG_CONTROL is allowed at seg2 0x1000 + 0x1b43 = 0x2b43");
++    CHECK(dcn41_allow_classify(0x00007000u, BAR5_DWORDS, other, 0, 0) == DCN41_ALLOW_OK,
++          "MPCC0_MPCC_TOP_SEL at seg3 0x7000 + 0x0");
++    CHECK(dcn41_allow_classify(0x00000280u, BAR5_DWORDS, other, 0, 0) == DCN41_ALLOW_OK,
++          "OTG0_PIXEL_RATE_CNTL at seg1 0x200 + 0x80");
++    CHECK(dcn41_allow_classify(0x0000160au, BAR5_DWORDS, other, 0, 0) == DCN41_ALLOW_OK,
++          "the primary surface address at seg2 0x1000 + 0x60a");
++    CHECK(dcn41_allow_classify(0x00002b43u, BAR5_DWORDS, other, 0, 0) == DCN41_ALLOW_OK
++              && dcn41_allow_classify(0x00005003u, BAR5_DWORDS, kSegs, 0, 0) == DCN41_ALLOW_OK,
++          "the same register is 0x5003 on the surveyed die");
++    /* and the first die's absolutes are only gaps now, never permissions carried over */
++    CHECK(dcn41_allow_classify(0x00005003u, BAR5_DWORDS, other, 0, 0) == DCN41_ALLOW_RANGE,
++          "0x5003 means nothing on the second die");
++    CHECK(dcn41_allow_classify(0x00009000u, BAR5_DWORDS, other, 0, 0) == DCN41_ALLOW_RANGE,
++          "so is 0x9000");
++    /* the denials are absolute: they never move with the display segments */
++    CHECK(dcn41_allow_classify(0x00000014u, BAR5_DWORDS, other, 0, 0) == DCN41_ALLOW_INDIRECT,
++          "RSMU_INDEX is still INDIRECT on a rebased die");
++    CHECK(dcn41_allow_classify(0x00016282u, BAR5_DWORDS, other, 0, 0) == DCN41_ALLOW_BLOCK,
++          "the SMU mailbox is still a named block");
++    /* the writer honours the rebased state, not the generated absolutes */
++    CHECK(dcn41_allow_write(&st, 0x00002b43u, 0x1234u, "otgctl"), "a rebased legal write passes");
++    CHECK(!dcn41_allow_write(&st, 0x00005003u, 0x1234u, "stale"),
++          "the surveyed die's address is refused here");
++    CHECK(st.allowed == 1u && st.refused == 1u, "one allowed, one refused: %" PRIu64 "/%" PRIu64,
++          st.allowed, st.refused);
++
++    /* 5c. a base difference in a segment the table ignores: flagged, but nothing moves */
++    rc = dcn41_allow_init(&st, seg4only, BAR5_DWORDS);
++    CHECK(rc == DCN41_ALLOW_OK, "an unused segment's new base still arms");
++    CHECK(st.rebased == 1u, "and is reported as rebased");
++    for (i = 0; i < n; i++) {
++        uint32_t lo = 0, hi = 0, xlo = 0, xhi = 0;
++        (void)dcn41_allow_range_at(i, &lo, &hi, 0, 0);
++        (void)dcn41_allow_range_at_seg(i, seg4only, &xlo, &xhi, 0, 0);
++        CHECK(lo == xlo && hi == xhi, "range %u did not move", i);
++    }
++
++    /* 5d. the window check runs against the REBASED top, not the generated one: 0x7f64 here,
++     * 0x9f64 on the surveyed die, both seg3's last range plus that segment's base. */
++    rc = dcn41_allow_init(&st, other, 0x7f64u);
++    CHECK(rc == DCN41_ALLOW_UNARMED, "a window ending ON the rebased top refuses");
++    rc = dcn41_allow_init(&st, other, 0x7f65u);
++    CHECK(rc == DCN41_ALLOW_OK, "one dword past it arms");
++    rc = dcn41_allow_init(&st, kSegs, 0x7f65u);
++    CHECK(rc == DCN41_ALLOW_UNARMED, "the same window is still too small for the surveyed die");
++    /* a die whose seg3 sits ABOVE its seg2 still has to fit: raise seg3 until it does */
++    {
++        uint32_t up[5];
++        for (i = 0; i < 5u; i++) up[i] = other[i];
++        up[3] = 0x00016000u;   /* now MPCC's first range sits on MP1/SMU */
++        rc = dcn41_allow_init(&st, up, BAR5_DWORDS);
++        CHECK(rc == DCN41_ALLOW_REBASE, "a die whose display segment overlaps the SMU refuses");
++        CHECK(st.rebase_overlap == 100, "naming the block: %d", st.rebase_overlap);
++        up[3] = 0x00000020u;   /* and one whose range sits back on the indirect page */
++        rc = dcn41_allow_init(&st, up, BAR5_DWORDS);
++        CHECK(rc == DCN41_ALLOW_REBASE, "a die whose display segment overlaps the low page refuses");
++        CHECK(st.rebase_overlap == 0, "naming the hard denial: %d", st.rebase_overlap);
++    }
++}
++
++/* ---- 6. the table itself: disjoint, ordered, inside BAR5, and it covers what we need -------- */
+ static void test_table_shape(void)
+ {
+     uint32_t n = dcn41_allow_range_count(), i;
+@@ -246,7 +397,7 @@ static void test_table_shape(void)
+     CHECK(dcn41_allow_reason_name(99)[0] == '?', "an unknown reason does not read out of bounds");
+ }
+ 
+-/* ---- 5b. the window this card actually maps ------------------------------------------------- */
++/* ---- 6b. the window this card actually maps ------------------------------------------------- */
+ static void test_measured_window(void)
+ {
+     struct dcn41_allow_state st;
+@@ -255,9 +406,9 @@ static void test_measured_window(void)
+ 
+     CHECK(0x00016282u < BAR5_MEASURED,
+           "the SMU mailbox 0x16282 is INSIDE this card's %u-dword register window", BAR5_MEASURED);
+-    CHECK(dcn41_allow_classify(0x00016282u, BAR5_MEASURED, 0, 0) == DCN41_ALLOW_BLOCK,
++    CHECK(dcn41_allow_classify(0x00016282u, BAR5_MEASURED, kSegs, 0, 0) == DCN41_ALLOW_BLOCK,
+           "and is refused as a NAMED BLOCK, not merely as out-of-window");
+-    CHECK(dcn41_allow_classify(0x0001629au, BAR5_MEASURED, 0, 0) == DCN41_ALLOW_BLOCK,
++    CHECK(dcn41_allow_classify(0x0001629au, BAR5_MEASURED, kSegs, 0, 0) == DCN41_ALLOW_BLOCK,
+           "so is the SMU response register 0x1629a");
+     for (i = 0; i < n; i++) {
+         uint32_t lo = 0, hi = 0;
+@@ -273,7 +424,7 @@ static void test_measured_window(void)
+           st.by_reason[DCN41_ALLOW_BLOCK]);
+ }
+ 
+-/* ---- 6. reads are counted, never gated ----------------------------------------------------- */
++/* ---- 7. reads are counted, never gated ----------------------------------------------------- */
+ static void test_reads(void)
+ {
+     struct dcn41_allow_state st;
+@@ -291,6 +442,7 @@ int main(void)
+     test_smu_refused();
+     test_out_of_range_refused();
+     test_deny_by_default();
++    test_rebase();
+     test_table_shape();
+     test_measured_window();
+     test_reads();
+diff --git a/src/navi48-bringup/src/Navi48Bringup.cpp b/src/navi48-bringup/src/Navi48Bringup.cpp
+index b01d6d0..7548056 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -609,13 +609,13 @@ void Navi48Bringup::surveyIPs() {
+ // ---------------------------------------------------------------------------
+ // surveyDcn — the DMU segment bases, and whether the display write allowlist
+ // would arm for them. Both read-only: dcn41_allow_init does no register I/O at
+-// all, it only compares the bases this die reports with the ones the generated
+-// range table was built for (dcn41_allow.c:79-84).
++// all, it rebases the generated ranges onto these bases and checks that the
++// result is still display-shaped (dcn41_allow.c, DCN41_ALLOW_REBASE).
+ //
+-// This is the display layer's single hard precondition. A Navi 44 that reports
+-// anything other than 0x12 / 0xc0 / 0x34c0 / 0x9000 / 0x2403c00 leaves the
+-// allowlist unarmed and the whole display path INERT (DCN41_E_BASES), which is
+-// safe but silent — the property makes it visible without booting a stage.
++// This is the display layer's single hard precondition. Before 0013 a die whose
++// bases were not Navi 48's 0x12 / 0xc0 / 0x34c0 / 0x9000 / 0x2403c00 left the
++// allowlist unarmed and the whole display path INERT (DCN41_E_BASES), silently —
++// which is why the property exists, and why it now says whether it rebased.
+ // ---------------------------------------------------------------------------
+ void Navi48Bringup::surveyDcn() {
+ 	IpDiscovery::IpEntry e {};
+@@ -642,11 +642,19 @@ void Navi48Bringup::surveyDcn() {
+ 	}
+ 	dcn41_allow_state st {};
+ 	const int rc = dcn41_allow_init(&st, e.bases, static_cast<uint32_t>(rmmioSize / 4));
+-	N48LOG("dcn-survey: allowlist would %s for segs %08x %08x %08x %08x %08x, BAR5 %u dwords (%s)",
++	N48LOG("dcn-survey: allowlist would %s for segs %08x %08x %08x %08x %08x, BAR5 %u dwords (%s); "
++	       "rebased=%u, range %d, denial %d",
+ 	       rc == DCN41_ALLOW_OK ? "ARM" : "REFUSE", e.bases[0], e.bases[1], e.bases[2], e.bases[3],
+-	       e.bases[4], static_cast<uint32_t>(rmmioSize / 4), dcn41_allow_reason_name(rc));
++	       e.bases[4], static_cast<uint32_t>(rmmioSize / 4), dcn41_allow_reason_name(rc),
++	       st.rebased, st.rebase_index, st.rebase_overlap);
+ 	setProperty("DMU,AllowlistArms", rc == DCN41_ALLOW_OK);
+ 	setProperty("DMU,AllowlistReason", dcn41_allow_reason_name(rc));
++	// 0013: arming no longer requires these to be Navi 48's bases, so say whether they were moved.
++	setProperty("DMU,AllowlistRebased", rc == DCN41_ALLOW_OK && st.rebased != 0u);
++	if (rc == DCN41_ALLOW_REBASE) {
++		setProperty("DMU,AllowlistRange", static_cast<uint64_t>(st.rebase_index < 0 ? 0 : st.rebase_index), 8);
++		setProperty("DMU,AllowlistDenial", static_cast<uint64_t>(st.rebase_overlap < 0 ? 0 : st.rebase_overlap), 8);
++	}
+ }
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/src/navi48-bringup/src/dcn/navi48_dcn.cpp b/src/navi48-bringup/src/dcn/navi48_dcn.cpp
+index 427e2ac..2fa5931 100644
+--- a/src/navi48-bringup/src/dcn/navi48_dcn.cpp
++++ b/src/navi48-bringup/src/dcn/navi48_dcn.cpp
+@@ -229,7 +229,7 @@ void dcn_wreg(void *cookie, uint32_t abs_dword, uint32_t value) {
+ 	auto *s = static_cast<DcnState *>(cookie);
+ 	if (!dcn41_allow_write(&s->allow, abs_dword, value, s->tag)) {
+ 		const char *why = nullptr;
+-		const int reason = dcn41_allow_classify(abs_dword, s->allow.mmio_dwords, nullptr, &why);
++		const int reason = dcn41_allow_classify(abs_dword, s->allow.mmio_dwords, s->allow.seg, nullptr, &why);
+ 		N48LOG("dcn: REFUSED write %#010x = %#010x (tag %s) — allowlist says %s: %s",
+ 		       abs_dword, value, s->tag, dcn41_allow_reason_name(reason), why ? why : "(no text)");
+ 		return;
+@@ -341,14 +341,16 @@ static uint32_t bind_locked(Navi48Bringup *owner) {
+ 
+ 	const uint32_t mmioDwords = (uint32_t)(gDcn.dev->rmmioSize / 4);
+ 
+-	// Arm the allowlist FIRST. If it refuses the bases, nothing else is armed and every
+-	// write stays refused — deny by default, all the way up.
++	// Arm the allowlist FIRST. It rebases its ranges onto these very bases, so a refusal means
++	// these are not display bases at all (a segment reported 0, or a window that would land on the
++	// SMU). Then nothing else is armed and every write stays refused — deny by default, all the way
++	// up.
+ 	const int ar = dcn41_allow_init(&gDcn.allow, gDcn.seg, mmioDwords);
+ 	if (ar != DCN41_ALLOW_OK) {
+ 		N48LOG("dcn: the write allowlist REFUSED to arm (%s) for segs %08x %08x %08x %08x %08x, "
+-		       "BAR5 %u dwords — display layer stays INERT",
++		       "BAR5 %u dwords — display layer stays INERT (range %d, denial %d)",
+ 		       dcn41_allow_reason_name(ar), gDcn.seg[0], gDcn.seg[1], gDcn.seg[2], gDcn.seg[3],
+-		       gDcn.seg[4], mmioDwords);
++		       gDcn.seg[4], mmioDwords, gDcn.allow.rebase_index, gDcn.allow.rebase_overlap);
+ 		gDcn.initStatus = 5;
+ 		return 5;
+ 	}
+@@ -373,9 +375,10 @@ static uint32_t bind_locked(Navi48Bringup *owner) {
+ 	gDcn.armed = true;
+ 	gDcn.initStatus = 0;
+ 	N48LOG("dcn: display layer ARMED — segs %08x %08x %08x %08x %08x, BAR5 %u dwords, "
+-	       "allowlist %u ranges / %u writable dwords (deny by default)",
++	       "allowlist %u ranges / %u writable dwords (%s), deny by default",
+ 	       gDcn.seg[0], gDcn.seg[1], gDcn.seg[2], gDcn.seg[3], gDcn.seg[4], mmioDwords,
+-	       dcn41_allow_range_count(), dcn41_allow_total_dwords());
++	       dcn41_allow_range_count(), dcn41_allow_total_dwords(),
++	       gDcn.allow.rebased ? "REBASED onto this die's bases" : "the generated bases");
+ 	// build 0.0.603 (S2a review MUST-FIX): on a NATIVE boot the golden timing copy is taken HERE, at bind - before any native
+ 	// call can write a display register - so `dcnmode 0` (exempt from the native refusal) always restores the boot capture, not whatever
+ 	// the first dcnmode call happened to find. Reads only; a non-native boot takes it lazily in mode(), exactly as before.
+@@ -2046,7 +2049,7 @@ static bool mt_wr(void *, uint32_t abs, uint32_t v) {
+ 	gDcn.tag = "modetrial";
+ 	if (!dcn41_allow_write(&gDcn.allow, abs, v, gDcn.tag)) {
+ 		const char *why = nullptr;
+-		const int reason = dcn41_allow_classify(abs, gDcn.allow.mmio_dwords, nullptr, &why);
++		const int reason = dcn41_allow_classify(abs, gDcn.allow.mmio_dwords, gDcn.allow.seg, nullptr, &why);
+ 		N48LOG("mode-trial: REFUSED write %#010x = %#010x - allowlist says %s: %s", abs, v, dcn41_allow_reason_name(reason), why ? why : "(no text)");
+ 		return false;
+ 	}
+diff --git a/src/navi48-bringup/src/dcn/navi48_disp2.h b/src/navi48-bringup/src/dcn/navi48_disp2.h
+index e7e5d43..31b92eb 100644
+--- a/src/navi48-bringup/src/dcn/navi48_disp2.h
++++ b/src/navi48-bringup/src/dcn/navi48_disp2.h
+@@ -42,7 +42,8 @@
+ //  MPC_OUT0, MPC global, HUBP1 / 3, DPP1 / 3, MPCC1 / 3), the COPY0 step (a read of one of 20 EXACT pipe-0 sources, pinned to its census value, written to pipe 2) and EXPECT (read only); the DP watch grows from 9 to 15 registers (reads only).
+ //
+ //  Register offsets and fields: Linux dcn_4_1_0_offset.h / dcn_4_1_0_sh_mask.h (the tree in re/linux-dc; the host test re-reads both). Absolute = segment + offset with this card's DMU segments
+-//  BASE_IDX 1 = 0xc0, BASE_IDX 2 = 0x34c0 (the allowlist refuses any other set, dcn41_allow_expected_segs).
++//  BASE_IDX 1 = 0xc0, BASE_IDX 2 = 0x34c0. Since 0013 the allowlist rebases every range onto the segments the card reports (and refuses a set that cannot be display hardware), so these are
++//  the surveyed card's numbers, not a precondition.
+ //
+ #ifndef N48_DISP2_H
+ #define N48_DISP2_H
+diff --git a/src/navi48-bringup/tests/native_dispread_test.cpp b/src/navi48-bringup/tests/native_dispread_test.cpp
+index 54839bb..66f9db7 100644
+--- a/src/navi48-bringup/tests/native_dispread_test.cpp
++++ b/src/navi48-bringup/tests/native_dispread_test.cpp
+@@ -306,7 +306,7 @@ static void b_registers() {
+     for (uint32_t off : { N48DR_I2C_CONTROL, N48DR_I2C_ARBITRATION, N48DR_I2C_SW_STATUS, N48DR_I2C_DDC1_SPEED + 4u, N48DR_I2C_DDC1_SETUP + 4u, N48DR_I2C_DDC1_SPEED + 6u, N48DR_I2C_DDC1_SETUP + 6u,
+                           N48DR_I2C_TRANSACTION0, N48DR_I2C_TRANSACTION0 + 1u, N48DR_I2C_TRANSACTION0 + 2u, N48DR_I2C_DATA, N48DR_DIO_MEM_PWR_CTRL }) {
+         const uint32_t abs = kSeg[2] + off;
+-        expect(dcn41_allow_classify(abs, 262144u, &rangeName, nullptr) == DCN41_ALLOW_OK && rangeName && std::string(rangeName) == "DC..DIG6" && abs >= 0x5358u && abs <= 0x53d3u && allowed_abs(abs),
++        expect(dcn41_allow_classify(abs, 262144u, kSeg, &rangeName, nullptr) == DCN41_ALLOW_OK && rangeName && std::string(rangeName) == "DC..DIG6" && abs >= 0x5358u && abs <= 0x53d3u && allowed_abs(abs),
+                "every register of the ddcread sequence is in the allowlist range DC..DIG6 (0x5358..0x53d3)");
+     }
+     expect(!allowed_abs(kSeg[2] + N48DR_I2C_DATA + 0x100u) && !allowed_abs(0x00000001u) && !allowed_abs(0x16282u), "control: a stray DC address, MM_DATA and the SMU mailbox stay refused");
+@@ -748,7 +748,7 @@ static void f_census45() {
+           res = res && a != DCN41_BAD_OFFSET && a == kSeg[r.base_idx] + r.off && a < 0x100000u; absok = absok && a == n48dr_census_abs(kSeg, r.base_idx, r.off);
+           baseok = baseok && (r.base_idx == 1 || r.base_idx == 2 || r.base_idx == 3);
+           fam = fam && plane_family_ok(r.name);
+-          const int why = dcn41_allow_classify(a, 0x100000u, nullptr, nullptr);
++          const int why = dcn41_allow_classify(a, 0x100000u, kSeg, nullptr, nullptr);
+           deny = deny && why != DCN41_ALLOW_INDIRECT && why != DCN41_ALLOW_BLOCK && why != DCN41_ALLOW_WINDOW; }
+       expect(res, "census45: every entry resolves through dcn41_abs_rd to seg + offset inside the BAR5 window");
+       expect(absok, "census45: the CLI's absolute address (n48dr_census_abs) equals dcn41_abs_rd for every entry");
+@@ -863,7 +863,7 @@ static void f_census7() {
+           res = res && a != DCN41_BAD_OFFSET && a == kSeg[r.base_idx] + r.off && a < 0x100000u; absok = absok && a == n48dr_census_abs(kSeg, r.base_idx, r.off);
+           baseok = baseok && (r.base_idx == 1 || r.base_idx == 2 || r.base_idx == 3);
+           fam = fam && mona_family_ok(r.name);
+-          const int why = dcn41_allow_classify(a, 0x100000u, nullptr, nullptr);
++          const int why = dcn41_allow_classify(a, 0x100000u, kSeg, nullptr, nullptr);
+           deny = deny && why != DCN41_ALLOW_INDIRECT && why != DCN41_ALLOW_BLOCK && why != DCN41_ALLOW_WINDOW;
+           if (r.base_idx != 2) wr = wr && dcn41_abs(&d, r.off, r.base_idx) == DCN41_BAD_OFFSET;       // the write-side twin refuses BASE_IDX 1 / 3
+           if (n48d2_guard_addr_i(N48D2_INST_MONA, a, nullptr) == N48D2_G_OK) g1ok.insert(r.name);       // instance 1's guard: ONLY its own timing registers (written by the existing `disp2` timing op) are listed
+diff --git a/src/navi48-bringup/tests/native_dmubcmd_test.cpp b/src/navi48-bringup/tests/native_dmubcmd_test.cpp
+index 194b855..8e93a43 100644
+--- a/src/navi48-bringup/tests/native_dmubcmd_test.cpp
++++ b/src/navi48-bringup/tests/native_dmubcmd_test.cpp
+@@ -180,7 +180,7 @@ int main(int argc, char **argv) {
+     expect_u("WPTR absolute on this card = 0x34c0 + 0x1d6 = 0x3696 (the VBIOS send routine's register)", kSeg[2] + N48DM_REG_INBOX1_WPTR, 0x3696);
+     expect_u("RPTR absolute = 0x3697", kSeg[2] + N48DM_REG_INBOX1_RPTR, 0x3697);
+     expect(allowed_abs(kSeg[2] + N48DM_REG_INBOX1_WPTR), "the WPTR write is inside the REAL DCN write allowlist");
+-    { const char *nm = nullptr; expect(dcn41_allow_classify(kSeg[2] + N48DM_REG_INBOX1_WPTR, 262144u, &nm, nullptr) == DCN41_ALLOW_OK && nm && std::string(nm) == "DC..MMHUBBUB", "the range is DC..MMHUBBUB 0x35e6..0x3771"); }
++    { const char *nm = nullptr; expect(dcn41_allow_classify(kSeg[2] + N48DM_REG_INBOX1_WPTR, 262144u, kSeg, &nm, nullptr) == DCN41_ALLOW_OK && nm && std::string(nm) == "DC..MMHUBBUB", "the range is DC..MMHUBBUB 0x35e6..0x3771"); }
+     expect(N48DM_POLL_STEP_US == 10u && N48DM_POLL_MAX == 10000u && N48DM_POLL_BOUND_US == 100000u, "the poll bound is 10000 reads x 10 us = 100 ms");
+     expect(N48DM_VAR_LASTSIZE == 0x3114u && N48DM_VAR_RPTR == 0x3118u && N48DM_VAR_WPTR == 0x311cu && N48DM_VAR_RPTR == N48DM_VAR_LASTSIZE + 4u && N48DM_VAR_WPTR == N48DM_VAR_RPTR + 4u && N48DM_VAR_STATUS == 0x3100u && N48DM_VAR_CMDSIZE_VALUE == 0x40u,
+            "the VBIOS ring variables are contiguous dwords +0x3114 +0x3118 +0x311c; +0x3100 is the status byte");
+diff --git a/tools/dcn41/gen_allow.py b/tools/dcn41/gen_allow.py
+index 47f75ea..b1c4701 100644
+--- a/tools/dcn41/gen_allow.py
++++ b/tools/dcn41/gen_allow.py
+@@ -260,8 +260,9 @@ def render(ranges, coverage):
+           f'  /* seg{r["base"]} + {r["off_lo"]:#07x}..{r["off_hi"]:#07x}, {r["nreg"]} regs in {r["nfam"]} block(s) */')
+     A("};")
+     A("")
+-    A("/* The segment bases the table above was generated for. dcn41_allow_init refuses any other set:")
+-    A(" * an allowlist of absolute addresses means nothing if the bases moved. */")
++    A("/* The segment bases the table above was generated for. dcn41_allow_init() moves every range")
++    A(" * by its own BASE_IDX onto the bases this card's IP discovery reports, so a die that numbers")
++    A(" * its display segments elsewhere gets the same relative windows; these are the subtrahend. */")
+     A("static const uint32_t dcn41_allow_expected_segs[5] = {")
+     A("    " + ", ".join(f"{s:#010x}u" for s in SEGS))
+     A("};")

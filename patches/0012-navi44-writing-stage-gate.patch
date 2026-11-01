@@ -1,0 +1,781 @@
+diff --git a/src/navi48-bringup/src/Navi48Bringup.cpp b/src/navi48-bringup/src/Navi48Bringup.cpp
+index 1793206..b01d6d0 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -39,6 +39,7 @@
+ #include "apple/gfx_sk82.h"         // build 0.0.527 (an internal design note): switch 82, the byte-identical re-copy skip (pure)
+ #include <IOKit/IOMemoryDescriptor.h> // build 0.0.527: the source re-read under gSk82Lock (readBytes)
+ #include <kern/clock.h>             // clock_get_uptime/absolutetime_to_nanoseconds - the owner's wait and non-owner
++#include "navi44_arm_gate.h"  // 0012: the Navi 44 writing-stage gate (pure, host-tested)
+                                      // yields are both timed (mirrors AppleHardwareHook.cpp's n48_pol_ns)
+ 
+ #include "fw/fw_table.h"            // 0.0.664 (Navi 44 part 2): per-die firmware set, selected in probe()
+@@ -536,6 +537,7 @@ void Navi48Bringup::selectFwFromDiscovery() {
+ 		       gc.major, gc.minor, gc.rev, mp0.major, mp0.minor, mp0.rev,
+ 		       mp1.major, mp1.minor, mp1.rev, amdgpu::fw_set_name());
+ 		setProperty("FW,SetSource", "PCI id, not confirmed by discovery");
++		fwSetConfirmed = false;   // 0012: the writing-stage gate reads this
+ 		return;
+ 	}
+ 	N48LOG("fw-select: firmware set '%s'%s from GC %u.%u.%u / MP0 %u.%u.%u / MP1 %u.%u.%u%s",
+@@ -544,6 +546,7 @@ void Navi48Bringup::selectFwFromDiscovery() {
+ 	       basesComplete ? "" : " (IP base table incomplete)");
+ 	setProperty("FW,Set", amdgpu::fw_set_name());
+ 	setProperty("FW,SetSource", "IP discovery");
++	fwSetConfirmed = true;   // 0012: the die named itself; the blobs we hand out are its own
+ }
+ 
+ void Navi48Bringup::surveyIPs() {
+@@ -767,6 +770,42 @@ void Navi48Bringup::stagePSP() {
+ 	N48LOG("psp-stage: requested (navi48-psp=1) — this stage WRITES to VRAM and the PSP mailbox");
+ 	setProperty("PSP,Stage", "requested");
+ 
++	// 0012: the Navi 44 writing-stage gate. It has to sit here, above mapVramAperture(),
++	// because that call retunes BAR0 and the rest of the stage talks to a mailbox whose
++	// firmware blobs were picked from a guess. Facts come from the survey, not from new I/O.
++	{
++		n48::Navi44ArmFacts facts {};
++		facts.matchedNavi44      = navi44ByPciId;
++		facts.requestedStage     = targetStage;
++		facts.discoveryValid     = ipDiscovery.isValid();
++		facts.fwSetFromDiscovery = fwSetConfirmed;
++		IpDiscovery::IpEntry gcEntry {};
++		if (ipDiscovery.findIp(IpDiscovery::HwGc, 0, gcEntry)) {
++			facts.gcVersionKnown = true;
++			facts.gcMajor = gcEntry.major;
++			facts.gcMinor = gcEntry.minor;
++			facts.gcRev   = gcEntry.revision;
++		}
++		const amdgpu::FwBlob *sosProbe = amdgpu::fw_get(amdgpu::FwId::PSP_SOS);
++		facts.sosBlobPresent = sosProbe && sosProbe->data && sosProbe->size != 0;
++		uint32_t force = 0;
++		facts.forceOverride = PE_parse_boot_argn("navi44-force", &force, sizeof(force)) && force != 0;
++
++		const char *why = nullptr;
++		const n48::Navi44Arm verdict = n48::navi44_arm_gate(facts, &why);
++		if (verdict == n48::Navi44Arm::Refuse) {
++			N48LOG("psp-stage: REFUSED on Navi 44 — %s", why);
++			setProperty("PSP,Stage", "navi44-gate-refused");
++			setProperty("PSP,GateReason", why);
++			return;
++		}
++		if (facts.matchedNavi44) {
++			N48LOG("psp-stage: Navi 44 gate ALLOWED (%s)%s", why,
++			       facts.forceOverride ? " — carried by navi44-force=1, not by the survey" : "");
++			setProperty("PSP,GateReason", why);
++		}
++	}
++
+ 	if (!mapVramAperture())        { N48LOG("psp-stage: no usable BAR0 aperture; aborting"); setProperty("PSP,Stage", "no-bar0"); return; }
+ 	captureBootFramebuffer();      // best effort; chooseVramBase() copes if unknown
+ 	if (!chooseVramBase())         { dropBar0(); setProperty("PSP,Stage", "no-vram-region"); return; }
+@@ -7558,11 +7597,19 @@ IOService *Navi48Bringup::probe(IOService *provider, SInt32 *score) {
+ 	setProperty("FW,Set", amdgpu::fw_set_name());
+ 	if (device == 0x7590) {
+ 		// Navi 44 (RX 9050 / 9060 XT): DCN 4.1.0 display, GC 12.0.0, a smaller die.
+-		// This match arms NOTHING: every writing stage keeps its own boot-arg
+-		// (targetStage stays 0, stagePSP() returns at its first line), so the boot
+-		// runs the read-only survey and publishes the die's real IP versions and
+-		// DMU segment bases. That survey is the entire purpose of matching here.
+-		N48LOG("probe: Navi 44 RX 9050/9060 XT (0x7590) — SURVEY ONLY, no writing stage armed");
++		//
++		// 0012 corrects what this block used to claim. It said "SURVEY ONLY, no writing
++		// stage armed" — but arming was never decided here: start() parses navi48-stage for
++		// every device this kext matches, so the same boot-arg that arms the RX 9070 XT
++		// already reached the writing stages on Navi 44 too. The sentence was harmless only
++		// in the sense that it was untrue; what it actually did was tell whoever read it
++		// next that trying was pointless, which is how a port stays parked at a survey
++		// forever. The decision now lives where it can be tested: src/navi44_arm_gate.h,
++		// consulted by stagePSP() before it touches BAR0.
++		navi44ByPciId = true;
++		N48LOG("probe: Navi 44 RX 9050/9060 XT (0x7590) — survey runs unconditionally; writing "
++		       "stages are boot-arg gated, on Navi 44 by navi44_arm_gate()");
++		setProperty("Navi44,Arming", "boot-arg gated (navi48-stage=N, decided by navi44_arm_gate)");
+ 		return this;
+ 	}
+ 	N48LOG("probe: Navi 48 %s (0x%04x) — bring-up enabled", device == 0x7550 ? "RX 9070/XT" : "R9700", device);
+diff --git a/src/navi48-bringup/src/Navi48Bringup.hpp b/src/navi48-bringup/src/Navi48Bringup.hpp
+index 0a5a71c..e427b20 100644
+--- a/src/navi48-bringup/src/Navi48Bringup.hpp
++++ b/src/navi48-bringup/src/Navi48Bringup.hpp
+@@ -182,6 +182,11 @@ private:
+ 	IpDiscovery        ipDiscovery;
+ 	amdgpu::DeviceContext dev;          // compat layer for src/amd/* modules
+ 	uint32_t           targetStage { 0 };
++	// 0012: what the survey learned about this die, kept for the writing-stage gate
++	// (src/navi44_arm_gate.h). navi44ByPciId is probe()'s label; fwSetConfirmed says
++	// whether IP discovery's GC/MP0/MP1 versions actually matched a die's firmware set.
++	bool               navi44ByPciId { false };
++	bool               fwSetConfirmed { false };
+ 	bool               accelExperimentArmed { false };
+ 	bool               accelExperimentFired { false };
+ };
+diff --git a/src/navi48-bringup/src/amd/cp_v12_0.cpp b/src/navi48-bringup/src/amd/cp_v12_0.cpp
+index dea52dc..46bd045 100644
+--- a/src/navi48-bringup/src/amd/cp_v12_0.cpp
++++ b/src/navi48-bringup/src/amd/cp_v12_0.cpp
+@@ -1331,13 +1331,16 @@ cp_hqd_program(const DeviceContext &dev, CPContext &cp)
+ // PREAMBLE_BEGIN_CLEAR_STATE, PACKET3_CONTEXT_CONTROL (0x28) with
+ // 0x80000000/0x80000000, a SET_CONTEXT_REG (0x69) walk over gfx11_cs_data,
+ // SET_CONTEXT_REG of PA_SC_TILE_STEERING_OVERRIDE, PREAMBLE_CNTL with
+-// END_CLEAR_STATE and CLEAR_STATE (0x12). None of that exists for GFX12:
+-// there is no gfx12_cs_data table in the tree, gfx_v12_0.c never
+-// references PACKET3_PREAMBLE_CNTL or PACKET3_CLEAR_STATE, and
+-// pa_sc_tile_steering_override is not part of GFX12's config. Emitting a
+-// GFX11 clear-state blob here would push SET_CONTEXT_REG packets carrying
+-// GFX11 register offsets at a GFX12 context — so this port does what the
+-// GFX12 driver does: registers only.
++// END_CLEAR_STATE and CLEAR_STATE (0x12). None of that is in GFX12's cp_gfx_start:
++// gfx_v12_0.c never references PACKET3_PREAMBLE_CNTL or PACKET3_CLEAR_STATE, and
++// pa_sc_tile_steering_override is zeroed rather than configured (gfx_v12_0.c:1846).
++// 0012 corrects one clause here, which was wrong and is load-bearing: gfx12 DOES ship
++// a clear-state table — drivers/gpu/drm/amd/amdgpu/clearstate_gfx12.h, 6 clusters /
++// 75 dwords, every value 0 — but it feeds the RLC clear-state BUFFER (amdgpu_rlc.c's
++// amdgpu_gfx_rlc_init_csb, vendored in rlc_v12_0.cpp as kGfx12_cs_data), not a packet
++// stream. So the CP still emits registers only; the table is where CSIB_LENGTH gets its
++// 75. Emitting a GFX11 clear-state blob here would push SET_CONTEXT_REG packets carrying
++// GFX11 register offsets at a GFX12 context.
+ //
+ // The ring-fetch proof the CP still owes us is therefore a separate,
+ // clearly-labelled diagnostic: cp_ring_fetch_probe below.
+diff --git a/src/navi48-bringup/src/navi44_arm_gate.h b/src/navi48-bringup/src/navi44_arm_gate.h
+new file mode 100644
+index 0000000..8ac4ad3
+--- /dev/null
++++ b/src/navi48-bringup/src/navi44_arm_gate.h
+@@ -0,0 +1,96 @@
++#pragma once
++//
++//  navi44_arm_gate.h — may the first WRITING stage run on this die?
++//
++//  RDNA4FB / Navi48Bringup.kext
++//
++//  Scope: this decides, from facts the survey already collects, whether a Navi 44
++//  (GC 12.0.0) boot may go past the read-only survey into a stage that writes VRAM
++//  and rings the PSP mailbox. It is a pure function over a struct so the host suite
++//  can drive it; nothing here reads a register, a boot-arg or IORegistry.
++//
++//  Why it exists: probe() has until now told the reader that a Navi 44 "arms
++//  nothing". That was never enforced — navi48-stage is parsed for every device this
++//  kext matches, so a Navi 44 boot with the same boot-arg the RX 9070 XT uses already
++//  reached the writing stages. The sentence did real damage anyway: it reads as
++//  "there is no point trying", which keeps the port parked at the survey while the
++//  only way to learn what Navi 44 actually needs is to try one stage on the card.
++//
++//  So the gate replaces an unenforced claim with an enforced, explained decision:
++//  arming is allowed, but not on an unverified guess about which firmware set the die
++//  wants. Every refusal here says the reason in the log and in a registry property.
++//
++
++#include <cstdint>
++
++namespace n48 {
++
++struct Navi44ArmFacts {
++    bool     matchedNavi44      = false;  // PCI id said Navi 44 (0x7590 / 0x7591 ...)
++    bool     gcVersionKnown     = false;  // IP discovery resolved GC at all
++    uint8_t  gcMajor = 0, gcMinor = 0, gcRev = 0;
++    bool     fwSetFromDiscovery = false;  // fw_select_from_ip() accepted the die's versions
++    bool     sosBlobPresent     = false;  // an SOS blob exists for the set now selected
++    bool     discoveryValid     = false;  // the ROM's IP discovery table parsed
++    bool     forceOverride      = false;  // boot-arg navi44-force=1: arm on the owner's word
++    uint32_t requestedStage     = 0;      // navi48-stage=N; 0 means nothing was asked for
++};
++
++enum class Navi44Arm {
++    NothingAsked,   // not a refusal - no writing stage was requested
++    Allow,          // arm it
++    Refuse,         // do not arm, and say why
++};
++
++// The reason text is owned by this header, so the log line and the registry property
++// can never drift apart from the branch that produced them.
++inline const char *navi44ArmReason(Navi44Arm v) {
++    switch (v) {
++        case Navi44Arm::NothingAsked: return "no writing stage requested";
++        case Navi44Arm::Allow:        return "allowed";
++        case Navi44Arm::Refuse:       break;
++    }
++    return "refused";
++}
++
++inline Navi44Arm navi44_arm_gate(const Navi44ArmFacts &f, const char **reasonOut) {
++    auto verdict = [&](Navi44Arm v, const char *r) {
++        if (reasonOut) *reasonOut = r;
++        return v;
++    };
++
++    // A Navi 48 boot is not this gate's business: it has been armed by boot-arg since
++    // long before this file existed, and silently gating it here would change behaviour
++    // the RX 9070 XT has already run through.
++    if (!f.matchedNavi44) return verdict(Navi44Arm::Allow, "not Navi 44 - existing behaviour");
++    if (f.requestedStage == 0) return verdict(Navi44Arm::NothingAsked, "no writing stage requested");
++
++    // Without a parsed discovery table we have no GC version, so "Navi 44" is a PCI-id
++    // label and nothing more. Arm anyway only under the override, which is what the
++    // owner sets when they are watching the console and accept the risk.
++    if (!f.discoveryValid && !f.forceOverride)
++        return verdict(Navi44Arm::Refuse,
++                       "no valid IP discovery table: the firmware set is a PCI-id guess "
++                       "(pass navi44-force=1 to arm anyway)");
++
++    // GC is what the register tables are keyed on. A die that reports something other
++    // than 12.0.0 while matching the Navi 44 PCI id is a card this port has no numbers
++    // for - refuse rather than drive it with Navi 48's.
++    if (f.gcVersionKnown && !(f.gcMajor == 12 && f.gcMinor == 0 && f.gcRev == 0))
++        return verdict(Navi44Arm::Refuse,
++                       "GC reports a version other than 12.0.0 on a Navi 44 PCI id - this "
++                       "port has no register table for that die");
++
++    if (!f.fwSetFromDiscovery && !f.forceOverride)
++        return verdict(Navi44Arm::Refuse,
++                       "discovery rejected the firmware set picked from the PCI id; refusing to "
++                       "PSP-load blobs that may belong to the other die (navi44-force=1 to override)");
++
++    if (!f.sosBlobPresent)
++        return verdict(Navi44Arm::Refuse,
++                       "no PSP SOS blob embedded for the selected firmware set - nothing to load");
++
++    return verdict(Navi44Arm::Allow, "allowed");
++}
++
++}  // namespace n48
+diff --git a/src/navi48-bringup/tests/navi44_arm_gate_plant.sh b/src/navi48-bringup/tests/navi44_arm_gate_plant.sh
+new file mode 100644
+index 0000000..90cfcc5
+--- /dev/null
++++ b/src/navi48-bringup/tests/navi44_arm_gate_plant.sh
+@@ -0,0 +1,164 @@
++#!/usr/bin/env bash
++#
++#  navi44_arm_gate_plant.sh — prove the 0012 suite can actually fail.
++#
++#  Usage (from anywhere):  ZIG=/path/to/zig.exe bash tests/navi44_arm_gate_plant.sh
++#
++#  One break at a time, planted into a COPY of the real sources, and the suite must catch
++#  it. A plant the suite lets through is a hole in the suite, not a pass for the driver -
++#  which for this patch is the whole point: section A executes a pure function and section
++#  C reads text, so the only thing that proves the two are wired to the same reality is a
++#  mutated kext source that makes a pin fail.
++#
++#  Rules this script follows (same as the other *_plant.sh in this directory):
++#    * needles are SINGLE-LINE, because the checkout is CRLF and a multi-line needle
++#      never matches;
++#    * every needle must be found, or the run aborts - a drifted needle silently
++#      becomes "no plant applied", which reads exactly like a passing suite;
++#    * the pristine tree's checksum is taken up front and re-checked at the end, so a
++#      bug in this script cannot leave mutated sources behind;
++#    * `control` runs the untouched copy first: if that does not pass, the copy step is
++#      broken and no plant result means anything.
++#
++set -u
++
++ZIG="${ZIG:?set ZIG to the zig (or zig c++) driver to use}"
++HERE="$(cd "$(dirname "$0")" && pwd)"
++ROOT="$(cd "$HERE/.." && pwd)"
++SCR="$(mktemp -d)"
++mkdir -p "$SCR" || { echo "cannot make $SCR"; exit 2; }
++trap 'rm -rf "$SCR"' EXIT
++
++cp -R "$ROOT/src" "$SCR/src" || { echo "copy of src failed"; exit 2; }
++cp -R "$ROOT/tests/dalshim" "$SCR/dalshim" 2>/dev/null
++
++PRISTINE=$(find "$SCR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) \
++    | sort | xargs cat | cksum | awk '{print $1}')
++
++build_run() {
++	# "$ZIG" stays quoted: on this workstation the toolchain path contains spaces, and a
++	# word-split $ZIG fails with "F:\Work: No such file or directory" - which a plant run
++	# reports as a build failure, indistinguishable from a broken source tree.
++	"$ZIG" c++ -std=c++17 -O1 -I "$SCR/dalshim" -I "$SCR/src" \
++		"$HERE/navi44_arm_gate_test.cpp" -o "$SCR/t" >"$SCR/build.log" 2>&1 || {
++		echo "    BUILD FAILED"; sed -n '1,6p' "$SCR/build.log"; return 2; }
++	"$SCR/t" "$SCR" >"$SCR/run.log" 2>&1
++	return $?
++}
++
++# plant FILE NEEDLE REPLACEMENT [OCCURRENCE]
++#
++# Counting is done with N="..." perl ... FILE, never with `perl -sne '...' N=...`:
++# without a preceding --, perl treats N=<needle> as another INPUT FILE, so $ENV{N} is empty,
++# the regex matches at every position, and both the "needle exists" and the "plant landed"
++# guards report success no matter what the tree contains. That turns the whole harness into
++# a machine that prints "caught" while planting nothing.
++count_matches() { # file needle -> echoes the number of occurrences
++	N="$2" perl -0777 -ne 'my $c = () = $_ =~ /\Q$ENV{N}\E/g; print $c' "$1"
++}
++
++plant() {
++	local file="$1" needle="$2" repl="$3" occ="${4:-1}"
++	local path="$SCR/$file"
++	cp "$ROOT/$file" "$path"                       # always plant from pristine
++	local found
++	found=$(count_matches "$path" "$needle")
++	if [ "${found:-0}" -lt "$occ" ]; then
++		echo "    NEEDLE MISSING (occ $occ of $found): $needle"
++		return 9
++	fi
++	N="$needle" R="$repl" O="$occ" perl -0777 -i -pe '
++		my $n = $ENV{N}; my $r = $ENV{R}; my $want = $ENV{O}; my $i = 0;
++		s/\Q$n\E/$i++; ($i == $want) ? $r : $n/ge;
++	' "$path"
++	# confirm the plant landed, or this run is a false "caught"
++	local after afterRepl
++	after=$(count_matches "$path" "$needle")
++	afterRepl=$(count_matches "$path" "$repl")
++	if [ "$after" -ge "$occ" ] && [ "${afterRepl:-0}" -eq 0 ]; then
++		echo "    PLANT DID NOT LAND"
++		return 9
++	fi
++	return 0
++}
++
++restore_all() { rm -rf "$SCR/src"; cp -R "$ROOT/src" "$SCR/src"; }
++
++H=src/navi44_arm_gate.h
++C=src/Navi48Bringup.cpp
++P=src/Navi48Bringup.hpp
++R=src/amd/rlc_v12_0.cpp
++X=src/amd/cp_v12_0.cpp
++
++declare -a PASS FAIL MISS
++PASSN=0 FAILN=0 MISSN=0
++run_plant() { # LABEL FILE NEEDLE REPL [OCC]
++	local label="$1"; shift
++	printf '  %-46s' "$label"
++	if ! plant "$@"; then echo "PLANT-ERROR"; MISS+=("$label"); MISSN=$((MISSN + 1)); restore_all; return; fi
++	build_run
++	local rc=$?
++	if [ "$rc" -eq 0 ]; then echo "ESCAPED (suite still passed)"; FAIL+=("$label"); FAILN=$((FAILN + 1));
++	else echo "caught (rc=$rc)"; PASS+=("$label"); PASSN=$((PASSN + 1)); fi
++	restore_all
++}
++
++echo "== control: the untouched copy =="
++if build_run; then echo "  control PASSED - plants below are meaningful"
++else echo "  control FAILED - the copy/build step is broken, stopping"; exit 1; fi
++
++echo "== plants =="
++# --- the gate's own decisions (section A executes these) ---
++run_plant "gate: non-Navi44 refuses"           "$H" 'if (!f.matchedNavi44) return verdict(Navi44Arm::Allow,' 'if (!f.matchedNavi44) return verdict(Navi44Arm::Refuse,'
++run_plant "gate: stage-0 becomes Allow"        "$H" 'if (f.requestedStage == 0) return verdict(Navi44Arm::NothingAsked,' 'if (f.requestedStage == 0) return verdict(Navi44Arm::Allow,'
++run_plant "gate: no-discovery check dropped"   "$H" 'if (!f.discoveryValid && !f.forceOverride)' 'if (false && !f.forceOverride)'
++run_plant "gate: GC-version check dropped"     "$H" 'if (f.gcVersionKnown && !(f.gcMajor == 12 && f.gcMinor == 0 && f.gcRev == 0))' 'if (false)'
++run_plant "gate: override arms a wrong GC"     "$H" '!(f.gcMajor == 12 && f.gcMinor == 0 && f.gcRev == 0))' '!(f.gcMajor == 12 && f.gcMinor == 0 && f.gcRev == 0) && !f.forceOverride)'
++run_plant "gate: fw-set check dropped"         "$H" 'if (!f.fwSetFromDiscovery && !f.forceOverride)' 'if (false)'
++run_plant "gate: missing-blob check dropped"   "$H" 'if (!f.sosBlobPresent)' 'if (false)'
++run_plant "gate: allow text changed"           "$H" 'return verdict(Navi44Arm::Allow, "allowed");' 'return verdict(Navi44Arm::Allow, "ok");'
++run_plant "gate: passthrough text changed"     "$H" '"not Navi 44 - existing behaviour"' '"passthrough"'
++run_plant "gate: refusal text duplicated"      "$H" '"no PSP SOS blob embedded for the selected firmware set - nothing to load"' '"allowed"'
++
++# --- the kext's use of it (section C pins these) ---
++run_plant "kext: label not fed to the gate"    "$C" 'facts.matchedNavi44      = navi44ByPciId;' 'facts.matchedNavi44      = false;'
++run_plant "kext: discovery validity faked"     "$C" 'facts.discoveryValid     = ipDiscovery.isValid();' 'facts.discoveryValid     = true;'
++run_plant "kext: GC never marked known"        "$C" 'facts.gcVersionKnown = true;' 'facts.gcVersionKnown = false;'
++run_plant "kext: GC read elsewhere"            "$C" 'ipDiscovery.findIp(IpDiscovery::HwGc, 0, gcEntry)' 'ipDiscovery.findIp(IpDiscovery::HwMmhub, 0, gcEntry)'
++run_plant "kext: blob check vacuous"           "$C" 'facts.sosBlobPresent = sosProbe && sosProbe->data && sosProbe->size != 0;' 'facts.sosBlobPresent = true;'
++run_plant "kext: override boot-arg renamed"    "$C" 'PE_parse_boot_argn("navi44-force", &force, sizeof(force))' 'PE_parse_boot_argn("navi44-arm", &force, sizeof(force))'
++run_plant "kext: gate not consulted"           "$C" 'const n48::Navi44Arm verdict = n48::navi44_arm_gate(facts, &why);' 'const n48::Navi44Arm verdict = n48::Navi44Arm::Allow;'
++run_plant "kext: refusal stage string changed" "$C" '"navi44-gate-refused"' '"gate-refused"'
++run_plant "kext: reason property renamed"      "$C" 'setProperty("PSP,GateReason", why);' 'setProperty("PSP,GateWhy", why);' 2
++run_plant "kext: probe stops labelling 7590"   "$C" 'navi44ByPciId = true;' 'navi44ByPciId = false;'
++run_plant "kext: header include broken"        "$C" '#include "navi44_arm_gate.h"' '#include "navi44_gate.h"'
++run_plant "kext: old arms-NOTHING claim back"  "$C" '"boot-arg gated (navi48-stage=N, decided by navi44_arm_gate)"' '"SURVEY ONLY, no writing stage armed"'
++run_plant "kext: gate runs after BAR0 work"    "$C" '	setProperty("PSP,Stage", "requested");' '	setProperty("PSP,Stage", "requested");
++	if (mapVramAperture()) { /* moved above the gate by a plant */ }'
++run_plant "fw-select: records false"           "$C" 'fwSetConfirmed = true;   // 0012' 'fwSetConfirmed = false;   // 0012'
++run_plant "hpp: label defaults to on"          "$P" 'bool               navi44ByPciId { false };' 'bool               navi44ByPciId { true };'
++run_plant "hpp: confirm defaults to on"        "$P" 'bool               fwSetConfirmed { false };' 'bool               fwSetConfirmed { true };'
++
++# --- the clear-state table (section B re-derives 75 from it) ---
++run_plant "csb: cluster count 6 -> 7"          "$R" '0x0000a0db,  6' '0x0000a0db,  7'
++run_plant "csb: cluster count 11 -> 1"         "$R" '0x0000a2e5, 11' '0x0000a2e5,  1'
++run_plant "csb: register base off by one"      "$R" '0x0000a03e, 34' '0x0000a03f, 34'
++run_plant "csb: size computed from other die"  "$R" 'rlc_get_csb_size(kGfx12_cs_data)' 'rlc_get_csb_size(kGfx11_cs_data)'
++run_plant "cs: table named wrongly again"      "$X" 'clearstate_gfx12.h' 'clearstate_gfx11.h'
++
++echo "== summary =="
++# Counts are plain integers: `${#ARR[@]}` on an empty array is an unbound-variable fatal
++# under `set -u` in bash 3.2, which would kill the run right where the tally prints.
++echo "caught:   $PASSN"
++echo "escaped:  $FAILN  ${FAIL[*]:-}"
++echo "plant-errors: $MISSN  ${MISS[*]:-}"
++
++AFTER=$(find "$SCR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \) \
++    | sort | xargs cat | cksum | awk '{print $1}')
++if [ "$AFTER" != "$PRISTINE" ]; then
++	echo "PRISTINE CHECKSUM CHANGED - the copy is polluted; investigate before trusting any result"
++	exit 3
++fi
++echo "pristine tree unchanged after the run (checksum $PRISTINE)"
++
++[ "$FAILN" -eq 0 ] && [ "$MISSN" -eq 0 ]
+diff --git a/src/navi48-bringup/tests/navi44_arm_gate_test.cpp b/src/navi48-bringup/tests/navi44_arm_gate_test.cpp
+new file mode 100644
+index 0000000..f1d8712
+--- /dev/null
++++ b/src/navi48-bringup/tests/navi44_arm_gate_test.cpp
+@@ -0,0 +1,363 @@
++//
++//  navi44_arm_gate_test.cpp — host suite for patch 0012's writing-stage gate.
++//
++//  Build (from src/navi48-bringup, on any machine — no Mac, no GPU):
++//    zig c++ -std=c++17 -Wall -Wextra -O1 -I tests/dalshim -I src \
++//        tests/navi44_arm_gate_test.cpp -o /tmp/navi44_arm_gate_test.exe
++//    /tmp/navi44_arm_gate_test.exe .
++//
++//  The argv[1] directory is the navi48-bringup root, used by the source-pin section.
++//
++//  Why a suite for a dozen lines of if: the gate is the difference between a Navi 44
++//  boot that can reach the PSP and one that cannot, and it is decided by facts the
++//  survey gathers. The wrong shape of that decision is not a crash — it is a stage that
++//  silently loads the other die's firmware and then fails three stages later with a
++//  status code that names nothing. So every branch is executed here, and the pins in
++//  section C/D check the two things a pure function cannot see for itself: that the
++//  kext really consults it, and that our vendored clear-state table has not drifted from
++//  upstream's.
++//
++
++#include "navi44_arm_gate.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <sstream>
++#include <string>
++#include <vector>
++
++static int gChecks = 0, gFailures = 0;
++static void report(const char *file, int line, const char *what, bool ok) {
++	gChecks++;
++	if (ok) return;
++	gFailures++;
++	printf("FAIL %s:%d: %s\n", file, line, what);
++}
++#define CHECK(cond) report(__FILE__, __LINE__, #cond, (cond))
++#define CHECK_MSG(cond, msg) report(__FILE__, __LINE__, msg, (cond))
++
++using n48::Navi44Arm;
++using n48::Navi44ArmFacts;
++
++// A Navi 44 that has answered every question the survey asks. Everything the gate wants
++// to see is on; individual cases switch one fact off.
++static Navi44ArmFacts healthy() {
++	Navi44ArmFacts f {};
++	f.matchedNavi44 = true;
++	f.requestedStage = 5;
++	f.discoveryValid = true;
++	f.gcVersionKnown = true;
++	f.gcMajor = 12; f.gcMinor = 0; f.gcRev = 0;
++	f.fwSetFromDiscovery = true;
++	f.sosBlobPresent = true;
++	return f;
++}
++
++static const char *run(const Navi44ArmFacts &f) {
++	const char *why = nullptr;
++	Navi44Arm v = navi44_arm_gate(f, &why);
++	(void)v;
++	return why;
++}
++
++static Navi44Arm verdict(const Navi44ArmFacts &f) {
++	return navi44_arm_gate(f, nullptr);
++}
++
++// ---------------------------------------------------------------------------
++// A. the gate itself
++// ---------------------------------------------------------------------------
++static void sectionA() {
++	printf("== A: gate truth table ==\n");
++
++	// A1: Navi 48 is not this gate's business. This is the case that must not regress:
++	// the RX 9070 XT has been armed by boot-arg for hundreds of builds.
++	{
++		Navi44ArmFacts f = healthy();
++		f.matchedNavi44 = false;
++		f.discoveryValid = false;
++		f.fwSetFromDiscovery = false;
++		f.sosBlobPresent = false;
++		CHECK(verdict(f) == Navi44Arm::Allow);
++		CHECK(std::strcmp(run(f), "not Navi 44 - existing behaviour") == 0);
++	}
++
++	// A2: nothing asked -> not a refusal. targetStage == 0 is the default boot, and a
++	// gate that reported Refuse there would spam a reason into the log on every card.
++	{
++		Navi44ArmFacts f = healthy();
++		f.requestedStage = 0;
++		CHECK(verdict(f) == Navi44Arm::NothingAsked);
++	}
++
++	// A3: the healthy Navi 44 arms. Without this case passing, 0012 has not moved the
++	// project at all - it is the entire point of the patch.
++	{
++		Navi44ArmFacts f = healthy();
++		CHECK(verdict(f) == Navi44Arm::Allow);
++		CHECK_MSG(std::strcmp(run(f), "allowed") == 0, "healthy Navi 44 must be allowed");
++	}
++
++	// A4: no discovery table and no override -> refuse, and name the override.
++	{
++		Navi44ArmFacts f = healthy();
++		f.discoveryValid = false;
++		CHECK(verdict(f) == Navi44Arm::Refuse);
++		CHECK(std::strstr(run(f), "navi44-force=1") != nullptr);
++		f.forceOverride = true;
++		CHECK_MSG(verdict(f) != Navi44Arm::Refuse,
++		          "navi44-force=1 must carry the no-discovery case (SOS blob is still checked)");
++	}
++
++	// A5: a die that matches the Navi 44 PCI id but reports a GC version that is not
++	// 12.0.0 is not a card this port has numbers for.
++	{
++		Navi44ArmFacts f = healthy();
++		f.gcRev = 1;   // 12.0.1 is Navi 48's GC: driving it with Navi 44 constants is wrong
++		const char *why = run(f);
++		CHECK(verdict(f) == Navi44Arm::Refuse);
++		CHECK(std::strstr(why, "12.0.0") != nullptr);
++		f.forceOverride = true;
++		CHECK_MSG(verdict(f) == Navi44Arm::Refuse,
++		          "the override must NOT arm a die whose GC version is unknown - that is a "
++		          "register-table problem, not a firmware-set gamble");
++	}
++
++	// A5b: but GC absent from discovery (gcVersionKnown false) is not a contradiction -
++	// it is the same unknown as A4, and the override carries it.
++	{
++		Navi44ArmFacts f = healthy();
++		f.gcVersionKnown = false;
++		CHECK(verdict(f) == Navi44Arm::Allow);
++	}
++
++	// A6: discovery rejected the PCI-id pick -> refuse, because the blobs would be the
++	// other die's. Override allowed (owner watching the console).
++	{
++		Navi44ArmFacts f = healthy();
++		f.fwSetFromDiscovery = false;
++		CHECK(verdict(f) == Navi44Arm::Refuse);
++		CHECK(std::strstr(run(f), "other die") != nullptr);
++		f.forceOverride = true;
++		CHECK(verdict(f) == Navi44Arm::Allow);
++	}
++
++	// A7: no SOS blob is fatal even under the override. Loading nothing is not a risk
++	// anyone should be allowed to take, and the kext would fail later with a vaguer
++	// message than this one.
++	{
++		Navi44ArmFacts f = healthy();
++		f.sosBlobPresent = false;
++		CHECK(verdict(f) == Navi44Arm::Refuse);
++		f.forceOverride = true;
++		CHECK_MSG(verdict(f) == Navi44Arm::Refuse, "no override for a missing firmware blob");
++	}
++
++	// A8: every verdict carries a reason, and no two refusals share one - otherwise the
++	// registry property PSP,GateReason cannot tell the owner which precondition to fix.
++	{
++		Navi44ArmFacts a = healthy(); a.discoveryValid = false;
++		Navi44ArmFacts b = healthy(); b.gcRev = 1;
++		Navi44ArmFacts c = healthy(); c.fwSetFromDiscovery = false;
++		Navi44ArmFacts d = healthy(); d.sosBlobPresent = false;
++		const char *ra = run(a), *rb = run(b), *rc = run(c), *rd = run(d);
++		const char *ok = run(healthy());   // the reason an Allow carries
++		CHECK(ra && rb && rc && rd);
++		CHECK(ra && rb && std::strcmp(ra, rb) != 0);
++		CHECK(ra && rc && std::strcmp(ra, rc) != 0);
++		CHECK(rd && std::strcmp(ra, rd) != 0 && std::strcmp(rb, rd) != 0 &&
++		      std::strcmp(rc, rd) != 0);
++		// And none of them may be the allow text: PSP,GateReason is read by the owner at
++		// the console, and a refusal that says "allowed" is worse than no reason at all.
++		CHECK(ok && ra && std::strcmp(ra, ok) != 0);
++		CHECK(ok && rb && std::strcmp(rb, ok) != 0);
++		CHECK(ok && rc && std::strcmp(rc, ok) != 0);
++		CHECK_MSG(ok && rd && std::strcmp(rd, ok) != 0,
++		          "a refusal cannot borrow the allow reason");
++	}
++
++	// A9: default-constructed facts are "some other card, nothing learned yet" - which must
++	// land on the pre-0012 path untouched. The Navi 44-shaped version of the same empty
++	// facts must NOT arm: a die labelled 0x7590 with no discovery and no confirmed
++	// firmware set is exactly the guess the gate exists to stop.
++	{
++		Navi44ArmFacts f {};
++		f.requestedStage = 5;
++		CHECK_MSG(verdict(f) == Navi44Arm::Allow,
++		          "an unlabelled die (matchedNavi44=false) stays on the existing path");
++		f.matchedNavi44 = true;
++		CHECK_MSG(verdict(f) == Navi44Arm::Refuse,
++		          "a Navi 44 with nothing confirmed by discovery is refused");
++	}
++
++	// A10: reasonOut == nullptr must be safe (the kext logs the verdict before it needs
++	// the text in one call path).
++	{
++		Navi44ArmFacts f = healthy();
++		f.discoveryValid = false;
++		CHECK(verdict(f) == Navi44Arm::Refuse);
++	}
++}
++
++// ---------------------------------------------------------------------------
++// B. the clear-state table, against upstream
++// ---------------------------------------------------------------------------
++// Patch 0012 settled an open question offline: drivers/gpu/drm/amd/amdgpu/clearstate_gfx12.h
++// is 6 SECT_CONTEXT clusters totalling 75 dwords (1 + sum(2 + reg_count)) - and every
++// register value in it is 0, so no Navi 48 constant can leak into it and Navi 44 needs no
++// different table. Upstream's layout (gfx_v12_0.c:681-730) is re-implemented here
++// independently of our port, then compared against the table rlc_v12_0.cpp vendored.
++static void sectionB(const std::string &root) {
++	printf("== B: gfx12 clear state vs upstream ==\n");
++
++	struct Cluster { uint32_t regIndex; uint32_t count; };
++	const Cluster upstream[] = {
++		{ 0x0000a03e, 34 }, { 0x0000a0cc, 2 }, { 0x0000a0d8, 1 },
++		{ 0x0000a0db, 6 }, { 0x0000a2e5, 11 }, { 0x0000a3c0, 8 },
++	};
++	// Upstream's own arithmetic, written out rather than hard-coded, so a future
++	// upstream change to the algorithm shows up as a diff instead of a wrong constant.
++	uint32_t dwords = 1;
++	for (const auto &c : upstream) dwords += 2 + c.count;
++	CHECK_MSG(dwords == 75, "the 75-dword CSB is derived from the table, not remembered");
++
++	std::string src;
++	{
++		std::ifstream in(root + "/src/amd/rlc_v12_0.cpp", std::ios::binary);
++		CHECK_MSG(in.good(), "can read src/amd/rlc_v12_0.cpp");
++		std::ostringstream ss; ss << in.rdbuf(); src = ss.str();
++		src.erase(std::remove(src.begin(), src.end(), '\r'), src.end());
++	}
++	if (src.empty()) return;
++
++	// Every cluster line our port must carry, exactly as upstream has it - parsed out of
++	// our table rather than string-matched, so a wrong reg_count is caught: the dword
++	// total is what gets programmed into RLC_CSIB_LENGTH, and a cluster whose count lies
++	// makes the hardware read past the buffer or leave registers uncleared.
++	std::vector<Cluster> ours;
++	{
++		std::istringstream in(src);
++		std::string line;
++		while (std::getline(in, line)) {
++			const char *p = std::strstr(line.c_str(), "{ kGfx12_SECT_CONTEXT_def_");
++			if (!p) continue;
++			uint32_t base = 0, cnt = 0;
++			if (std::sscanf(p, "{ kGfx12_SECT_CONTEXT_def_%*u, 0x%x, %u }", &base, &cnt) == 2)
++				ours.push_back(Cluster{ base, cnt });
++		}
++	}
++	CHECK_MSG(ours.size() == sizeof(upstream) / sizeof(upstream[0]),
++	          "our table has the same six clusters as upstream's");
++	if (ours.size() == sizeof(upstream) / sizeof(upstream[0])) {
++		for (size_t i = 0; i < ours.size(); i++) {
++			CHECK_MSG(ours[i].regIndex == upstream[i].regIndex, "cluster register base matches");
++			CHECK_MSG(ours[i].count == upstream[i].count, "cluster register count matches");
++		}
++		uint32_t oursDwords = 1;
++		for (const auto &c : ours) oursDwords += 2 + c.count;
++		CHECK_MSG(oursDwords == dwords, "our table computes to the same CSB length as upstream's");
++	}
++	CHECK_MSG(src.find("kGfx12_cs_data") != std::string::npos, "the table is named as upstream's");
++
++	// And the count the kext programs into RLC_CSIB_LENGTH comes out of the same arithmetic.
++	CHECK_MSG(src.find("rlc_get_csb_size(kGfx12_cs_data)") != std::string::npos,
++	          "clear_state_dwords is computed from the table, not hard-coded to 75");
++}
++
++// ---------------------------------------------------------------------------
++// C. the kext really consults the gate
++// ---------------------------------------------------------------------------
++// A pure function can be correct and unused. These pins are what the plant script
++// mutates: they are the only way this suite sees stagePSP() and probe() at all.
++static void sectionC(const std::string &root) {
++	printf("== C: the kext consults the gate ==\n");
++
++	auto slurp = [&](const char *rel) {
++		std::ifstream in(std::string(root) + rel, std::ios::binary);
++		std::ostringstream ss; ss << in.rdbuf();
++		std::string s = ss.str();
++		s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());
++		return s;
++	};
++
++	const std::string cpp = slurp("/src/Navi48Bringup.cpp");
++	CHECK_MSG(!cpp.empty(), "read Navi48Bringup.cpp");
++	if (cpp.empty()) return;
++
++	CHECK_MSG(cpp.find("#include \"navi44_arm_gate.h\"") != std::string::npos,
++	          "the gate header is included");
++	CHECK_MSG(cpp.find("navi44_arm_gate(facts") != std::string::npos,
++	          "stagePSP() calls the gate");
++	CHECK_MSG(cpp.find("facts.matchedNavi44      = navi44ByPciId") != std::string::npos,
++	          "the gate is fed probe()'s Navi 44 label");
++	CHECK_MSG(cpp.find("navi44ByPciId = true;") != std::string::npos,
++	          "probe() labels the 0x7590 match");
++	CHECK_MSG(cpp.find("navi44-gate-refused") != std::string::npos,
++	          "a refusal is published as a PSP,Stage value");
++	CHECK_MSG(cpp.find("PSP,GateReason") != std::string::npos,
++	          "the refusal text reaches the registry");
++
++	// The claim 0012 exists to remove. If it comes back, someone re-broke the doc AND
++	// probably the arming path.
++	CHECK_MSG(cpp.find("SURVEY ONLY, no writing stage armed") == std::string::npos,
++	          "the old \"arms NOTHING\" claim must stay gone");
++
++	// Order matters, and the check has to see an EARLIER call too: the gate must run
++	// before mapVramAperture() retunes BAR0, so it is anchored on the start of stagePSP()
++	// rather than on the gate's own position.
++	const size_t stageAt = cpp.find("void Navi48Bringup::stagePSP()");
++	const size_t gateAt = cpp.find("navi44_arm_gate(facts");
++	const size_t bar0First = cpp.find("mapVramAperture())", stageAt);
++	CHECK_MSG(stageAt != std::string::npos && gateAt != std::string::npos &&
++	              bar0First != std::string::npos && stageAt < gateAt && gateAt < bar0First,
++	          "the gate sits above the first BAR0 side effect in stagePSP()");
++
++	// The facts must be read, not assumed. Each of these is planted by
++	// navi44_arm_gate_plant.sh: a gate fed a constant is a gate that always agrees.
++	CHECK_MSG(cpp.find("facts.discoveryValid     = ipDiscovery.isValid();") != std::string::npos,
++	          "discovery validity comes from the parsed table");
++	CHECK_MSG(cpp.find("facts.gcVersionKnown = true;") != std::string::npos,
++	          "GC version is marked known only inside the findIp() success path");
++	CHECK_MSG(cpp.find("ipDiscovery.findIp(IpDiscovery::HwGc, 0, gcEntry)") != std::string::npos,
++	          "GC version is read from IP discovery");
++	CHECK_MSG(cpp.find("facts.sosBlobPresent = sosProbe && sosProbe->data && sosProbe->size != 0;")
++	              != std::string::npos,
++	          "the SOS blob check looks at the pointer, the bytes and the size");
++	CHECK_MSG(cpp.find("PE_parse_boot_argn(\"navi44-force\", &force, sizeof(force))") != std::string::npos,
++	          "the override is read from the documented boot-arg name");
++	size_t reasonProps = 0, from = 0;
++	while ((from = cpp.find("setProperty(\"PSP,GateReason\", why);", from)) != std::string::npos) {
++		reasonProps++; from += 1;
++	}
++	CHECK_MSG(reasonProps == 2, "both the refusal and the Navi 44 allow publish the reason");
++
++	// FW,SetSource is now two states with a variable behind them, not just a string.
++	const std::string selTrue = "fwSetConfirmed = true;";
++	const std::string selFalse = "fwSetConfirmed = false;";
++	CHECK_MSG(cpp.find(selTrue) != std::string::npos, "selectFwFromDiscovery records confirmation");
++	CHECK_MSG(cpp.find(selFalse) != std::string::npos, "...and records refusal");
++
++	const std::string hpp = slurp("/src/Navi48Bringup.hpp");
++	CHECK_MSG(hpp.find("bool               navi44ByPciId { false };") != std::string::npos,
++	          "the members exist and default to off");
++	CHECK_MSG(hpp.find("bool               fwSetConfirmed { false };") != std::string::npos,
++	          "fwSetConfirmed defaults to off");
++
++	// The stale-comment fix in cp_v12_0.cpp: gfx12 DOES have a clearstate table.
++	const std::string cp = slurp("/src/amd/cp_v12_0.cpp");
++	CHECK_MSG(cp.find("there is no gfx12_cs_data table in the tree") == std::string::npos,
++	          "the false \"no gfx12_cs_data table\" claim is gone");
++	CHECK_MSG(cp.find("clearstate_gfx12.h") != std::string::npos,
++	          "cp_v12_0.cpp names the real upstream table");
++}
++
++int main(int argc, char **argv) {
++	const std::string root = argc > 1 ? argv[1] : ".";
++	sectionA();
++	sectionB(root);
++	sectionC(root);
++	printf("\n%d checks, %d failures\n", gChecks, gFailures);
++	return gFailures == 0 ? 0 : 1;
++}

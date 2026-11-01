@@ -1,0 +1,660 @@
+0030: the survey says how far the boot got
+
+A survey boot that died early left no record at all: /Volumes/OPENCORE never appeared and
+E:\NAVI48.TXT kept the bytes of the previous boot, so "the survey never ran" and "the survey
+died at BAR5" looked identical on the stick. The writer thread now carries a progress record
+beside the final one: survey_report.h defines kSurveyStageStart/Mmio/Discovery/Report as
+cumulative bits and survey_stage_text() formats them as a 135-byte "navi48 survey progress:
+start=1 mmio=0 discovery=0 report=0" line that keeps the "navi" magic the raw channel already
+requires, and Navi48Bringup::start() marks each stage before the work it vouches for, through
+survey_stage_mark() in accel_takeover.cpp - it starts the report thread on the first mark and
+only ORs bits after it. The thread rewrites NAVI48.TXT whenever new bits arrive, so a boot that
+stops at MMIO leaves "mmio=1 discovery=0" behind; the full record, marked kSurveyStageReport,
+replaces the progress line exactly as patch 0029 wrote it. The mounted volume's grace drops
+from 30 s to 1 s: this machine's survey boots never mounted the stick before the boot ended,
+so 30 s of grace was 30 s of no report. Host suite: the E2 section pins the record's length
+across bit values, the "navi" magic at every stage, that nothing is written past the cap, and
+that each mark precedes the work it vouches for in start().
+
+The tests come with it, and they are the only test-side change: the first full run showed the
+takeover suite counting IOSleep(1000) over the whole of accel_takeover.cpp, a number 0027 and
+0030 both moved, so its pins are now scoped to the function that owns them (the tick, the wait
+constant, the stand-down on the positive signal, the census reads) and every thread that file
+starts must still be released; survey_report_test.cpp pins the boot-arg gate (survey_stage_mark()
+refuses without navi48-survey-report and consults no arming argument) and that the progress
+record stays under the raw writer 1536-byte cap; and tests/accel_report_file_plant.sh plants
+the volume misspelling against the path the header really holds, so its control step passes.
+
+Review fixes, same patch number because 0030 was never booted. The review of the first 0030
+build found four things that would have cost a boot each, and one of them was a correctness bug
+in the record itself:
+
+  * the writer's storage client was `this`, the bring-up service. Its whole reason to exist is
+    the boot where start() returns false, and on that path IOKit stops and detaches the service -
+    so the one boot that needed a report had a writer holding a service it could no longer use.
+    All four hand-offs (the three stage marks and the final record) now pass the provider, which
+    super::start() retains and the PCI registry keeps: kSurveyStageStart marks before pciDevice
+    is even assigned, so it uses the argument, and the two later marks use pciDevice.
+  * the survey handed the writer sizeof(text), the buffer, not n, the bytes the formatter wrote.
+    The remaining ~1 KB of a kernel stack array went onto the stick as the tail of a tidy-looking
+    survey record. It now passes n and the writer pads with spaces as before.
+  * the 1 s grace turned the raw block-device write into a certainty on every survey boot - a
+    data-cluster write into a FAT32 volume, started one second into a boot that had not finished
+    mapping BAR5. That is now opt-in behind navi48-raw-report=1, read once at thread entry, so a
+    boot can be run without it and the two outcomes differ only in that channel. A boot that
+    resets with the arg off is therefore not the raw writer's fault; a boot that resets with it on
+    is, and the panic log says so. The verdict reporter's own use of the raw channel is unchanged.
+  * the survey re-checks gWriterStarted immediately before the complete record goes out, not only
+    when it was handed over, because the verdict reporter can start after the survey's last
+    progress line; and a failed kernel_thread_start() gives back both its retain and its claim, so
+    the pending stage bits are picked up by the next mark instead of waiting for a thread that
+    never ran.
+
+survey_report_test.cpp grows 24 checks for exactly these: the pins that used to demand
+`this, text, sizeof(text)` now refuse it, each mark is pinned to a client that outlives start()
+and to its place in the function, raw_report_wanted() is pinned to one boot argument, and the
+stage bits are pinned to be set before the thread is asked for. The two cross-builds that this
+file only reaches through strings are what caught the unqualified kReportFilePath in the new log
+lines - the host suites stayed green over it.
+--- a/src/navi48-bringup/src/Navi48Bringup.cpp
++++ b/src/navi48-bringup/src/Navi48Bringup.cpp
+@@ -861,7 +861,10 @@
+ 	N48LOG("survey-report: requested — writing NAVI48.TXT on the boot stick (%zu bytes); "
+ 	       "the screen says the same and scrolls away", n < sizeof(text) ? n : sizeof(text) - 1);
+ 	setProperty("Navi48,SurveyReport", "writing NAVI48.TXT on the boot stick");
+-	n48::survey_report_start_writer(this, text, sizeof(text));
++	// 0030 review (#4): n, not sizeof(text). The writer pads to the fixed record length itself; handing it the
++	// whole buffer copied the untouched tail of a stack array onto the stick — the boot's own
++	// return addresses and IOKit pointers, inside what reads as a clean survey report.
++	n48::survey_report_start_writer(pciDevice, text, n);
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -7768,6 +7771,13 @@
+ 
+ bool Navi48Bringup::start(IOService *provider) {
+ 	if (!super::start(provider)) return false;
++	// 0030: the first fact any survey boot records is that start() ran at all. Its writer thread
++	// keeps retrying on its own, so even a boot that dies before the survey ends leaves this line.
++	// 0030 review (#2): the client is the provider, not this. A retain on `this` keeps our memory alive but not
++	// usable: every abort path below returns false, IOKit then stops and detaches us, and the
++	// boot this record exists to describe is exactly one of those. The IOPCIDevice outlives our
++	// start() — super::start() already holds it — so the aborting boot still has a raw client.
++	n48::survey_stage_mark(n48::kSurveyStageStart, provider);
+ 	if (!gVramMmLock) gVramMmLock = IOLockAlloc();   // never freed: a verb may hold it at stop
+ 	if (!gScanoutLock) gScanoutLock = IOLockAlloc(); // 0.0.272: never freed, same reason
+ 	if (!gFmLock) gFmLock = IOLockAlloc();           // build 0.0.518 (switch 74, flip mode): never freed, same reason
+@@ -7787,9 +7797,11 @@
+ 
+ 	if (!mapRegisters()) { N48LOG("start: BAR5 unavailable — aborting"); return false; }
+ 	if (!probeMemSize())  { N48LOG("start: MMIO not usable — aborting"); unmapRegisters(); return false; }
++	n48::survey_stage_mark(n48::kSurveyStageMmio, pciDevice);
+ 	if (!loadOnDieDiscovery()) {
+ 		N48LOG("start: IP discovery unavailable — MMIO works, but no register map");
+ 	} else {
++		n48::survey_stage_mark(n48::kSurveyStageDiscovery, pciDevice);
+ 		selectFwFromDiscovery();   // before the surveys: no blob has been handed out yet
+ 		surveyIPs();
+ 		surveyDcn();
+--- a/src/navi48-bringup/src/accel_takeover.cpp
++++ b/src/navi48-bringup/src/accel_takeover.cpp
+@@ -17,6 +17,7 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+ #include <kern/thread.h>
++#include <pexpert/pexpert.h>   // 0030: PE_parse_boot_argn (navi48-survey-report)
+ #include <libkern/c++/OSData.h>
+ #include <libkern/c++/OSMetaClass.h>
+ #include <libkern/c++/OSSymbol.h>
+@@ -54,7 +55,9 @@
+ // mount the stick. The block device is only touched after this grace, so the mounted-volume
+ // channel (the file system's own, safe one) wins whenever a mount is coming; the raw channel
+ // stays the fallback for the boots where no mount ever happens.
+-constexpr uint32_t kSurveyVfsGraceSeconds = 30;
++// 0030: this machine's survey boots ended before the mount: NAVI48.TXT kept its bytes through
++// every attempt, so 30 s of grace was 30 s of no report. One second in, the block device is tried.
++constexpr uint32_t kSurveyVfsGraceSeconds = 1;
+ } // namespace
+ 
+ #define TAKELOG(fmt, ...) ::amdgpu::n48_logf("takeover: " fmt "\n", ##__VA_ARGS__)
+@@ -260,39 +263,88 @@
+ 
+ // 0029: the survey report travels the same road as the verdict report: the fixed 1536-byte
+ // record, /Volumes/OPENCORE/NAVI48.TXT first, the file's own data cluster through the block
+-// device second. There is no verdict to wait for - the survey was complete when start() called
+-// this - so it starts at once and retries only while neither channel works.
++// device second.
++// 0030: the same thread now also carries the progress line (survey_report.h, kSurveyStage*):
++// it writes whatever stage bits exist, then the full record when the survey completes. A boot
++// that dies before the survey ends leaves the last progress line instead of nothing.
+ volatile uint32_t gSurveyStarted;
++volatile uint32_t gSurveyMask;
++volatile uint32_t gSurveyReportReady;
++volatile uint32_t gSurveyReportClaimed;
+ volatile uintptr_t gSurveyClient;
+ char gSurveyText[n48::kSurveyReportCap];
+ 
++// 0030 review (#3): the block-device channel is the only unaudited write in the survey path. It
++// walks every IOMedia in the registry, opens one as reader-writer and programs a data-cluster
++// write — and in 0030 it started one second into a boot that had not finished mapping BAR5. A
++// survey boot that resets with no report cannot tell us whether that write caused it, so the raw
++// channel is now opt-in: navi48-raw-report=1. Without it the survey uses the mounted volume only,
++// which is the file system's own road and needs no storage client at all. The verdict reporter's
++// use of the raw channel is not changed by this patch.
++bool raw_report_wanted() {
++    uint32_t on = 0;
++    return PE_parse_boot_argn("navi48-raw-report", &on, sizeof(on)) && on != 0;
++}
++
++bool survey_wanted() {
++    uint32_t on = 0;
++    return PE_parse_boot_argn("navi48-survey-report", &on, sizeof(on)) && on != 0;
++}
++
+ void survey_report_thread(void *, wait_result_t) {
+     IOService *client = (IOService *)__atomic_load_n(&gSurveyClient, __ATOMIC_ACQUIRE);
++    const bool rawOk = raw_report_wanted();
++    uint32_t written = 0;
+     bool saidGrace = false;
+     for (uint32_t t = 0; t < n48::kReportFileRetrySeconds; t++) {
+-        const int vfsErr = write_report_file(gSurveyText, sizeof gSurveyText);
++        const uint32_t mask = __atomic_load_n(&gSurveyMask, __ATOMIC_ACQUIRE);
++        if (mask == 0 || mask == written) { IOSleep(1000); continue; }
++        // 0030 review (#5): asked again here, not only when the record was handed over. The verdict
++        // reporter starts long after the survey's last progress line, so a boot that arms both
++        // would otherwise let the survey overwrite the one answer that cannot be re-run.
++        if ((mask & n48::kSurveyStageReport) &&
++            __atomic_load_n(&gWriterStarted, __ATOMIC_ACQUIRE)) {
++            TAKELOG("survey report dropped: the verdict reporter took %s over this boot",
++                    n48::kReportFilePath);
++            return;
++        }
++        char stage[n48::kSurveyReportCap];
++        const char *text = gSurveyText;
++        size_t len = sizeof gSurveyText;
++        if (!__atomic_load_n(&gSurveyReportReady, __ATOMIC_ACQUIRE)) {
++            const size_t n = n48::survey_stage_text(stage, sizeof stage, mask);
++            for (size_t i = n < sizeof stage ? n : sizeof stage - 1; i < sizeof stage; i++)
++                stage[i] = ' ';
++            text = stage;
++            len = sizeof stage;
++        }
++        const int vfsErr = write_report_file(text, len);
+         int err = vfsErr;
+         const char *channel = "the mounted volume";
+-        if (err != 0 && t >= kSurveyVfsGraceSeconds) {
+-            err = n48::report_raw_write(client, gSurveyText, sizeof gSurveyText);
++        if (err != 0 && rawOk && t >= kSurveyVfsGraceSeconds) {
++            err = n48::report_raw_write(client, text, len);
+             channel = "the block device (stick not mounted)";
+         }
+         if (err == 0) {
+-            TAKELOG("survey report written to %s through %s (%llu bytes) - no photograph needed",
+-                    n48::kReportFilePath, channel, (unsigned long long)sizeof gSurveyText);
+-            return;
++            TAKELOG("survey %s written to %s through %s (%llu bytes) - no photograph needed",
++                    (mask & n48::kSurveyStageReport) ? "report" : "progress record",
++                    n48::kReportFilePath, channel, (unsigned long long)len);
++            written = mask;
++            if (mask & n48::kSurveyStageReport) return;
++            continue;  // a newer stage may already be set; write it without waiting a second
+         }
+         if (t == 0)
+-            TAKELOG("survey report not writable yet: volume %d; retrying, block device after %u s",
+-                    vfsErr, kSurveyVfsGraceSeconds);
+-        if (t == kSurveyVfsGraceSeconds && !saidGrace) {
++            TAKELOG("survey report not writable yet: volume %d; retrying%s", vfsErr,
++                    rawOk ? ", block device after 1 s" : " (volume only: navi48-raw-report=0)");
++        if (rawOk && t == kSurveyVfsGraceSeconds && !saidGrace) {
+             TAKELOG("survey report: volume still absent after %u s - trying the block device",
+                     kSurveyVfsGraceSeconds);
+             saidGrace = true;
+         }
+         IOSleep(1000);
+     }
+-    TAKELOG("survey report never written: %s never became writable", n48::kReportFilePath);
++    TAKELOG("survey report never written: %s never became writable through %s", n48::kReportFilePath,
++            rawOk ? "the volume or the block device" : "the volume (navi48-raw-report=0)");
+ }
+ 
+ void print_block(n48::TakeoverVerdict v, uint32_t waited, const n48::TakeoverFacts &f) {
+@@ -401,14 +453,41 @@
+             kReportFilePath);
+ }
+ 
++// 0030: the first statement of start() and every later mark land here. The first call starts the
++// thread; later calls only add bits. The thread survives a start() that returns false, so the
++// client it retains has to survive too - which is why start() hands over its provider, not this.
++void survey_stage_mark(uint32_t stage, ::IOService *client) {
++    if (stage == 0 || !client || !survey_wanted()) return;
++    // 0030 review: the bit is set before the thread is asked for. A mark whose thread start fails must not
++    // lose the fact it recorded: the bits stay pending and the next mark retries the start.
++    __atomic_fetch_or(&gSurveyMask, stage, __ATOMIC_ACQ_REL);
++    uint32_t expected = 0;
++    if (!__atomic_compare_exchange_n(&gSurveyStarted, &expected, 1u, false, __ATOMIC_ACQ_REL,
++                                     __ATOMIC_ACQUIRE))
++        return;  // a writer is already running; it will see the bit
++    client->retain();  // held for the boot; the writer outlives start()
++    __atomic_store_n(&gSurveyClient, (uintptr_t)client, __ATOMIC_RELEASE);
++    thread_t th = nullptr;
++    const kern_return_t kr = kernel_thread_start(&survey_report_thread, nullptr, &th);
++    if (kr != KERN_SUCCESS) {
++        // 0030 review: no thread exists, so nothing holds this retain - and the claim must be handed back,
++        // or the pending bits would wait for a writer that can never start.
++        client->release();
++        __atomic_store_n(&gSurveyClient, 0, __ATOMIC_RELEASE);
++        __atomic_store_n(&gSurveyStarted, 0u, __ATOMIC_RELEASE);
++        TAKELOG("kernel_thread_start failed (0x%x) - no survey report on this boot", kr);
++        return;
++    }
++    thread_deallocate(th);
++    TAKELOG("survey report thread started; it writes %s as the boot advances", kReportFilePath);
++}
++
+ // 0029: the survey's own record on the same file. Called once from start() when
+ // navi48-survey-report=1; the text was formatted from facts the survey had already read, so all
+-// this does is copy, pad to the fixed length, and hand it to the same two channels.
++// this does is copy, pad to the fixed length, and mark kSurveyStageReport, which replaces the
++// progress line with the full record.
+ void survey_report_start_writer(::IOService *client, const char *text, size_t len) {
+     if (!text || len == 0 || len > kSurveyReportCap) return;
+-    uint32_t expected = 0;
+-    if (!__atomic_compare_exchange_n(&gSurveyStarted, &expected, 1u, false, __ATOMIC_ACQ_REL,
+-                                     __ATOMIC_ACQUIRE)) return;
+     // One file, one writer: if the verdict reporter already owns this boot's NAVI48.TXT, its
+     // record is the one that must survive.
+     if (__atomic_load_n(&gWriterStarted, __ATOMIC_ACQUIRE)) {
+@@ -416,20 +495,16 @@
+                 kReportFilePath);
+         return;
+     }
++    uint32_t expected = 0;
++    if (!__atomic_compare_exchange_n(&gSurveyReportClaimed, &expected, 1u, false, __ATOMIC_ACQ_REL,
++                                     __ATOMIC_ACQUIRE)) return;
+     size_t n = len < kSurveyReportCap ? len : kSurveyReportCap - 1;
+     for (size_t i = 0; i < n; i++) gSurveyText[i] = text[i];
+     // A fixed-length write, like the verdict report: the survey plus spaces, so an earlier boot's
+     // longer record can never leave a tail under this boot's shorter one.
+     for (size_t i = n; i < sizeof gSurveyText; i++) gSurveyText[i] = ' ';
+-    __atomic_store_n(&gSurveyClient, (uintptr_t)client, __ATOMIC_RELEASE);
+-    thread_t th = nullptr;
+-    const kern_return_t kr = kernel_thread_start(&survey_report_thread, nullptr, &th);
+-    if (kr != KERN_SUCCESS) {
+-        TAKELOG("kernel_thread_start failed (0x%x) - no survey report on this boot", kr);
+-        return;
+-    }
+-    thread_deallocate(th);
+-    TAKELOG("survey report thread started; it writes %s", kReportFilePath);
++    __atomic_store_n(&gSurveyReportReady, 1u, __ATOMIC_RELEASE);
++    survey_stage_mark(kSurveyStageReport, client);
+ }
+ 
+ } // namespace n48
+--- a/src/navi48-bringup/src/survey_report.h
++++ b/src/navi48-bringup/src/survey_report.h
+@@ -1,4 +1,6 @@
+ //  survey_report.h — patch 0029: the survey leaves the screen and lands on the stick.
++//  Patch 0030 adds the progress record: the same file also says how far start() got, because a
++//  boot that dies before the survey completes currently leaves nothing at all.
+ //
+ //  0027/0028 taught the verdict to write itself to E:\NAVI48.TXT. The survey never learned it:
+ //  every fact it produces goes to the -v console, and on this machine the console scrolls away
+@@ -24,6 +26,16 @@
+ 
+ // The fixed record length the raw writer accepts (accel_report_file.h: kReportFileWriteCap).
+ constexpr uint32_t kSurveyReportCap = 1536;
++
++// 0030: the survey boot left no record at all - /Volumes/OPENCORE never appeared and NAVI48.TXT
++// kept its bytes - so the writer now records progress as well as the final record. The first mark
++// is the first statement of start(); each later mark is one more fact about how far the boot got,
++// and the thread writes whatever bits exist so a boot that dies mid-survey still leaves its last
++// line behind. Bits, cumulative: every write carries all bits reached so far.
++constexpr uint32_t kSurveyStageStart     = 1u << 0;  // start() entered, provider matched
++constexpr uint32_t kSurveyStageMmio      = 1u << 1;  // BAR5 mapped, MMIO readable
++constexpr uint32_t kSurveyStageDiscovery = 1u << 2;  // IP discovery parsed
++constexpr uint32_t kSurveyStageReport    = 1u << 3;  // the full survey record is ready
+ constexpr uint32_t kSurveyReportMaxIps = 10;
+ constexpr uint32_t kSurveyReportMaxIpBases = 3;   // per IP row; DCN has its own five-segment line
+ constexpr uint32_t kSurveyReportMaxDmuSegs = 5;
+@@ -109,7 +121,7 @@
+         void finish() { if (out && cap) out[len < cap ? len : cap - 1] = 0; }
+     } w = { out, cap, 0 };
+ 
+-    w.str("navi48 survey report - patch 0029; written by the kext, no photograph needed\n");
++    w.str("navi48 survey report - patch 0030; written by the kext, no photograph needed\n");
+     w.str("card: vendor 0x");
+     w.hex4(f.vendorId);
+     w.str(" device 0x");
+@@ -265,10 +277,41 @@
+     return w.len;
+ }
+ 
++// 0030: the progress record written before the full report exists. Pure, same writer idiom as
++// survey_report_text. It starts with "navi" so the raw writer's magic check (accel_report_raw.h)
++// accepts a stage write and still accepts the report that replaces it later in the same boot.
++inline size_t survey_stage_text(char *out, size_t cap, uint32_t reached) {
++    struct W {
++        char *out;
++        size_t cap, len;
++        void ch(char c) { if (out && len + 1 < cap) out[len] = c; len++; }
++        void str(const char *s) { while (s && *s) ch(*s++); }
++        void dec(uint32_t v) { ch((char)('0' + (v % 10))); }
++        void finish() { if (out && cap) out[len < cap ? len : cap - 1] = 0; }
++    } w = { out, cap, 0 };
++
++    w.str("navi48 survey progress: start=");
++    w.dec(reached & kSurveyStageStart ? 1u : 0u);
++    w.str(" mmio=");
++    w.dec(reached & kSurveyStageMmio ? 1u : 0u);
++    w.str(" discovery=");
++    w.dec(reached & kSurveyStageDiscovery ? 1u : 0u);
++    w.str(" report=");
++    w.dec(reached & kSurveyStageReport ? 1u : 0u);
++    w.str("; patch 0030 - the full record replaces this line when the survey completes\n");
++    w.finish();
++    return w.len;
++}
++
+ // ---- runtime, defined in accel_takeover.cpp ----
+-// Copies/pads `text` to the fixed record and writes NAVI48.TXT through the mounted volume, then
+-// the block device, retrying for kReportFileRetrySeconds. client is the IOService the raw channel
+-// opens the stick as. Safe to call once per boot; later calls are ignored.
++// Records that `stage` (one kSurveyStage* bit) was reached and writes NAVI48.TXT through the
++// mounted volume, then the block device, retrying for kReportFileRetrySeconds. The thread starts
++// on the first call; later calls only add bits. No-op unless navi48-survey-report=1.
++void survey_stage_mark(uint32_t stage, ::IOService *client);
++
++// Copies/pads `text` to the fixed record and marks kSurveyStageReport, which replaces the progress
++// line with the full record. client is the IOService the raw channel opens the stick as. Safe to
++// call once per boot; later calls are ignored.
+ void survey_report_start_writer(::IOService *client, const char *text, size_t len);
+ 
+ } // namespace n48
+--- a/src/navi48-bringup/tests/survey_report_test.cpp
++++ b/src/navi48-bringup/tests/survey_report_test.cpp
+@@ -1,4 +1,5 @@
+-//  survey_report_test.cpp — host suite for patch 0029, the survey that writes itself to the stick.
++//  survey_report_test.cpp — host suite for patches 0029-0030, the survey that writes itself to
++//  the stick and now also reports how far start() got while doing it.
+ //
+ //  Build (any machine, no Mac, no GPU):
+ //    zig c++ -std=c++17 -Wall -Wextra -O1 -I src tests/survey_report_test.cpp -o /tmp/survey_report_test.exe
+@@ -45,6 +46,12 @@
+ 	return hay.find(needle) != std::string::npos;
+ }
+ 
++size_t count_of(const std::string &hay, const std::string &needle) {
++	size_t n = 0, p = 0;
++	while ((p = hay.find(needle, p)) != std::string::npos) { n++; p += needle.size(); }
++	return n;
++}
++
+ // The full picture a working Navi 44 survey produces, with realistic segment counts.
+ n48::SurveyReportFacts full_facts() {
+ 	n48::SurveyReportFacts f = {};
+@@ -139,7 +146,7 @@
+ 	const n48::SurveyReportFacts full = full_facts();
+ 	const std::string t = format(full);
+ 	CHECK(!t.empty());
+-	CHECK(has(t, "navi48 survey report - patch 0029"));
++	CHECK(has(t, "navi48 survey report - patch 0030"));
+ 	CHECK(has(t, "card: vendor 0x1002 device 0x7590 navi44=1"));
+ 	CHECK(has(t, "bar5: 16777216 bytes"));
+ 	CHECK(has(t, "vram: 16368 MiB"));
+@@ -244,6 +251,44 @@
+ 	CHECK(has(tw, "writes: none requested"));
+ 	CHECK(has(tw, "end of survey report"));
+ 
++	// ---------------------------------------------------------------- E2: the 0030 progress record
++	{
++		// The record is 135 bytes of text, so the buffer that carries it must be bigger than
++		// that; a short cap keeps the NUL inside the cap, exactly as survey_report_text does (D).
++		const size_t need0 = n48::survey_stage_text(nullptr, 0, 15u);
++		CHECK(need0 > 0);
++		// The raw writer accepts exactly kSurveyReportCap bytes; a progress line that filled the
++		// record would be cut on the stick and read back as a complete line. Same guard as E,
++		// for the line written when the full record does not exist yet.
++		CHECK(need0 < n48::kSurveyReportCap);
++		char rec[192];
++		for (uint32_t mask : {1u, 3u, 7u, 15u}) {
++			std::memset(rec, 0xAA, sizeof rec);
++			const size_t need = n48::survey_stage_text(rec, sizeof rec, mask);
++			CHECK(need == need0);                       // one length, whatever bits are set
++			CHECK(rec[need] == 0);
++			CHECK(std::string(rec, 4) == "navi");        // the raw writer's magic survives each stage
++			CHECK((unsigned char)rec[need + 1] == 0xAA);  // nothing written past the record
++		}
++		char tight[16];
++		std::memset(tight, 0xAA, sizeof tight);
++		CHECK(n48::survey_stage_text(tight, 10, 15u) == need0);
++		CHECK(tight[9] == 0);
++		for (size_t i = 10; i < sizeof tight; i++) CHECK((unsigned char)tight[i] == 0xAA);
++		// Counting without writing agrees with the real run, as in section D.
++		std::memset(tight, 0xAA, sizeof tight);
++		CHECK(n48::survey_stage_text(nullptr, 0, 15u) == need0);
++		for (size_t i = 0; i < sizeof tight; i++) CHECK((unsigned char)tight[i] == 0xAA);
++
++		char full[n48::kSurveyReportCap];
++		n48::survey_stage_text(full, sizeof full, n48::kSurveyStageStart);
++		CHECK(has(std::string(full), "start=1 mmio=0 discovery=0 report=0"));
++		n48::survey_stage_text(full, sizeof full,
++		                       n48::kSurveyStageStart | n48::kSurveyStageMmio |
++		                       n48::kSurveyStageDiscovery | n48::kSurveyStageReport);
++		CHECK(has(std::string(full), "start=1 mmio=1 discovery=1 report=1"));
++	}
++
+ 	// ---------------------------------------------------------------- F: the wiring
+ 	const std::string src = slurp(root + "/src/Navi48Bringup.cpp");
+ 	const std::string hpp = slurp(root + "/src/Navi48Bringup.hpp");
+@@ -253,7 +298,10 @@
+ 
+ 	CHECK(has(src, "PE_parse_boot_argn(\"navi48-survey-report\", &on, sizeof(on))"));
+ 	CHECK(has(src, "n48::survey_report_text(text, sizeof(text), surveyFacts)"));
+-	CHECK(has(src, "n48::survey_report_start_writer(this, text, sizeof(text))"));
++	// The writer is handed the length the formatter used, not the buffer size, and the PCI provider
++	// rather than the service that is about to be aborted. A pin on the old call is a pin on a bug.
++	CHECK(has(src, "n48::survey_report_start_writer(pciDevice, text, n);"));
++	CHECK(!has(src, "survey_report_start_writer(this, text, sizeof(text))"));
+ 	CHECK(has(src, "setProperty(\"Navi48,SurveyReport\""));
+ 	// The report is started after the survey (and any stage) and before the display attaches.
+ 	CHECK(src.find("surveyPSP();") < src.find("startSurveyReportIfRequested();"));
+@@ -268,10 +316,103 @@
+ 	CHECK(has(hpp, "bool               surveyReportStarted"));
+ 
+ 	CHECK(has(take, "void survey_report_start_writer(::IOService *client, const char *text, size_t len)"));
+-	CHECK(has(take, "write_report_file(gSurveyText, sizeof gSurveyText)"));
+-	CHECK(has(take, "n48::report_raw_write(client, gSurveyText, sizeof gSurveyText)"));
++	CHECK(has(take, "write_report_file(text, len)"));
++	CHECK(has(take, "n48::report_raw_write(client, text, len)"));
+ 	CHECK(has(take, "kernel_thread_start(&survey_report_thread"));
+ 	CHECK(has(take, "if (__atomic_load_n(&gWriterStarted, __ATOMIC_ACQUIRE))"));
++	// 0030: progress marks, the one-second grace, and the thread that carries both.
++	CHECK(has(take, "kSurveyVfsGraceSeconds = 1;"));
++	CHECK(has(take, "void survey_stage_mark(uint32_t stage, ::IOService *client)"));
++	CHECK(has(take, "n48::survey_stage_text(stage, sizeof stage, mask)"));
++	CHECK(has(take, "__atomic_fetch_or(&gSurveyMask, stage, __ATOMIC_ACQ_REL)"));
++	CHECK(has(src, "n48::survey_stage_mark(n48::kSurveyStageStart, provider);"));
++	CHECK(has(src, "n48::survey_stage_mark(n48::kSurveyStageMmio, pciDevice);"));
++	CHECK(has(src, "n48::survey_stage_mark(n48::kSurveyStageDiscovery, pciDevice);"));
++	// Every raw client is a service that outlives start(): the marks exist to describe the boots
++	// where start() returns false, and a writer holding `this` through that abort is the bug.
++	CHECK(!has(src, "survey_stage_mark(n48::kSurveyStageStart, this)"));
++	CHECK(!has(src, "survey_stage_mark(n48::kSurveyStageMmio, this)"));
++	CHECK(!has(src, "survey_stage_mark(n48::kSurveyStageDiscovery, this)"));
++	// Marks must precede the work they vouch for, or a boot that dies there reports the wrong stage.
++	// Anchored inside start(): the definitions of mapRegisters()/loadOnDieDiscovery()/surveyIPs()
++	// sit earlier in the file, so an unanchored find() would match those and not the calls.
++	const size_t startAt = src.find("bool Navi48Bringup::start(IOService *provider) {");
++	CHECK(startAt != std::string::npos);
++	auto after = [&](const char *needle) { return src.find(needle, startAt); };
++	CHECK(after("kSurveyStageStart, provider);") < after("if (!mapRegisters())"));
++	CHECK(after("kSurveyStageMmio, pciDevice);") < after("if (!loadOnDieDiscovery())"));
++	CHECK(after("kSurveyStageDiscovery, pciDevice);") < after("surveyIPs();"));
++	// provider is only safe after super::start() retained it; pciDevice only after it was assigned.
++	CHECK(after("kSurveyStageStart, provider);") > after("if (!super::start(provider)) return false;"));
++	CHECK(after("kSurveyStageMmio, pciDevice);") > after("pciDevice = OSDynamicCast(IOPCIDevice, provider);"));
++
++	// The raw channel is opt-in. One second of grace means the block-device write would otherwise
++	// run on every survey boot, before BAR5 is even mapped, and a boot that resets in it leaves no
++	// report and no clue. navi48-raw-report=1 is the only thing that turns it on.
++	CHECK(has(take, "PE_parse_boot_argn(\"navi48-raw-report\", &on, sizeof(on)) && on != 0"));
++	CHECK(has(take, "if (err != 0 && rawOk && t >= kSurveyVfsGraceSeconds)"));
++	CHECK(has(take, "if (rawOk && t == kSurveyVfsGraceSeconds && !saidGrace)"));
++	const size_t rawAt = take.find("bool raw_report_wanted() {");
++	const size_t wantedBefore = take.find("bool survey_wanted() {", rawAt);
++	CHECK(rawAt != std::string::npos && wantedBefore != std::string::npos && rawAt < wantedBefore);
++	const std::string rawBody = take.substr(rawAt, wantedBefore - rawAt);
++	CHECK(count_of(rawBody, "PE_parse_boot_argn(") == 1);   // asks one argument, nothing else
++	CHECK(has(rawBody, "navi48-raw-report"));
++	CHECK(!has(rawBody, "navi48-survey-report"));
++	// Reading the flag once, at thread entry, is the point: a boot-arg cannot change mid-boot, so
++	// the survey either may or may not touch the media - never "depends on which loop turned up".
++	const size_t threadAt2 = take.find("void survey_report_thread(", wantedBefore);
++	CHECK(threadAt2 != std::string::npos && wantedBefore < threadAt2);
++	const std::string surveyBody =
++	    take.substr(threadAt2, take.find("void print_block(", threadAt2) - threadAt2);
++	CHECK(count_of(surveyBody, "raw_report_wanted()") == 1);
++	CHECK(count_of(surveyBody, "rawOk") >= 4);
++	// A survey record must not overwrite a verdict record: the verdict is asked again immediately
++	// before the complete record goes out, not only when the survey finished formatting it.
++	CHECK(has(surveyBody, "__atomic_load_n(&gWriterStarted, __ATOMIC_ACQUIRE)"));
++	CHECK(has(surveyBody, "survey report dropped: the verdict reporter took"));
++	// A failed thread start gives back both the retain and the claim, or the pending bits would
++	// wait forever for a writer that never ran.
++	const size_t markAt2 = take.find("void survey_stage_mark(uint32_t stage, ::IOService *client)");
++	// The slice ends at the first line that is only a closing brace; "\n}" works whatever the
++	// checkout's line endings are, which the CRLF form of this needle would not.
++	const std::string markBody2 = take.substr(markAt2, take.find("\n}", markAt2) - markAt2);
++	CHECK(has(markBody2, "client->release();"));
++	CHECK(has(markBody2, "__atomic_store_n(&gSurveyStarted, 0u, __ATOMIC_RELEASE);"));
++	CHECK(has(markBody2, "__atomic_store_n(&gSurveyClient, 0, __ATOMIC_RELEASE);"));
++	CHECK(markBody2.find("__atomic_fetch_or(&gSurveyMask") < markBody2.find("kernel_thread_start("));
++	CHECK(count_of(markBody2, "client->retain();") == 1);
++	CHECK(count_of(markBody2, "client->release();") == 1);
++
++	// The boot-arg gate: like the survey report itself, the progress line exists only on a boot
++	// that asked for it. survey_stage_mark() must ask survey_wanted() before it retains a client,
++	// starts a thread, or sets a bit, so a boot with no argument leaves NAVI48.TXT untouched and
++	// no survey thread runs at all.
++	const size_t markAt = take.find("void survey_stage_mark(uint32_t stage, ::IOService *client)");
++	const size_t markEnd = take.find("void survey_report_start_writer(", markAt);
++	CHECK(markAt != std::string::npos && markEnd != std::string::npos && markAt < markEnd);
++	const std::string markBody = take.substr(markAt, markEnd - markAt);
++	const size_t gate = markBody.find("!survey_wanted()");
++	const size_t retainAt = markBody.find("client->retain();");
++	const size_t threadAt = markBody.find("kernel_thread_start(&survey_report_thread");
++	const size_t bitAt = markBody.find("__atomic_fetch_or(&gSurveyMask");
++	CHECK(gate != std::string::npos);                        // the refusal is there at all
++	CHECK(retainAt != std::string::npos && threadAt != std::string::npos && bitAt != std::string::npos);
++	CHECK(gate < retainAt && gate < threadAt && gate < bitAt);   // ...and it comes first
++	CHECK(count_of(markBody, "PE_parse_boot_argn(") == 0);   // it asks survey_wanted(), not the args
++
++	// The only boot argument consulted is navi48-survey-report. The arming arguments belong to
++	// start(); reading one of them here would let an unrelated boot-arg turn this writer on.
++	const size_t wantedAt = take.find("bool survey_wanted() {");
++	const size_t wantedEnd = take.find("void survey_report_thread(", wantedAt);
++	CHECK(wantedAt != std::string::npos && wantedEnd != std::string::npos && wantedAt < wantedEnd);
++	const std::string wantedBody = take.substr(wantedAt, wantedEnd - wantedAt);
++	CHECK(has(wantedBody, "PE_parse_boot_argn(\"navi48-survey-report\", &on, sizeof(on)) && on != 0"));
++	CHECK(count_of(wantedBody, "PE_parse_boot_argn(") == 1);
++	CHECK(!has(wantedBody, "navi48-accel-experiment"));
++	CHECK(!has(wantedBody, "navi48-accel-fire-at-boot"));
++	CHECK(!has(wantedBody, "navi48-report-hold"));
++	CHECK(!has(wantedBody, "navi48-interrupts"));
+ 
+ 	CHECK(has(hdr, "kSurveyReportCap = 1536"));
+ 	CHECK(has(hdr, "survey_report_text"));
+--- a/src/navi48-bringup/tests/accel_takeover_report_test.cpp
++++ b/src/navi48-bringup/tests/accel_takeover_report_test.cpp
+@@ -55,6 +55,16 @@
+ 	return n;
+ }
+ 
++// The text of one definition, from `def` up to the next definition `next`. A count taken inside
++// a function says what that path does; a count over the whole file only says how many writers
++// happen to exist today (0027 and 0030 each added two).
++std::string body_of(const std::string &hay, const std::string &def, const std::string &next) {
++	const size_t a = hay.find(def);
++	if (a == std::string::npos) return "";
++	const size_t b = hay.find(next, a);
++	return hay.substr(a, b == std::string::npos ? std::string::npos : b - a);
++}
++
+ // The rules in prose, written out by hand rather than reusing the header's expression.
+ TakeoverVerdict expect_verdict(bool armed, bool started) {
+ 	if (!armed) return TakeoverVerdict::NotArmed;
+@@ -167,12 +177,39 @@
+ 	CHECK(mark < peer.find("force_accelerator_enabled(p2);"));
+ 
+ 	// the negative signal: a thread that waits, one second at a time, and stands down the
+-	// moment the positive one is recorded
++	// moment the positive one is recorded.
++	// Everything below is counted in the function that owns it: 0027's verdict writer repeats the
++	// poller's wait loop and 0030 added a third thread, so a whole-file has() passes on the
++	// writer's copy while the poller's own copy is broken.
++	const std::string pollerBody = body_of(rt, "void takeover_poller(", "namespace n48 {");
++	const std::string writerBody = body_of(rt, "void report_file_thread(", "void survey_report_thread(");
++	const std::string surveyBody = body_of(rt, "void survey_report_thread(", "void print_block(");
++	const std::string holdBody = body_of(rt, "void print_block(", "void takeover_poller(");
++	CHECK(!pollerBody.empty() && !writerBody.empty() && !surveyBody.empty() && !holdBody.empty());
+ 	CHECK(has(rt, "kernel_thread_start(&takeover_poller, nullptr, &th)"));
+-	CHECK(has(rt, "thread_deallocate(th)"));
+-	CHECK(has(rt, "while (waited < n48::kTakeoverWaitSeconds)"));
+-	CHECK(has(rt, "if (__atomic_load_n(&gStarted, __ATOMIC_ACQUIRE)) break;"));
+-	CHECK(count_of(rt, "IOSleep(1000);") == 2);   // one in print_block, one in the wait loop
++	CHECK(has(pollerBody, "while (waited < n48::kTakeoverWaitSeconds) {"));
++	CHECK(has(pollerBody, "if (__atomic_load_n(&gStarted, __ATOMIC_ACQUIRE)) break;"));
++	// ...and the writer's own wait ends on the same flag, so a late announce is not waited out.
++	// Both loops use the tested constant, not a literal that drifts from kTakeoverWaitSeconds.
++	CHECK(has(writerBody, "while (waited < n48::kTakeoverWaitSeconds) {"));
++	CHECK(has(writerBody, "if (__atomic_load_n(&gStarted, __ATOMIC_ACQUIRE)) break;"));
++	// Every thread this file starts is also released - the poller's, 0027's writer, 0030's survey.
++	CHECK(count_of(rt, "thread_deallocate(th)") == count_of(rt, "kernel_thread_start("));
++	// One second per tick, counted inside the function that owns the tick. 0027's verdict writer
++	// and 0030's survey writer each sleep once per retry second on their own path, so a literal
++	// count over the whole file would only pin how many writers exist, not that they wait.
++	CHECK(count_of(pollerBody, "IOSleep(1000);") == 1);   // the timeout wait loop
++	CHECK(count_of(writerBody, "IOSleep(1000);") == 2);   // the verdict writer: wait loop + retry loop
++	CHECK(count_of(surveyBody, "IOSleep(1000);") == 2);   // 0030: idle tick + retry loop
++	CHECK(count_of(holdBody, "IOSleep(1000);") == 1);     // one second per hold, never two
++	// ...and the poller's tick is inside the wait loop, not merely somewhere in the thread.
++	const size_t pollWait = pollerBody.find("while (waited < n48::kTakeoverWaitSeconds) {");
++	const size_t pollTick = pollerBody.find("IOSleep(1000);");
++	CHECK(pollWait != std::string::npos && pollTick != std::string::npos && pollWait < pollTick);
++	// No path outside those four sleeps a second, so a new writer has to be pinned here by name.
++	CHECK(count_of(pollerBody, "IOSleep(1000);") + count_of(writerBody, "IOSleep(1000);") +
++	      count_of(surveyBody, "IOSleep(1000);") + count_of(holdBody, "IOSleep(1000);") ==
++	      count_of(rt, "IOSleep(1000);"));
+ 	CHECK(has(rt, "__atomic_store_n(&gArmed, 1u, __ATOMIC_RELEASE);"));
+ 	CHECK(has(rt, "__atomic_store_n(&gStarted, 1u, __ATOMIC_RELEASE);"));
+ 	// 0025: the announce is proof by itself. The flag is stored before anything can return, so
+@@ -203,8 +240,16 @@
+ 	// without it says Apple failed but not at which of the 43 entry points.
+ 	CHECK(has(rt, "#include \"apple/Navi48Ttl.hpp\""));
+ 	CHECK(has(rt, "const uint32_t calls = gNavi48Ttl.totalCalls();"));
+-	CHECK(has(rt, "const int first = gNavi48Ttl.firstUnsupported();"));
+-	CHECK(has(rt, "gNavi48Ttl.bound() ? 1u : 0u"));
++	// 0027's file writer reads the same counters for the report, so the screen's copy is pinned
++	// inside the function that prints it rather than anywhere in the file.
++	const std::string censusBody = body_of(rt, "void print_ttl_census() {", "uint16_t injected_id(");
++	const std::string inputsBody = body_of(rt, "n48::ReportFileInputs gather_report_inputs() {",
++	                                       "int write_report_file(");
++	CHECK(!censusBody.empty() && !inputsBody.empty());
++	CHECK(has(censusBody, "const int first = gNavi48Ttl.firstUnsupported();"));
++	CHECK(has(censusBody, "gNavi48Ttl.bound() ? 1u : 0u"));
++	CHECK(has(inputsBody, "const int first = gNavi48Ttl.firstUnsupported();"));
++	CHECK(has(inputsBody, "in.ttlBound = gNavi48Ttl.bound() ? 1u : 0u;"));
+ 	CHECK(has(rt, "for (int s = 0; s < 43; s++) if (gNavi48Ttl.callCount(s) != 0) touched++;"));
+ 	CHECK(has(rt, "ttl: bound=%u calls=%u slots=%u/43 first unsupported=%d"));
+ 	const size_t censusCall = rt.find("print_ttl_census();");
+--- a/src/navi48-bringup/tests/accel_report_file_plant.sh
++++ b/src/navi48-bringup/tests/accel_report_file_plant.sh
+@@ -125,7 +125,7 @@
+ run_plant "writer: unarmed freezes on first write"   "$R" 'if (in.started || in.armed) return;' 'if (true) return;'
+ run_plant "writer: the device id is not gathered"    "$R" 'in.deviceId = injected_id(prov, "device-id")' 'in.deviceId = 0'
+ run_plant "writer: the slot mask is a single bit"    "$R" 'mask |= (1ull << s)' 'mask |= (1ull << 0)'
+-run_plant "header: the volume is misspelled"         "$F" '"/Volumes/OPENCORE/navi48-report.txt"' '"/Volumes/OPENCORE/navi48-report.txtx"'
++run_plant "header: the volume is misspelled"         "$F" '"/Volumes/OPENCORE/NAVI48.TXT"' '"/Volumes/OPENCOREX/NAVI48.TXT"'
+ run_plant "header: the retry window is one second"   "$F" 'kReportFileRetrySeconds = 120' 'kReportFileRetrySeconds = 1'
+ 
+ echo "== plants: the xsrc wiring (every requested boot writes) =="

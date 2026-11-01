@@ -1,0 +1,264 @@
+diff --git a/src/dcn41/dcn41.h b/src/dcn41/dcn41.h
+index 456e196..8025b07 100644
+--- a/src/dcn41/dcn41.h
++++ b/src/dcn41/dcn41.h
+@@ -48,15 +48,18 @@ extern "C" {
+ #define DCN41_NUM_PIPES 4u                     /* res_cap_dcn4_01: 4 OTG, 4 HUBP (dcn401_resource.c) */
+ #define DCN41_NUM_HPD 4u
+ 
+-/* The DMU (discovery hw id 271, v4.1.0) segment bases measured on this card:
+- * notes/logs/runs/sacomp1/driverlog-stream.txt:1413
+- * "Navi48Ttl:   hwId 271 inst 0  v4.1.0  5 segs: 00000012 000000c0 000034c0 00009000 02403c00 00000000"
+- * and Linux's own irq_service_dcn401.c: "#define DCN_BASE__INST0_SEG2 0x000034C0". */
+-#define DCN41_SEG0_EXPECTED 0x00000012u
+-#define DCN41_SEG1_EXPECTED 0x000000c0u
++/* Segment 2 is the one base with an IP-wide value, and the only one this layer insists on. Every write address it
++ * builds lives there (all 56 entries of dcn41_regs.h are BASE_IDX 2) and the read-only twin adds BASE_IDX 1 and 3;
++ * Linux hardcodes segment 2 for the whole DCN 4.1.0 family, no discovery lookup:
++ *   display/dc/irq/dcn401/irq_service_dcn401.c:16  #define DCN_BASE__INST0_SEG2 0x000034C0
++ *
++ * The other segments are per-SoC discovery numbers, not IP constants - Linux reads them from IP discovery
++ * (display/dc/resource/dcn401/dcn401_resource.c:99  #define BASE_INNER(seg) ctx->dcn_reg_offsets[seg]). This card
++ * (Navi 48, discovery hw id 271) reported 00000012 000000c0 000034c0 00009000 02403c00
++ * (notes/logs/runs/sacomp1/driverlog-stream.txt:1413); a Navi 44 may report other values for 0/1/3/4 and every
++ * address this layer computes stays correct, so those four are taken as discovered - only nonzero and inside BAR5
++ * when the layer actually uses them. */
+ #define DCN41_SEG2_EXPECTED 0x000034c0u
+-#define DCN41_SEG3_EXPECTED 0x00009000u
+-#define DCN41_SEG4_EXPECTED 0x02403c00u
+ 
+ /* SOC15_IH_CLIENTID_DCE = 0x04 (include/soc15_ih_clientid.h) */
+ #define DCN41_IH_CLIENT_DCE 0x04u
+@@ -113,8 +116,9 @@ struct dcn41_dev {
+     uint32_t flip_exact_n;
+ };
+ 
+-/* Initialise: checks the callbacks, that seg[] equals the measured DMU bases (unless DCN41_F_ALLOW_OTHER_BASES), and
+- * that seg[b] + the largest offset this layer uses for BASE_IDX b is below mmio_dwords. No register I/O. */
++/* Initialise: checks the callbacks, that seg[2] equals the DCN 4.1.0 DMU base (unless DCN41_F_ALLOW_OTHER_BASES),
++ * and that every used segment plus the largest offset this layer uses for its BASE_IDX is below mmio_dwords. No
++ * register I/O. */
+ int dcn41_dev_init(struct dcn41_dev *dev, void *cookie, dcn41_rreg_fn rreg, dcn41_wreg_fn wreg,
+                    dcn41_udelay_fn udelay, const uint32_t seg[DCN41_NUM_SEGS], uint32_t mmio_dwords, uint32_t flags);
+ 
+diff --git a/src/dcn41/dcn41_core.c b/src/dcn41/dcn41_core.c
+index 6dcea96..88ab70b 100644
+--- a/src/dcn41/dcn41_core.c
++++ b/src/dcn41/dcn41_core.c
+@@ -8,9 +8,6 @@
+ int dcn41_dev_init(struct dcn41_dev *dev, void *cookie, dcn41_rreg_fn rreg, dcn41_wreg_fn wreg,
+                    dcn41_udelay_fn udelay, const uint32_t seg[DCN41_NUM_SEGS], uint32_t mmio_dwords, uint32_t flags)
+ {
+-    static const uint32_t expected[DCN41_NUM_SEGS] = {
+-        DCN41_SEG0_EXPECTED, DCN41_SEG1_EXPECTED, DCN41_SEG2_EXPECTED, DCN41_SEG3_EXPECTED, DCN41_SEG4_EXPECTED,
+-    };
+     uint32_t i;
+ 
+     if (!dev)
+@@ -20,9 +17,8 @@ int dcn41_dev_init(struct dcn41_dev *dev, void *cookie, dcn41_rreg_fn rreg, dcn4
+     if (!rreg || !wreg || !udelay || !seg || mmio_dwords == 0)
+         return DCN41_E_ARG;
+     if (!(flags & DCN41_F_ALLOW_OTHER_BASES)) {
+-        for (i = 0; i < DCN41_NUM_SEGS; i++)
+-            if (seg[i] != expected[i])
+-                return DCN41_E_BASES;
++        if (seg[2] != DCN41_SEG2_EXPECTED)
++            return DCN41_E_BASES;
+     }
+     for (i = 0; i < DCN41_NUM_SEGS; i++) {
+         uint32_t max_off = 0;
+diff --git a/src/dcn41/tests/test_dcn41.c b/src/dcn41/tests/test_dcn41.c
+index fbd0141..56135ca 100644
+--- a/src/dcn41/tests/test_dcn41.c
++++ b/src/dcn41/tests/test_dcn41.c
+@@ -77,8 +77,20 @@ static void test_init(void)
+     for (i = 0; i < 5; i++) {
+         memcpy(bad, SEG, sizeof(bad));
+         bad[i] ^= 0x40;
+-        CHECK(dcn41_dev_init(&d, m, m_read, m_write, m_udelay, bad, MMIO_DWORDS, 0) == DCN41_E_BASES, "seg %d", i);
++        if (i == 2)
++            CHECK(dcn41_dev_init(&d, m, m_read, m_write, m_udelay, bad, MMIO_DWORDS, 0) == DCN41_E_BASES,
++                  "seg 2 is the DCN 4.1.0 constant, %#x refused", bad[i]);
++        else
++            CHECK(dcn41_dev_init(&d, m, m_read, m_write, m_udelay, bad, MMIO_DWORDS, 0) == DCN41_OK,
++                  "seg %d is discovery-supplied, %#x accepted", i, bad[i]);
+     }
++    /* A discovery-supplied base is used verbatim: the read-only twin resolves BASE_IDX 1 at whatever the caller passed,
++     * so a Navi 44 whose discovery table differs from this card's still addresses its own registers. */
++    memcpy(bad, SEG, sizeof(bad));
++    bad[1] = 0x80;
++    CHECK(dcn41_dev_init(&d, m, m_read, m_write, m_udelay, bad, MMIO_DWORDS, 0) == DCN41_OK, "base 1 as discovered");
++    CHECK(dcn41_abs_rd(&d, 0x10, 1) == 0x90, "base 1 resolves at the discovered 0x80: %#x",
++          dcn41_abs_rd(&d, 0x10, 1));
+     memcpy(bad, SEG, sizeof(bad));
+     bad[2] = 0x4000;
+     CHECK(dcn41_dev_init(&d, m, m_read, m_write, m_udelay, bad, MMIO_DWORDS, DCN41_F_ALLOW_OTHER_BASES) == DCN41_OK,
+diff --git a/src/navi48-bringup/src/dcn/navi48_dispread.h b/src/navi48-bringup/src/dcn/navi48_dispread.h
+index c4654a2..6c8b169 100644
+--- a/src/navi48-bringup/src/dcn/navi48_dispread.h
++++ b/src/navi48-bringup/src/dcn/navi48_dispread.h
+@@ -1838,13 +1838,12 @@ static const struct n48dr_reg n48dr_census5[N48DR_CENSUS5_COUNT] = {
+     { "CM2_CM_COEF_FORMAT", 2, 0x109c },
+     { "CM2_CM_TEST_DEBUG_INDEX", 2, 0x109d },
+ };
+-// The DMU segment bases of this card (dcn41.h DCN41_SEG*_EXPECTED; the host test pins the equality) - the CLI uses them to print absolute BAR5 dword addresses.
+-#define N48DR_SEG1 0x000000c0u
+-#define N48DR_SEG2 0x000034c0u
+-#define N48DR_SEG3 0x00009000u
+-static inline uint32_t n48dr_census_abs(uint32_t base_idx, uint32_t off)
++// Absolute BAR5 dword address of a census register, from the CALLER's DMU segment bases (the device's own discovery
++// table). Only BASE_IDX 2 is DCN 4.1.0-wide (dcn41.h DCN41_SEG2_EXPECTED, Linux irq_service_dcn401.c:16); 1 and 3 are
++// per-SoC discovery numbers and are never compiled in.
++static inline uint32_t n48dr_census_abs(const uint32_t *seg, uint32_t base_idx, uint32_t off)
+ {
+-    return base_idx == 1u ? N48DR_SEG1 + off : base_idx == 2u ? N48DR_SEG2 + off : base_idx == 3u ? N48DR_SEG3 + off : 0xFFFFFFFFu;
++    return base_idx >= 1u && base_idx <= 3u ? seg[base_idx] + off : 0xFFFFFFFFu;
+ }
+ static inline int n48dr_census_arg_ok(uint64_t arg) { return arg < N48DR_CENSUS_ALL_PAGES; }
+ // pages 0 and 1: the original table; pages 2..: n48dr_census2 (24 per page, the last page short)
+diff --git a/src/navi48-bringup/tests/native_dispread_test.cpp b/src/navi48-bringup/tests/native_dispread_test.cpp
+index 3951790..fe1c762 100644
+--- a/src/navi48-bringup/tests/native_dispread_test.cpp
++++ b/src/navi48-bringup/tests/native_dispread_test.cpp
+@@ -601,7 +601,7 @@ static void f_census2() {
+         const n48dr_reg &r = n48dr_census2[i];
+         const uint32_t a = dcn41_abs_rd(&d, r.off, r.base_idx);
+         res = res && a != DCN41_BAD_OFFSET && a == kSeg[r.base_idx] + r.off;
+-        absok = absok && a == n48dr_census_abs(r.base_idx, r.off);
++        absok = absok && a == n48dr_census_abs(kSeg, r.base_idx, r.off);
+         blk = blk && in_block(r);
+         // the write side refuses the same registers when they are BASE_IDX 1 or 3
+         if (r.base_idx != 2) expect(dcn41_abs(&d, r.off, r.base_idx) == DCN41_BAD_OFFSET, (std::string("the write-side address refuses ") + r.name).c_str());
+@@ -610,9 +610,9 @@ static void f_census2() {
+     expect(dcn41_abs_rd(&d, 0x10, 3) == 0x9010u && dcn41_abs_rd(&d, 0x10, 1) == 0xd0u && dcn41_abs(&d, 0x10, 1) == DCN41_BAD_OFFSET && dcn41_abs(&d, 0x10, 3) == DCN41_BAD_OFFSET, "census2: the read twin maps BASE_IDX 1 and 3, the write-side address refuses both");
+     expect(absok, "census2: the CLI's absolute address (n48dr_census_abs) equals dcn41_abs_rd for every register");
+     expect(blk, "census2: every register lies inside a display block (DCCG clock sources, DIG0..3, RDPCSTX1/2); none elsewhere");
+-    expect(N48DR_SEG1 == DCN41_SEG1_EXPECTED && N48DR_SEG2 == DCN41_SEG2_EXPECTED && N48DR_SEG3 == DCN41_SEG3_EXPECTED && kSeg[1] == N48DR_SEG1 && kSeg[2] == N48DR_SEG2 && kSeg[3] == N48DR_SEG3, "census2: the CLI's segment bases are the dcn41 layer's");
++    expect(DCN41_SEG2_EXPECTED == kSeg[2], "census2: segment 2 is the DCN 4.1.0 constant at this card's value");
+     // the design's absolute addresses (an internal design note M4 table): OTG_PIXEL_RATE_DIV 0x12f, OTG1_PIXEL_RATE_CNTL 0x144, OTG1_PHYPLL_PIXEL_RATE_CNTL 0x147, SYMCLKC 0x162, PHYCSYMCLK 0x3514, DIG2_STREAM_MAPPER 0x53cf, RDPCSTX2 0x5fa0..0x5fce
+-    auto absof = [&](const char *n) -> uint32_t { for (uint32_t i = 0; i < N48DR_CENSUS2_COUNT; i++) if (!std::strcmp(n48dr_census2[i].name, n)) return n48dr_census_abs(n48dr_census2[i].base_idx, n48dr_census2[i].off); return 0xdeadbeefu; };
++    auto absof = [&](const char *n) -> uint32_t { for (uint32_t i = 0; i < N48DR_CENSUS2_COUNT; i++) if (!std::strcmp(n48dr_census2[i].name, n)) return n48dr_census_abs(kSeg, n48dr_census2[i].base_idx, n48dr_census2[i].off); return 0xdeadbeefu; };
+     expect(absof("OTG_PIXEL_RATE_DIV") == 0x12f && absof("OTG1_PIXEL_RATE_CNTL") == 0x144 && absof("OTG1_PHYPLL_PIXEL_RATE_CNTL") == 0x147 && absof("SYMCLKC_CLOCK_ENABLE") == 0x162 && absof("PHYCSYMCLK_CLOCK_CNTL") == 0x3514 &&
+            absof("DIG2_STREAM_MAPPER_CONTROL") == 0x53cf && absof("RDPCSTX2_RDPCSTX_CNTL") == 0x5fa0 && absof("RDPCSTX2_RDPCS_TX_PLL_UPDATE_DATA_OVRRD") == 0x5fce && absof("DP_DTO0_PHASE") == 0x141, "census2: absolute addresses equal the design memo's");
+     // the page reads: every register of the page exactly once in order, the values land in their slots (pages 2..7), nothing else
+@@ -650,7 +650,7 @@ static void f_census3() {
+         { "OTG0_OTG_MASTER_UPDATE_LOCK", 2, 0x1b89, 0x5049 }, { "OTG1_OTG_MASTER_UPDATE_LOCK", 2, 0x1c09, 0x50c9 },
+         { "OTG0_OTG_UPDATE_LOCK", 2, 0x1b5b, 0x501b }, { "OTG1_OTG_UPDATE_LOCK", 2, 0x1bdb, 0x509b } };
+     bool same = true;
+-    for (uint32_t i = 0; i < 25; i++) same = same && !std::strcmp(n48dr_census3[i].name, want[i].n) && n48dr_census3[i].base_idx == want[i].base && n48dr_census3[i].off == want[i].off && n48dr_census_abs(want[i].base, want[i].off) == want[i].abs;
++    for (uint32_t i = 0; i < 25; i++) same = same && !std::strcmp(n48dr_census3[i].name, want[i].n) && n48dr_census3[i].base_idx == want[i].base && n48dr_census3[i].off == want[i].off && n48dr_census_abs(kSeg, want[i].base, want[i].off) == want[i].abs;
+     expect(same, "census3: the 25 registers, their order, BASE_IDX, offset and absolute BAR5 dword are exactly the brief's");
+     std::set<std::string> names; std::set<std::pair<uint32_t, uint32_t>> addrs;
+     for (uint32_t i = 0; i < N48DR_CENSUS3_COUNT; i++) { names.insert(n48dr_census3[i].name); addrs.insert({ n48dr_census3[i].base_idx, n48dr_census3[i].off }); }
+@@ -658,7 +658,7 @@ static void f_census3() {
+     // every register resolves through the READ twin to seg + offset
+     
+     struct dcn41_dev d; expect(dcn41_dev_init(&d, nullptr, ro_rd, ro_wr, ro_dl, kSeg, 0x100000u, 0) == DCN41_OK, "census3: dcn41_dev_init on the card's own bases");
+-    bool res = true; for (uint32_t i = 0; i < N48DR_CENSUS3_COUNT; i++) res = res && dcn41_abs_rd(&d, n48dr_census3[i].off, n48dr_census3[i].base_idx) == n48dr_census_abs(n48dr_census3[i].base_idx, n48dr_census3[i].off);
++    bool res = true; for (uint32_t i = 0; i < N48DR_CENSUS3_COUNT; i++) res = res && dcn41_abs_rd(&d, n48dr_census3[i].off, n48dr_census3[i].base_idx) == n48dr_census_abs(kSeg, n48dr_census3[i].base_idx, n48dr_census3[i].off);
+     expect(res, "census3: every register resolves through dcn41_abs_rd to seg + offset");
+     // pages 8 and 9: one READ per register, in table order (the environment has no write member at all), the values in their slots, nothing past the page
+     for (uint32_t pg = 8; pg < 10; pg++) { CensusEnv ce; uint64_t v[13]; const uint32_t st = n48dr::census_page(ce, pg, v);
+@@ -745,7 +745,7 @@ static void f_census45() {
+       for (int t = 0; t < 2; t++) for (uint32_t i = 0; i < (t ? N48DR_CENSUS5_COUNT : N48DR_CENSUS4_COUNT); i++) {
+           const n48dr_reg &r = t ? n48dr_census5[i] : n48dr_census4[i];
+           const uint32_t a = dcn41_abs_rd(&d, r.off, r.base_idx);
+-          res = res && a != DCN41_BAD_OFFSET && a == kSeg[r.base_idx] + r.off && a < 0x100000u; absok = absok && a == n48dr_census_abs(r.base_idx, r.off);
++          res = res && a != DCN41_BAD_OFFSET && a == kSeg[r.base_idx] + r.off && a < 0x100000u; absok = absok && a == n48dr_census_abs(kSeg, r.base_idx, r.off);
+           baseok = baseok && (r.base_idx == 1 || r.base_idx == 2 || r.base_idx == 3);
+           fam = fam && plane_family_ok(r.name);
+           const int why = dcn41_allow_classify(a, 0x100000u, nullptr, nullptr);
+@@ -760,7 +760,7 @@ static void f_census45() {
+       for (int t = 0; t < 2; t++) for (uint32_t i = 0; i < (t ? N48DR_CENSUS5_COUNT : N48DR_CENSUS4_COUNT); i++) {
+           const n48dr_reg &r = t ? n48dr_census5[i] : n48dr_census4[i];
+           if (r.base_idx != 2) wr = wr && dcn41_abs(&d, r.off, r.base_idx) == DCN41_BAD_OFFSET;
+-          const uint32_t a = n48dr_census_abs(r.base_idx, r.off);
++          const uint32_t a = n48dr_census_abs(kSeg, r.base_idx, r.off);
+           // 0.0.635: instance 1 admits NO entry; instance 2 admits an entry ONLY if it is one of its listed plane registers or one of the two DCCG exceptions (the census itself writes nothing: census_page has no write member)
+           bool listed2 = a == N48D2_DPPCLK2_DTO_PARAM || a == N48D2_DPPCLK_CTRL;
+           for (uint32_t k = 0; k < N48D2_ALLOWED2P_COUNT; k++) listed2 = listed2 || a == n48d2_allowed2p[k];
+@@ -784,7 +784,7 @@ static void f_census45() {
+       for (const char *pre : { "DSCL", "CM", "DPP_TOP", "CNVC_CFG" }) { std::vector<std::string> a, b2; for (uint32_t i = 0; i < N48DR_CENSUS5_COUNT; i++) { const std::string n = n48dr_census5[i].name; if (n.compare(0, std::strlen(pre) + 2, std::string(pre) + "0_") == 0) a.push_back(n.substr(std::strlen(pre) + 2)); if (n.compare(0, std::strlen(pre) + 2, std::string(pre) + "2_") == 0) b2.push_back(n.substr(std::strlen(pre) + 2)); }
+           expect(!a.empty() && a == b2, (std::string("census5: ") + pre + "0 and " + pre + "2 list the same registers in the same order (DPP2 is DPP0's twin)").c_str()); } }
+     // the brief's named registers, with the design's absolute addresses (CONFIRMED against the header: 0xc0 / 0x34c0 + offset)
+-    { auto abs_of = [&](const char *nm) -> uint32_t { for (uint32_t i = 0; i < N48DR_CENSUS5_COUNT; i++) if (!std::strcmp(n48dr_census5[i].name, nm)) return n48dr_census_abs(n48dr_census5[i].base_idx, n48dr_census5[i].off); return 0xdeadbeefu; };
++    { auto abs_of = [&](const char *nm) -> uint32_t { for (uint32_t i = 0; i < N48DR_CENSUS5_COUNT; i++) if (!std::strcmp(n48dr_census5[i].name, nm)) return n48dr_census_abs(kSeg, n48dr_census5[i].base_idx, n48dr_census5[i].off); return 0xdeadbeefu; };
+       expect(abs_of("DCHUBBUB_COMPBUF_CTRL") == 0x397a && abs_of("DCHUBBUB_DET0_CTRL") == 0x397b && abs_of("DCHUBBUB_DET1_CTRL") == 0x397c && abs_of("DCHUBBUB_DET2_CTRL") == 0x397d && abs_of("DCHUBBUB_DET3_CTRL") == 0x397e, "census5: COMPBUF_CTRL 0x397a, DET0..3_CTRL 0x397b..0x397e (the design's addresses)");
+       expect(abs_of("DCN_VM_FAULT_STATUS") == 0x3a8c && abs_of("DPPCLK_CTRL") == 0x168 && abs_of("DPPCLK0_DTO_PARAM") == 0x159 && abs_of("DPPCLK1_DTO_PARAM") == 0x15a && abs_of("DPPCLK2_DTO_PARAM") == 0x15b && abs_of("DPPCLK_DTO_CTRL") == 0x176 && abs_of("OTG2_OTG_GLOBAL_CONTROL2") == 0x5150, "census5: DCN_VM_FAULT_STATUS 0x3a8c, DPPCLK_CTRL 0x168, DPPCLK0..2_DTO_PARAM 0x159..0x15b, DPPCLK_DTO_CTRL 0x176 (the DTO control register's real name), OTG2_GLOBAL_CONTROL2 0x5150");
+       expect(abs_of("HUBPREQ0_DCN_VM_SYSTEM_APERTURE_LOW_ADDR") == 0x34c0 + 0x62c && abs_of("HUBPREQ0_DCN_VM_SYSTEM_APERTURE_HIGH_ADDR") == 0x34c0 + 0x62d && abs_of("HUBPREQ0_DCN_VM_MX_L1_TLB_CNTL") == 0x34c0 + 0x63a && abs_of("HUBPREQ1_DCN_VM_MX_L1_TLB_CNTL") != 0xdeadbeefu && abs_of("HUBPREQ2_VMID_SETTINGS_0") != 0xdeadbeefu, "census5: HUBPREQ0 aperture low / high / MX_L1_TLB at offsets 0x62c / 0x62d / 0x63a (the design's; the header names them *_ADDR), HUBPREQ1 / 2 present");
+@@ -796,11 +796,11 @@ static void f_census45() {
+           if (two && !vm2) { if (i < firstTwo) firstTwo = i; } else lastOther = i; }
+       expect(firstTwo < N48DR_CENSUS5_COUNT && lastOther < firstTwo, "census5: the HUBP2 / HUBPREQ2 / HUBPRET2 / DPP2 blocks are the LAST 4 blocks of the table (after MPCC, MPC_OUT, OTG2_GLOBAL_CONTROL2)"); }
+     // the DP watch: the nine registers n48d2_dpx_regs compares are page 10, in the same order, with the same absolute address (the CLI reads page 10 and uses the kext's masks by index)
+-    { bool same = true; for (uint32_t i = 0; i < N48DR_CENSUS4_COUNT; i++) same = same && n48dr_census_abs(n48dr_census4[i].base_idx, n48dr_census4[i].off) == n48d2_dpx_regs[i].abs;
++    { bool same = true; for (uint32_t i = 0; i < N48DR_CENSUS4_COUNT; i++) same = same && n48dr_census_abs(kSeg, n48dr_census4[i].base_idx, n48dr_census4[i].off) == n48d2_dpx_regs[i].abs;
+       expect(N48D2_DPX_REGS == 15u && N48DR_CENSUS4_COUNT == 9u && same, "census4: page 10's nine registers are rows 0..8 of n48d2_dpx_regs[], in order, same absolute dwords (one list for the kext's check and the CLI's)");
+-      bool same6 = n48dr_census_abs(n48dr_census4[4].base_idx, n48dr_census4[4].off) == n48d2_dpx_regs[9].abs;            // row 9 is HUBP0_DCHUBP_CNTL again (page 10's row 4)
+-      for (uint32_t i = 0; i < 5; i++) same6 = same6 && n48dr_census_abs(n48dr_census6[i].base_idx, n48dr_census6[i].off) == n48d2_dpx_regs[10 + i].abs;      // rows 10..14 = census6[0..4]
+-      same6 = same6 && n48dr_census_abs(n48dr_census6[5].base_idx, n48dr_census6[5].off) == N48D2_HUBPREQ0_PRIMARY_HIGH && N48DR_CENSUS6_COUNT == 6u;           // + the primary HIGH dword
++      bool same6 = n48dr_census_abs(kSeg, n48dr_census4[4].base_idx, n48dr_census4[4].off) == n48d2_dpx_regs[9].abs;            // row 9 is HUBP0_DCHUBP_CNTL again (page 10's row 4)
++      for (uint32_t i = 0; i < 5; i++) same6 = same6 && n48dr_census_abs(kSeg, n48dr_census6[i].base_idx, n48dr_census6[i].off) == n48d2_dpx_regs[10 + i].abs;      // rows 10..14 = census6[0..4]
++      same6 = same6 && n48dr_census_abs(kSeg, n48dr_census6[5].base_idx, n48dr_census6[5].off) == N48D2_HUBPREQ0_PRIMARY_HIGH && N48DR_CENSUS6_COUNT == 6u;           // + the primary HIGH dword
+       expect(same6, "census6: page 43 holds rows 10..14 of n48d2_dpx_regs[] in order and then the HUBP0 primary HIGH dword; row 9 is page 10's HUBP0_DCHUBP_CNTL again"); }
+     // the page reads: one READ per register in table order, the values in their slots, nothing past the page; the pages cover every register once
+     { std::set<const n48dr_reg *> seen;
+@@ -822,7 +822,7 @@ static void f_census45() {
+     // the CLI names the pages: `plane` (10..42) and `dpwatch` (10), printing name / BASE_IDX / absolute dword / value, flushing every page
+     { const std::string cli = slurp(g_root + "/tools/pc/navi48test.c");
+       expect(cli.find("!strcmp(a1, \"plane\") || !strcmp(a1, \"dpwatch\")") != std::string::npos && cli.find("for (uint32_t p = N48DR_CENSUS4_PAGE; p <= last && rc == 0; p++) rc = dc_print_page(p);") != std::string::npos && cli.find("const uint32_t last = !strcmp(a1, \"dpwatch\") ? N48DR_CENSUS4_PAGE : N48DR_CENSUS6_PAGE;") != std::string::npos &&
+-             cli.find("printf(\"  %-52s (BASE_IDX %u, abs %#07x) = %#010x\\n\", r->name, r->base_idx, n48dr_census_abs(r->base_idx, r->off)") != std::string::npos && cli.find("fflush(stdout);       /* a hang on a clock-gated pipe must show which page it was */") != std::string::npos,
++             cli.find("n48dr_census_abs(n48dr_seg_card, r->base_idx, r->off)") != std::string::npos && cli.find("fflush(stdout);       /* a hang on a clock-gated pipe must show which page it was */") != std::string::npos,
+              "census45: the CLI's `dispcensus plane` walks pages 10..42 in order by name, `dpwatch` is page 10, every page is flushed"); }
+ }
+ 
+@@ -860,7 +860,7 @@ static void f_census7() {
+       for (uint32_t i = 0; i < N48DR_CENSUS7_COUNT; i++) {
+           const n48dr_reg &r = n48dr_census7[i];
+           const uint32_t a = dcn41_abs_rd(&d, r.off, r.base_idx);
+-          res = res && a != DCN41_BAD_OFFSET && a == kSeg[r.base_idx] + r.off && a < 0x100000u; absok = absok && a == n48dr_census_abs(r.base_idx, r.off);
++          res = res && a != DCN41_BAD_OFFSET && a == kSeg[r.base_idx] + r.off && a < 0x100000u; absok = absok && a == n48dr_census_abs(kSeg, r.base_idx, r.off);
+           baseok = baseok && (r.base_idx == 1 || r.base_idx == 2 || r.base_idx == 3);
+           fam = fam && mona_family_ok(r.name);
+           const int why = dcn41_allow_classify(a, 0x100000u, nullptr, nullptr);
+@@ -908,7 +908,7 @@ static void f_census7() {
+           if (fl) { ++odd; dist = dist && o7[i].first == 3 && o5[i].first == 3 && dd == 2; } else dist = dist && o7[i].first == o5[i].first && dd == (hub ? 0xdcu : 0x16bu); }
+       expect(dist && odd == 2, "census7: every block register sits 0xdc (HUBP/HUBPREQ/HUBPRET) or 0x16b (DPP) below its pipe-2 twin, BASE_IDX equal; the two HUBP_3DLUT_FL_* registers are the header's BASE_IDX-3 stride-2 exception"); }
+     // the named registers, with the spec's absolute addresses (CONFIRMED against the header: 0xc0 / 0x34c0 / 0x9000 + offset)
+-    { auto abs_of = [&](const char *nm) -> uint32_t { for (uint32_t i = 0; i < N48DR_CENSUS7_COUNT; i++) if (!std::strcmp(n48dr_census7[i].name, nm)) return n48dr_census_abs(n48dr_census7[i].base_idx, n48dr_census7[i].off); return 0xdeadbeefu; };
++    { auto abs_of = [&](const char *nm) -> uint32_t { for (uint32_t i = 0; i < N48DR_CENSUS7_COUNT; i++) if (!std::strcmp(n48dr_census7[i].name, nm)) return n48dr_census_abs(kSeg, n48dr_census7[i].base_idx, n48dr_census7[i].off); return 0xdeadbeefu; };
+       expect(abs_of("OTG1_OTG_GLOBAL_CONTROL2") == 0x50d0 && abs_of("OTG1_OTG_MASTER_UPDATE_LOCK") == 0x50c9 && abs_of("ODM1_OPTC_INPUT_GLOBAL_CONTROL") == 0x4f9a && abs_of("DIG2_DIG_OUTPUT_CRC_CNTL") == 0x579e, "census7: OTG1_GLOBAL_CONTROL2 0x50d0, MASTER_UPDATE_LOCK 0x50c9, ODM1 0x4f9a, DIG2_DIG_OUTPUT_CRC_CNTL 0x579e (the spec's addresses)");
+       expect(abs_of("MPC_OUT1_MUX") == 0x92f6 && abs_of("MPCC_OGAM1_MPCC_OGAM_CONTROL") == 0x90dc && abs_of("MPCC_MCM1_MPCC_MCM_SHAPER_CONTROL") == 0x9503 && abs_of("MPCC_MCM1_MPCC_MCM_3DLUT_MODE") == 0x953a && abs_of("MPCC_MCM1_MPCC_MCM_1DLUT_CONTROL") == 0x9543, "census7: MPC_OUT1_MUX 0x92f6, OGAM1 0x90dc, MCM1 0x9503 / 0x953a / 0x9543 (the spec's addresses)");
+       expect(abs_of("HUBP1_DCHUBP_CNTL") == 0x3b90 && abs_of("HUBPREQ1_DCSURF_SURFACE_PITCH") == 0x3ba3 && abs_of("DPP_TOP1_DPP_CONTROL") == 0x42f0 && abs_of("DSCL1_SCL_MODE") == 0x4333 && abs_of("DSCL1_OTG_H_BLANK") == 0x4347, "census7: HUBP1_DCHUBP_CNTL 0x3b90, pitch 0x3ba3, DPP_TOP1 0x42f0, DSCL1 SCL_MODE 0x4333 / OTG_H_BLANK 0x4347 (the spec's addresses)");
+diff --git a/tools/pc/navi48test.c b/tools/pc/navi48test.c
+index 6dde83c..6434250 100644
+--- a/tools/pc/navi48test.c
++++ b/tools/pc/navi48test.c
+@@ -739,6 +739,10 @@ static int cmd_dmubring(const char *a1) {
+ }
+ 
+ // 0.0.634 (stage M4a, plane census): print one page of n48dr_census4 / n48dr_census5 by NAME (name, BASE_IDX, absolute BAR5 dword, value); READ-ONLY. Returns 0, or non-zero when the call or the page failed.
++/* This card's DMU discovery table (survey DMU,Seg0..4), used ONLY to print an absolute address next to the value; every
++ * read above went through the kext's own device bases. On a die whose discovery differs, take the table from the survey
++ * output instead of trusting this one. */
++static const uint32_t n48dr_seg_card[5] = { 0x12u, 0xc0u, 0x34c0u, 0x9000u, 0x02403c00u };
+ static int dc_print_page(uint32_t pg) {
+     uint64_t o[16];
+     printf("accel dispcensus %u (%s)\n", pg, pg == N48DR_CENSUS4_PAGE ? "the DP watch" : pg >= N48DR_CENSUS7_FIRST_PAGE ? "monitor A instance-1 census page" : "plane page");
+@@ -749,7 +753,7 @@ static int dc_print_page(uint32_t pg) {
+     if (st != N48DR_OK) { printf("  page %u: status %u (%s)\n", pg, st, n48dr_status_name(st)); return 3; }
+     for (uint32_t i = 0; i < n; i++) {
+         const struct n48dr_reg *r = n48dr_census_reg(pg, i);
+-        printf("  %-52s (BASE_IDX %u, abs %#07x) = %#010x\n", r->name, r->base_idx, n48dr_census_abs(r->base_idx, r->off), (uint32_t)(v[1 + i / 2] >> (32 * (i & 1))));
++        printf("  %-52s (BASE_IDX %u, abs %#07x) = %#010x\n", r->name, r->base_idx, n48dr_census_abs(n48dr_seg_card, r->base_idx, r->off), (uint32_t)(v[1 + i / 2] >> (32 * (i & 1))));
+     }
+     fflush(stdout);
+     return 0;
+@@ -777,7 +781,7 @@ static int cmd_dispcensus(const char *a1) {
+         if (st != N48DR_OK) { printf("  page %u: status %u (%s)\n", (unsigned)pg, st, n48dr_status_name(st)); return 3; }
+         for (uint32_t i = 0; i < n; i++) {
+             const struct n48dr_reg *r = n48dr_census_reg((uint32_t)pg, i);
+-            printf("  %-38s (BASE_IDX %u, abs %#07x) = %#010x\n", r->name, r->base_idx, n48dr_census_abs(r->base_idx, r->off), (uint32_t)(v[1 + i / 2] >> (32 * (i & 1))));
++            printf("  %-38s (BASE_IDX %u, abs %#07x) = %#010x\n", r->name, r->base_idx, n48dr_census_abs(n48dr_seg_card, r->base_idx, r->off), (uint32_t)(v[1 + i / 2] >> (32 * (i & 1))));
+         }
+         return 0;
+     }
